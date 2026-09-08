@@ -1,0 +1,4 @@
+Sales Order ID,Date,Customer,Item Code,Qty,Rate,UOM,Company
+SO-2026-001,2026-08-01,Acme Steel Works,WIDGET-001,10,25.5,Nos,Demo Manufacturing
+SO-2026-001,2026-08-01,Acme Steel Works,BOLT-002,100,0.85,Nos,Demo Manufacturing
+SO-2026-002,2026-08-15,Bluedot Logistics,WIDGET-001,4,25.5,Nos,Demo Manufacturing

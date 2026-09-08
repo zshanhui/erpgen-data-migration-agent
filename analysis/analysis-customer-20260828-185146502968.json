@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-28T18:51:46+00:00",
+  "doctype": "Customer",
+  "source": "/tmp/ov_test.csv",
+  "source_rows": 1,
+  "id_field": "name",
+  "id_column": "Customer Name",
+  "base_url": "http://localhost:8081",
+  "plan": {
+    "doctype": "Customer",
+    "id_field": "name",
+    "mappings": [
+      {
+        "source": "Customer Name",
+        "target": "customer_name",
+        "confidence": 1.0,
+        "method": "exact",
+        "notes": [],
+        "alternatives": []
+      },
+      {
+        "source": "Group",
+        "target": "customer_group",
+        "confidence": 1.0,
+        "method": "override",
+        "notes": [
+          "Link field; values must exist in Customer Group"
+        ],
+        "alternatives": []
+      },
+      {
+        "source": "Territory",
+        "target": "territory",
+        "confidence": 1.0,
+        "method": "exact",
+        "notes": [
+          "Link field; values must exist in Territory"
+        ],
+        "alternatives": []
+      }
+    ],
+    "defaults": {
+      "customer_type": "Company"
+    },
+    "warnings": [
+      "Required field 'customer_type' (Customer Type) has no source column and no default",
+      "Read-only fetch field 'mobile_no' left alone (good): populated from customer_primary_contact.mobile_no",
+      "Read-only fetch field 'email_id' left alone (good): populated from customer_primary_contact.email_id",
+      "Read-only fetch field 'first_name' left alone (good): populated from customer_primary_contact.first_name",
+      "Read-only fetch field 'last_name' left alone (good): populated from customer_primary_contact.last_name"
+    ],
+    "fetch_from_conflicts": [],
+    "link_fields": [
+      "customer_group (Link -> Customer Group)",
+      "territory (Link -> Territory)"
+    ],
+    "value_maps": {
+      "customer_group": {
+        "Wholesale": "Commercial"
+      }
+    }
+  },
+  "column_profiles": [
+    {
+      "header": "Customer Name",
+      "non_empty": 1.0,
+      "unique": 1.0,
+      "sample": [
+        "Northwind Traders"
+      ],
+      "inferred_type": "text",
+      "messy": []
+    },
+    {
+      "header": "Group",
+      "non_empty": 1.0,
+      "unique": 1.0,
+      "sample": [
+        "Wholesale"
+      ],
+      "inferred_type": "text",
+      "messy": []
+    },
+    {
+      "header": "Territory",
+      "non_empty": 1.0,
+      "unique": 1.0,
+      "sample": [
+        "All Territories"
+      ],
+      "inferred_type": "text",
+      "messy": []
+    }
+  ],
+  "conflicts": [
+    {
+      "kind": "link_value_conflict",
+      "severity": "error",
+      "source": "Group",
+      "target": "customer_group",
+      "doctype": "Customer Group",
+      "missing_values": [
+        "Wholesale"
+      ],
+      "detail": "1 source value(s) for 'customer_group' do not exist in Customer Group.",
+      "suggested_action": "map values to existing Customer Group records, or create the missing option records first."
+    }
+  ],
+  "suggested_custom_fields": [],
+  "agent_instructions": "You are the migration-fix agent for ERPNext doctype 'Customer'. Act on the conflicts below:\n- unmapped_column -> run the suggested create_command, then re-run import.\n- ambiguous_mapping -> choose the correct target among target/alternatives.\n- fetch_from -> the field is read-only; set the value on its source doc.\n- link_value_conflict -> create the missing option records or remap values.\n- required_missing -> supply --defaults or map a source column.\nDo not import until every 'error'-severity conflict is resolved."
+}

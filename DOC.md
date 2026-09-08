@@ -1,0 +1,256 @@
+# erpgen — agentic Excel/ERP → ERPNext migration tooling
+
+Converts messy SME spreadsheets (CSV / XLSX) into ERPNext, using the **live
+target site's DocType metadata** as the ground truth for mapping.
+
+## Quick start
+
+```bash
+# zero-dependency core; openpyxl optional for .xlsx (venv provided)
+python3 erpgen.py map samples/customers.csv --doctype Customer \
+    --defaults '{"customer_group":"Commercial","territory":"All Territories"}'
+
+# dry-run import (plan + payloads + predicted dedup, touches nothing)
+python3 erpgen.py import samples/customers.csv --doctype Customer
+python3 erpgen.py import samples/customers.csv --doctype Customer \
+    --defaults '{"customer_group":"Commercial","territory":"All Territories"}'
+
+# idempotent import: creates only NEW records, skips duplicates, logs everything
+python3 erpgen.py import samples/customers.csv --doctype Customer --apply
+python3 erpgen.py import samples/customers.csv --doctype Customer \
+    --defaults '{"customer_group":"Commercial","territory":"All Territories"}' --apply
+
+# bulk path via the Data Import machinery (also deduped), optional submit
+python3 erpgen.py import samples/customers.csv --doctype Customer --apply --bulk --submit
+
+# explicit natural-key column when it isn't auto-inferred
+python3 erpgen.py import samples/sales_orders.csv --doctype "Sales Order" \
+    --id-column "Sales Order ID" --apply
+
+# cleanup
+python3 erpgen.py delete --doctype Customer --names "Acme Steel Works"
+```
+
+Defaults: `--base http://localhost:8081 --user Administrator --password admin`.
+For `.xlsx` use the venv: `.venv/bin/python erpgen.py ...` (see below).
+
+## Idempotency & logging
+
+Imports are **idempotent**: before inserting anything the tool queries which
+natural keys already exist on the target site, creates **only new records**, and
+**skips duplicates** (logged as `skipped`, never re-created, never errored).
+The natural key is the doctype's autoname field (e.g. `customer_name`, `item_code`)
+or `name`; it's auto-inferred from the live metadata and the mapping
+(`--id-column` overrides). Re-running the same source is a safe no-op.
+
+**Everything is logged**: each `--apply` run appends an audit trail to
+`logs/import-<doctype>-<timestamp>.jsonl` (JSONL, one event per line):
+- `run_start` — doctype, source, mode, id field/column, defaults, full plan
+- `row` — one line per source row: source row number, key, status
+  (`created` | `skipped` | `failed`), docname, message
+- `run_end` — totals + duration + post-run verification count
+- bulk path adds `data_import_start` / `data_import_end` with the job name and
+  file reference
+
+`--log-dir` changes the log location (default `logs/`). A human summary is
+printed after every run.
+
+## What the mapper does
+
+1. **Profiles the source** — per-column type inference, emptiness, uniqueness,
+   messiness flags (currency symbols, comma-as-decimal, whitespace).
+2. **Discovers the target** — pulls `DocType` metadata from the live site:
+   fieldtype, `reqd`, `read_only`, `fetch_from`, Link options, Table children.
+3. **Suggests mappings** — exact/normalized/token/fuzzy label+fieldname matching
+   plus a synonym table; scores every column; flags ambiguity.
+4. **Flags the traps** (all discovered the hard way against the demo site):
+   - `fetch_from` (read-only) fields — e.g. `Customer.email_id` is fetched from
+     the primary Contact; direct writes are silently discarded. The mapper
+     drops them from payloads and tells you to write the source doc.
+   - Required fields with no source and no default.
+   - Link fields whose values must exist in the target (e.g. Item Group, UOM).
+   - Child-table columns (e.g. `items.*`, `credit_limits.credit_limit`) with the
+     exact Data Import header required, e.g. `Credit Limit (Credit & Overdue Limits)`.
+5. **Builds payloads / template CSV** — value conversion (dates → ISO,
+   currencies → float, booleans), applies defaults, groups child rows.
+
+## Architecture
+
+```
+erpgen/
+  client.py    ERPNextClient — REST + Data Import + metadata (stdlib urllib)
+  metadata.py  DoctypeMeta/FieldMeta models from live DocType docs
+  source.py    CSV/XLSX readers + column profiling
+  mapper.py    MappingEngine → MappingPlan (JSON-serializable, LLM-slot ready)
+  dedup.py     natural-key resolution + existence checks (idempotency)
+  logger.py    RunLogger — JSONL audit trail + run summary
+  loader.py    RestLoader.upsert (default) + DataImportLoader (--bulk)
+erpgen.py     CLI: map | import | createfield | delete
+samples/       demo CSV + XLSX
+logs/          per-run audit logs (JSONL)
+```
+
+Deterministic for now; `MappingEngine.suggest(llm=...)` accepts a callback for
+LLM-assisted disambiguation of hard cases later.
+
+## Mapping analysis artifact (for LLM agents)
+
+`map` and `import` (dry-run and apply) save an **agent-consumable analysis** to
+`analysis/analysis-<doctype>-<timestamp>.json` (`--analysis-dir` to relocate):
+
+```json
+{
+  "schema_version": 1,
+  "doctype": "Customer",
+  "source": "samples/customers.csv",
+  "source_rows": 9,
+  "id_field": "name",
+  "id_column": "Customer Name",
+  "base_url": "http://localhost:8081",
+  "plan": { "mappings": [ {"source", "target", "confidence", "method",
+                           "notes", "alternatives"} ], "defaults", "warnings",
+            "fetch_from_conflicts", "link_fields", "id_field" },
+  "column_profiles": [ {"header", "inferred_type", "non_empty", "unique",
+                        "sample", "messy"} ],
+  "conflicts": [
+    {"kind": "unmapped_column",    "severity": "info",    "source": "Notes", ...},
+    {"kind": "ambiguous_mapping",  "severity": "warning", "source": "Group",
+     "target": "customer_group", "alternatives": ["tax_withholding_group"], ...},
+    {"kind": "fetch_from",         "severity": "warning", "target": "email_id",
+     "fetch_from": "customer_primary_contact.email_id", ...},
+    {"kind": "required_missing",   "severity": "error",   "field": "customer_type", ...},
+    {"kind": "link_value_conflict","severity": "error",   "target": "customer_group",
+     "doctype": "Customer Group", "missing_values": ["Wholesale"], ...}
+  ],
+  "suggested_custom_fields": [
+    {"source": "Vendor Code", "fieldname": "vendor_code", "fieldtype": "Data",
+     "create_command": "python3 erpgen.py createfield Customer --label 'Vendor Code' --fieldtype Data"}
+  ],
+  "agent_instructions": "You are the migration-fix agent ... act on the conflicts ..."
+}
+```
+
+A downstream agent reads this file, resolves each conflict (run
+`suggested_custom_fields[].create_command` for unmapped columns, create missing
+option records for `link_value_conflict`, pick targets for `ambiguous_mapping`,
+supply `--defaults` for `required_missing`), then re-runs
+`python3 erpgen.py import ... --apply` — the analysis regenerates each run, so
+progress is visible as conflicts shrink.
+
+## LLM agent skeleton (LlamaIndex AgentWorkflow)
+
+`scripts/agent.py` is the agent skeleton: it reads the latest analysis, then an
+LLM agent resolves conflicts via tools and imports — looping until
+error-severity conflicts are zero.
+
+```bash
+.venv/bin/python scripts/agent.py --doctype Customer --source samples/customers.csv \
+    --defaults '{"customer_group":"Commercial"}'            # fresh analysis + agent run
+.venv/bin/python scripts/agent.py --analysis analysis/analysis-customer-<ts>.json  # resume
+.venv/bin/python scripts/agent.py --doctor --doctype Customer --source samples/customers.csv
+#   ^ no-LLM mode: prints the 9 tools + current conflicts, for wiring/debugging
+```
+
+Provider: `--provider openai|anthropic|ollama` (auto-detected from
+`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`; Ollama uses `--ollama-base-url` /
+`--model`).
+
+Tools the agent can call: `latest_analysis`, `run_map`, `run_import`,
+`create_field`, `create_record`, `set_mapping`, `describe_doctype`,
+`get_record`, `list_records` — each wraps the same functions the CLI uses
+(in-process), so the agent and the CLI can never drift apart.
+
+Note: `create_field`/`create_record` were extracted into `erpgen/tools.py`
+(reused by the `createfield` CLI command) so the agent calls real shared code.
+
+## Creating fields programmatically
+
+Unmapped source columns are dropped with a warning — to keep that data, give it
+a home first with `createfield` (creates a `Custom Field`, i.e. a real column,
+via the REST API; the mapper auto-discovers it on the next run):
+
+```bash
+python3 erpgen.py createfield Customer --label "Vendor Code" --fieldtype Data
+python3 erpgen.py createfield Customer --label "Customer Tier" --fieldtype Select \
+    --options "Standard,Premium,Enterprise" --insert-after customer_group
+python3 erpgen.py createfield Customer --list          # see what exists
+```
+
+- `--fieldname` is auto-derived from the label (`Vendor Code` → `vendor_code`),
+  or set it explicitly; `--reqd`, `--read-only`, `--default`, `--fetch-from`
+  also supported.
+- Idempotent: re-running with an existing fieldname reports "already exists".
+- Delete a field via `DELETE /api/resource/Custom Field/<dt>-<fieldname>`
+  (drops the column).
+
+## Record inspection (agent verification)
+
+Agent-friendly read tools — JSON on stdout (stderr carries human notes/errors):
+
+```bash
+python3 erpgen.py get-record Customer "Acme Steel Works"
+python3 erpgen.py list-records "Customer Group"                        # all, name only
+python3 erpgen.py list-records Customer --filter '[["customer_group","=","Commercial"]]' \
+    --fields '["name","tax_id"]'
+python3 erpgen.py list-records "Customer Group" --filter '[["name","like","%Commercial%"]]'
+```
+
+`get-record` exits 2 with a clear error when the record doesn't exist —
+machine-detectable for the agent loop.
+
+`describe-doctype` tells the agent how to construct records — required fields,
+Link targets, child tables, fetch_from fields, the id field, and custom-field
+count (JSON on stdout, human summary on stderr):
+
+```bash
+python3 erpgen.py describe-doctype Customer                 # summary categories
+python3 erpgen.py describe-doctype Item --all               # + full field list
+python3 erpgen.py describe-doctype "Customer Group"         # id_field=customer_group_name
+```
+
+This is what lets `create-record` (next tool) know that a Customer Group needs
+`customer_group_name`, not `name`.
+
+## Mapping overrides (`set-mapping`)
+
+Record a deliberate decision — "this source column maps to that target field" —
+instead of editing the source file. Fixes `ambiguous_mapping` conflicts and
+missed/wrong auto-mappings:
+
+```bash
+python3 erpgen.py set-mapping Customer --column "Group" --target customer_group
+python3 erpgen.py set-mapping Customer --column "Item" --target items.item_code   # child table
+python3 erpgen.py set-mapping Customer --list       # show overrides
+python3 erpgen.py set-mapping Customer --unset "Group"
+```
+
+Writes `mapping-overrides.json`:
+
+```json
+{ "Customer": {
+    "mappings":  {"Group": "customer_group"},
+    "defaults":  {"customer_type": "Company"},            // future: set-default
+    "value_maps": {"customer_group": {"Wholesale": "Commercial"}}  // future: set-value-map
+} }
+```
+
+`map`/`import` auto-load this file (or `--overrides <file>` for per-client
+configs) and apply it **after** scoring: forced targets win (method becomes
+`override`), defaults fill missing required fields, value_maps remap values
+before insert. Invalid targets are rejected against live metadata; unknown
+source columns are ignored with a warning. The source file is never touched —
+decisions live in the JSON and show up in every analysis artifact.
+
+## Verified against the demo (v16)
+
+- Customers CSV → plan → import: created 4, **re-run → 0 created, 4 skipped**,
+  incl. child credit limits and fetch_from handling.
+- Bulk path (Data Import): deduped CSV → 1 created + 4 skipped, per-row audit log.
+- XLSX source: same pipeline.
+- Sales Order template: parent + child `items` mapping, required-field report.
+- Known limitation: multi-row parents (one Sales Order spread over several
+  source rows) are not yet grouped — each source row becomes one document.
+
+## Local demo stack
+
+See `docker/README.md` (ERPNext v16 on :8081, OrbStack, setup wizard note).

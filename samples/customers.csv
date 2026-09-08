@@ -1,0 +1,10 @@
+Customer Name,Customer Type,Group,Territory,Email,Phone,Tax ID,Credit Limit,Notes
+Acme Steel Works,Company,Commercial,All Territories,accounts@acmesteel.example,+1 555 2100,US-88421,15000,Long-standing sheet-metal supplier
+Bluedot Logistics,Company,Commercial,All Territories,ops@bluedot.example,+1 555 2101,,25000,3PL partner
+Maple Grove Organics,Individual,,United States,hello@maplegrove.example,,CA-112233,5000,Organic produce distributor
+CP Machines,Company,Commercial,All Territories,shanhui@cpmachines.com,+1 888-8888,TID-12345,2500,trades industrial and agri equipment
+Summit Forge Co,Company,Commercial,All Territories,sales@summitforge.example,+1 555 3100,US-77101,18000,Precision metal stamping
+Riverside Packing,Company,Commercial,United States,orders@riversidepack.example,+1 555 3101,US-77102,9000,Corrugated packaging supplier
+Cascade Auto Parts,Company,Commercial,All Territories,parts@cascadeauto.example,+1 555 3102,US-77103,22000,Aftermarket auto components
+Harborline Freight,Company,Commercial,Rest Of The World,freight@harborline.example,+1 555 3103,US-77104,,Ocean freight forwarder
+Pine Ridge Cabinetry,Individual,Commercial,United States,studio@pinridge.example,,US-77105,6000,Custom wood cabinetry
