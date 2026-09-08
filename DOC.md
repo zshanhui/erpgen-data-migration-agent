@@ -31,7 +31,7 @@ python3 erpgen.py import samples/sales_orders.csv --doctype "Sales Order" \
 python3 erpgen.py delete --doctype Customer --names "Acme Steel Works"
 ```
 
-Defaults: `--base http://localhost:8081 --user Administrator --password admin`.
+Defaults: `--base http://localhost:8082 --user Administrator --password admin`.
 For `.xlsx` use the venv: `.venv/bin/python erpgen.py ...` (see below).
 
 ## Idempotency & logging
@@ -106,7 +106,7 @@ LLM-assisted disambiguation of hard cases later.
   "source_rows": 9,
   "id_field": "name",
   "id_column": "Customer Name",
-  "base_url": "http://localhost:8081",
+  "base_url": "http://localhost:8082",
   "plan": { "mappings": [ {"source", "target", "confidence", "method",
                            "notes", "alternatives"} ], "defaults", "warnings",
             "fetch_from_conflicts", "link_fields", "id_field" },
@@ -253,4 +253,4 @@ decisions live in the JSON and show up in every analysis artifact.
 
 ## Local demo stack
 
-See `docker/README.md` (ERPNext v16 on :8081, OrbStack, setup wizard note).
+See `docker/README.md` (ERPNext v16 on :8082, OrbStack, setup wizard note).

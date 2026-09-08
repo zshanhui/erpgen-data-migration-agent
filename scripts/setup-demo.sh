@@ -4,7 +4,7 @@
 # Usage: bash scripts/setup-demo.sh   (idempotent: wizard no-ops if setup done)
 set -euo pipefail
 
-BASE="${BASE:-http://localhost:8081}"
+BASE="${BASE:-http://localhost:8082}"
 CURL=(curl -s -m 300)
 
 "${CURL[@]}" -c /tmp/erpnext_cookies.txt -d 'usr=Administrator&pwd=admin' "$BASE/api/method/login" >/dev/null

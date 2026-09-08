@@ -376,7 +376,7 @@ def main() -> int:
     ap.add_argument("--source", help="source CSV/XLSX to analyze (runs map first)")
     ap.add_argument("--analysis", help="path to an existing analysis JSON")
     ap.add_argument("--defaults", help='JSON defaults for map/import, e.g. \'{"customer_group":"Commercial"}\'')
-    ap.add_argument("--base", default="http://localhost:8081")
+    ap.add_argument("--base", default="http://localhost:8082")
     ap.add_argument("--user", default="Administrator")
     ap.add_argument("--password", default="admin")
     ap.add_argument("--provider", default="auto",

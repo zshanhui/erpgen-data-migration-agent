@@ -1,0 +1,11 @@
+# Local-only override for the ERPNext demo stack.
+# Keeps the upstream frappe_docker repo pristine (mergable upstream) by moving
+# local tweaks OUT of the repo into this external override file.
+#
+# Port note: upstream pwd.yml maps the frontend to host 8080, but a local
+# process occupies 8080, so we override to 8082. `!override` REPLACES the
+# ports list instead of appending (compose >= 2.24).
+services:
+  frontend:
+    ports: !override
+      - "8082:8080"

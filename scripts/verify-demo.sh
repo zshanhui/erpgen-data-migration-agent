@@ -4,7 +4,7 @@
 # Requires: site up AND setup wizard run (see scripts/setup-demo.sh).
 set -euo pipefail
 
-BASE="${BASE:-http://localhost:8081}"
+BASE="${BASE:-http://localhost:8082}"
 CURL=(curl -s -m 15)
 
 echo "== 1. site reachable =="

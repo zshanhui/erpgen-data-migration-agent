@@ -77,7 +77,7 @@ from erpgen.tools import (  # noqa: E402
     list_records,
 )
 
-DEFAULT_BASE = "http://localhost:8081"
+DEFAULT_BASE = "http://localhost:8082"
 
 
 def _client(args) -> ERPNextClient:
