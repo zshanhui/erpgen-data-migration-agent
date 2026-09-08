@@ -1,0 +1,18 @@
+{
+  "Customer": {
+    "mappings": {
+      "Group": "customer_group"
+    },
+    "defaults": {},
+    "value_maps": {}
+  },
+  "Item": {
+    "mappings": {
+      "UoM": "stock_uom",
+      "Group": "item_group",
+      "Rate": "standard_rate"
+    },
+    "defaults": {},
+    "value_maps": {}
+  }
+}

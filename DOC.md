@@ -85,7 +85,9 @@ erpgen/
   dedup.py     natural-key resolution + existence checks (idempotency)
   logger.py    RunLogger — JSONL audit trail + run summary
   loader.py    RestLoader.upsert (default) + DataImportLoader (--bulk)
-erpgen.py     CLI: map | import | createfield | delete
+erpgen.py     CLI: map | import | createfield | describe-doctype | get-record |
+              list-records | set-mapping | rollback | rollback-schema |
+              rollback-options | delete
 samples/       demo CSV + XLSX
 logs/          per-run audit logs (JSONL)
 ```
@@ -241,6 +243,47 @@ before insert. Invalid targets are rejected against live metadata; unknown
 source columns are ignored with a warning. The source file is never touched —
 decisions live in the JSON and show up in every analysis artifact.
 
+## Rollback (undo a migration)
+
+Every import and agent run writes logs, so migrations can be **rolled back**.
+Three commands, each dry-run by default (`--apply` to execute), each accepting
+an explicit `log` path or `--latest <doctype>` to pick the newest matching log:
+
+| Command | Undoes | Log consumed |
+|---|---|---|
+| `rollback` | records created by an import run (newest-first) | `logs/import-<doctype>-*.jsonl` |
+| `rollback-options` | lookup records the agent created (Item Groups, UOMs, Territories…) | `logs/agent-<doctype>-*.jsonl` |
+| `rollback-schema` | custom fields the agent created — **drops the columns + data** | `logs/agent-<doctype>-*.jsonl` |
+
+```bash
+# preview (default)
+python3 erpgen.py rollback --latest Item
+python3 erpgen.py rollback-options --latest Item
+python3 erpgen.py rollback-schema --latest Item
+
+# execute
+python3 erpgen.py rollback --latest Item --apply
+python3 erpgen.py rollback-options --latest Item --apply
+python3 erpgen.py rollback-schema --latest Item --apply   # destructive
+```
+
+Full undo of an agent run (records + option records + fields):
+
+```bash
+python3 erpgen.py rollback --latest Item --apply
+python3 erpgen.py rollback-options --latest Item --apply
+python3 erpgen.py rollback-schema --latest Item --apply
+```
+
+Behavior notes:
+- `rollback`/`rollback-options` report (rather than abort on) failures — e.g. a
+  record now referenced by a transaction won't delete and is listed as `FAILED`.
+- `rollback-schema` is **irreversible for column data**; it only drops fields
+  the agent actually created (`created: true` in the transcript), never fields
+  it merely found existing.
+- Rollback is scoped to **one run's log** — records from other runs are
+  untouched, so you can unwind migrations independently.
+
 ## Verified against the demo (v16)
 
 - Customers CSV → plan → import: created 4, **re-run → 0 created, 4 skipped**,
@@ -248,6 +291,9 @@ decisions live in the JSON and show up in every analysis artifact.
 - Bulk path (Data Import): deduped CSV → 1 created + 4 skipped, per-row audit log.
 - XLSX source: same pipeline.
 - Sales Order template: parent + child `items` mapping, required-field report.
+- Rollback trio: records / option records / custom fields each dry-run + `--apply`
+  verified against throwaway Item + Customer Group data; `--latest` resolves
+  the newest log per doctype.
 - Known limitation: multi-row parents (one Sales Order spread over several
   source rows) are not yet grouped — each source row becomes one document.
 

@@ -36,6 +36,11 @@ Examples:
   python3 erpgen.py list-records "Customer Group" --filter '[["name","like","%Whol%"]]'
   python3 erpgen.py describe-doctype "Customer Group"   # what a record needs
 
+  # rollback a migration (records / option records / custom fields)
+  python3 erpgen.py rollback --latest Item
+  python3 erpgen.py rollback-options --latest Item
+  python3 erpgen.py rollback-schema --latest Item        # drops columns (destructive)
+
   # clean up demo data
   python3 erpgen.py delete --doctype Customer --names "Acme Steel Works,Bluedot Logistics"
 """
@@ -75,6 +80,12 @@ from erpgen.tools import (  # noqa: E402
     describe_doctype,
     get_record,
     list_records,
+    parse_agent_schema_changes,
+    parse_import_log,
+    parse_agent_option_records,
+    rollback_records,
+    rollback_schema,
+    rollback_options,
 )
 
 DEFAULT_BASE = "http://localhost:8082"
@@ -499,6 +510,97 @@ def cmd_delete(args) -> int:
     return 0
 
 
+def _latest_log(doctype: str, prefix: str):
+    pat = f"{prefix}{doctype.lower().replace(' ', '-')}-*.jsonl"
+    files = sorted(Path("logs").glob(pat))
+    return str(files[-1]) if files else None
+
+
+def _resolve_log(args, prefix: str) -> str:
+    """Resolve the rollback target: --latest <doctype> or an explicit path."""
+    if args.latest:
+        path = _latest_log(args.latest, prefix)
+        if path is None:
+            print(f"ERROR: no {prefix}*.jsonl logs for doctype {args.latest!r}",
+                  file=sys.stderr)
+            raise SystemExit(2)
+        return path
+    if not args.log:
+        print("ERROR: pass a log path or --latest <doctype>", file=sys.stderr)
+        raise SystemExit(2)
+    return args.log
+
+
+def cmd_rollback(args) -> int:
+    client = _client(args)
+    path = _resolve_log(args, "import-")
+    doctype, names = parse_import_log(path)
+    if not names:
+        print(f"No created rows found in {path}")
+        return 0
+
+    res = rollback_records(client, doctype, names, apply=args.apply)
+    if not args.apply:
+        print(f"Rollback {doctype} — {res['total']} record(s) would be deleted "
+              f"(dry run; use --apply). Newest-first order:")
+        for n in reversed(names):
+            print(f"  - {n}")
+        return 0
+
+    print(f"Rolled back {doctype}: deleted {res['deleted']}/{res['total']}, "
+          f"{len(res['failed'])} failed")
+    for f in res["failed"]:
+        print(f"  FAILED {f['name']}: {f['error'][:160]}")
+    return 0 if not res["failed"] else 1
+
+
+def cmd_rollback_schema(args) -> int:
+    client = _client(args)
+    path = _resolve_log(args, "agent-")
+    fields = parse_agent_schema_changes(path)
+    if not fields:
+        print(f"No custom fields created (create_field) found in {path}")
+        return 0
+
+    if not args.apply:
+        print(f"Schema rollback — {len(fields)} custom field(s) would be DROPPED "
+              f"(dry run; --apply drops the columns AND their data):")
+        for f in fields:
+            print(f"  - {f['custom_field']}  (fieldname {f.get('fieldname')})")
+        print("WARNING: --apply is destructive and irreversible for column data.")
+        return 0
+
+    res = rollback_schema(client, fields, apply=True)
+    print(f"Dropped {res['deleted']}/{res['total']} custom fields; "
+          f"{len(res['failed'])} failed")
+    for f in res["failed"]:
+        print(f"  FAILED {f['custom_field']}: {f['error'][:160]}")
+    return 0 if not res["failed"] else 1
+
+
+def cmd_rollback_options(args) -> int:
+    client = _client(args)
+    path = _resolve_log(args, "agent-")
+    records = parse_agent_option_records(path)
+    if not records:
+        print(f"No created lookup records (create_record) found in {path}")
+        return 0
+
+    if not args.apply:
+        print(f"Options rollback — {len(records)} lookup record(s) would be "
+              f"deleted (dry run; --apply to delete):")
+        for r in reversed(records):
+            print(f"  - {r['doctype']}/{r['name']}")
+        return 0
+
+    res = rollback_options(client, records, apply=True)
+    print(f"Deleted {res['deleted']}/{res['total']} lookup records; "
+          f"{len(res['failed'])} failed")
+    for f in res["failed"]:
+        print(f"  FAILED {f['doctype']}/{f['name']}: {f['error'][:160]}")
+    return 0 if not res["failed"] else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="erpgen.py", description=__doc__)
     ap.add_argument("--base", default=DEFAULT_BASE, help=f"ERPNext URL (default {DEFAULT_BASE})")
@@ -598,6 +700,42 @@ def main() -> int:
     p_sm.add_argument("--unset", metavar="COLUMN", help="remove a mapping override")
     p_sm.add_argument("--list", action="store_true", help="show current overrides")
     p_sm.set_defaults(fn=cmd_set_mapping)
+
+    p_rb = sub.add_parser(
+        "rollback",
+        help="undo a migration: delete the records a run-log created (newest-first). "
+             "Consumes logs/import-<doctype>-<ts>.jsonl",
+    )
+    p_rb.add_argument("log", nargs="?", help="path to a logs/import-*.jsonl run log")
+    p_rb.add_argument("--latest", metavar="DOCTYPE",
+                      help="use the newest log for this doctype instead of a path")
+    p_rb.add_argument("--apply", action="store_true",
+                      help="actually delete (default: dry-run preview)")
+    p_rb.set_defaults(fn=cmd_rollback)
+
+    p_rs = sub.add_parser(
+        "rollback-schema",
+        help="undo agent-created custom fields (drops columns). "
+             "Consumes logs/agent-<doctype>-<ts>.jsonl",
+    )
+    p_rs.add_argument("log", nargs="?", help="path to a logs/agent-*.jsonl transcript")
+    p_rs.add_argument("--latest", metavar="DOCTYPE",
+                      help="use the newest transcript for this doctype instead of a path")
+    p_rs.add_argument("--apply", action="store_true",
+                      help="actually drop the custom fields (destructive)")
+    p_rs.set_defaults(fn=cmd_rollback_schema)
+
+    p_ro = sub.add_parser(
+        "rollback-options",
+        help="undo agent-created lookup records (Item Groups, UOMs, etc.). "
+             "Consumes logs/agent-<doctype>-<ts>.jsonl",
+    )
+    p_ro.add_argument("log", nargs="?", help="path to a logs/agent-*.jsonl transcript")
+    p_ro.add_argument("--latest", metavar="DOCTYPE",
+                      help="use the newest transcript for this doctype instead of a path")
+    p_ro.add_argument("--apply", action="store_true",
+                      help="actually delete (default: dry-run preview)")
+    p_ro.set_defaults(fn=cmd_rollback_options)
 
     p_del = sub.add_parser("delete", help="delete records by name (cleanup)")
     p_del.add_argument("--doctype", required=True)

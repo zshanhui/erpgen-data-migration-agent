@@ -51,6 +51,7 @@ from erpgen.tools import (  # noqa: E402
 )
 
 CLIENT: ERPNextClient = None  # set in main()
+_TRANSCRIPT_CTX: dict = {}  # {round, log_event} set before each agent round
 
 
 # ---------------------------------------------------------------- plumbing
@@ -73,6 +74,31 @@ def latest_analysis(doctype: str):
 
 def _j(v) -> str:
     return json.dumps(v, indent=2, default=str)
+
+
+def _text(value) -> str:
+    """Normalize an agent result to plain text.
+
+    llama-index may hand back a str, a ChatMessage, or an object with .content
+    depending on how the workflow finishes — unwrap any of them safely.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    content = getattr(value, "content", None)
+    if content is not None:
+        return str(content)
+    return str(value)
+
+
+def _safe(value, limit: int = 1000) -> str:
+    """Serialize arbitrary tool args/results for the transcript log."""
+    try:
+        s = json.dumps(value, default=str)
+    except Exception:
+        s = str(value)
+    return s[:limit]
 
 
 # ---------------------------------------------------------------- tools
@@ -208,30 +234,71 @@ Rules:
 
 
 # ---------------------------------------------------------------- llm
+def _deepseek_llm(model: str, api_base: str):
+    """OpenAI-compatible client for DeepSeek.
+
+    Uses llama-index's OpenAILike (not the OpenAI class, whose metadata
+    property validates model names against OpenAI's registry and rejects
+    DeepSeek model ids). is_function_calling_model=True is required for the
+    FunctionAgent tool loop.
+    """
+    from llama_index.llms.openai_like import OpenAILike
+
+    return OpenAILike(
+        model=model or "deepseek-v4-flash",
+        api_key=os.environ.get("DEEPSEEK_API_KEY"),
+        api_base=api_base or "https://api.deepseek.com",
+        is_chat_model=True,
+        is_function_calling_model=True,
+    )
+
+
 def get_llm(provider: str, model: str, api_base: str = ""):
     from llama_index.llms.openai import OpenAI
 
     if provider == "openai":
         return OpenAI(model=model or "gpt-4o-mini")
     if provider == "deepseek":
-        key = os.environ.get("DEEPSEEK_API_KEY")
-        if not key:
+        if not os.environ.get("DEEPSEEK_API_KEY"):
             raise SystemExit(
                 "DEEPSEEK_API_KEY is not set. export DEEPSEEK_API_KEY=... "
                 "(or pass --provider openai)"
             )
-        return OpenAI(model=model or "deepseek-v4-flash", api_key=key,
-                      api_base=api_base or "https://api.deepseek.com")
+        return _deepseek_llm(model, api_base)
     if os.environ.get("OPENAI_API_KEY"):
         return OpenAI(model=model or "gpt-4o-mini")
     if os.environ.get("DEEPSEEK_API_KEY"):
-        return OpenAI(model=model or "deepseek-v4-flash",
-                      api_key=os.environ["DEEPSEEK_API_KEY"],
-                      api_base=api_base or "https://api.deepseek.com")
+        return _deepseek_llm(model, api_base)
     raise SystemExit(
         "No LLM provider configured. Set OPENAI_API_KEY or DEEPSEEK_API_KEY "
         "and choose --provider openai|deepseek."
     )
+
+
+def _wrap_tool(fn, name):
+    """Wrap a tool function so every call is logged to the run transcript.
+
+    functools.wraps preserves the original signature, so FunctionTool still
+    builds the correct JSON schema for the model.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        ctx = _TRANSCRIPT_CTX
+        log = ctx.get("log_event")
+        rnd = ctx.get("round")
+        if log:
+            log(event="tool_call", round=rnd, name=name,
+                kwargs=_safe(kwargs if kwargs else args))
+        result = fn(*args, **kwargs)
+        if log:
+            log(event="tool_result", round=rnd, tool=name,
+                args=_safe(kwargs if kwargs else args),
+                result_tail=_text(result)[-600:])
+        return result
+
+    return wrapped
 
 
 # ---------------------------------------------------------------- workflow
@@ -240,7 +307,8 @@ def build_workflow(llm):
     from llama_index.core.tools import FunctionTool
 
     tools = [
-        FunctionTool.from_defaults(fn=t["fn"], name=t["name"], description=t["description"])
+        FunctionTool.from_defaults(fn=_wrap_tool(t["fn"], t["name"]),
+                                   name=t["name"], description=t["description"])
         for t in TOOLS
     ]
     agent = FunctionAgent(
@@ -275,6 +343,18 @@ def cmd_doctor(args) -> int:
     return 0
 
 
+async def _run_agent_round(workflow, user_msg: str) -> str:
+    """Run one agent round.
+
+    Tool calls and results are logged by the tool wrappers via _TRANSCRIPT_CTX
+    (set by run_agent before each round). Here we await the workflow — the
+    WorkflowHandler is awaitable but NOT async-iterable in llama-index 0.14 —
+    and return the final response text.
+    """
+    result = await workflow.run(user_msg=user_msg)
+    return _text(getattr(result, "response", None)) or _text(result)
+
+
 async def run_agent(args) -> int:
     llm = get_llm(args.provider, args.model, args.api_base)
 
@@ -301,9 +381,25 @@ async def run_agent(args) -> int:
     workflow = build_workflow(llm)
     doctype = a["doctype"]
     source = a.get("source") or args.source or "unknown"
-    transcript: list[dict] = []
     prev_error_count = None
     final_response = ""
+    after_errs: list = []
+
+    # monotonic audit transcript: run_start, thinking/tool events, rounds, run_end
+    logs_dir = ROOT / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
+    tfile = logs_dir / f"agent-{doctype.lower().replace(' ', '-')}-{stamp}.jsonl"
+    fh = tfile.open("w", encoding="utf-8")
+
+    def log_event(**entry) -> None:
+        row = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), **entry}
+        fh.write(json.dumps(row, default=str) + "\n")
+        fh.flush()
+
+    log_event(event="run_start", doctype=doctype, source=source, base=args.base,
+              provider=args.provider, model=args.model or "(provider default)",
+              max_rounds=args.max_rounds)
 
     for round_no in range(1, args.max_rounds + 1):
         errs = [c for c in a["conflicts"] if c["severity"] == "error"]
@@ -328,8 +424,10 @@ async def run_agent(args) -> int:
                 "confirm they are gone. Import only once no error conflicts remain."
             )
 
-        result = await workflow.run(user_msg=user_msg)
-        final_response = getattr(result, "response", None) or str(result)
+        log_event(event="round_start", round=round_no, errors_before=len(errs),
+                  conflicts_total=len(a["conflicts"]))
+        _TRANSCRIPT_CTX.update({"round": round_no, "log_event": log_event})
+        final_response = await _run_agent_round(workflow, user_msg)
 
         # programmatic verification: re-read the newest analysis artifact
         fresh = latest_analysis(doctype)
@@ -341,13 +439,10 @@ async def run_agent(args) -> int:
         if prev_error_count is not None and len(after_errs) >= prev_error_count:
             note = "  [no decrease vs previous round]"
         print(f"--- Round {round_no}: {len(after_errs)} error(s) remain{note}")
-        transcript.append({
-            "round": round_no,
-            "errors_before": len(errs),
-            "errors_after": len(after_errs),
-            "conflicts_total": len(a["conflicts"]),
-            "response": final_response[-800:],
-        })
+        log_event(event="round_end", round=round_no, errors_before=len(errs),
+                  errors_after=len(after_errs),
+                  conflicts_total=len(a["conflicts"]),
+                  response=final_response[-2000:])
 
         if not after_errs:
             print("\n=== AGENT CONVERGED (no error-severity conflicts) ===\n")
@@ -358,15 +453,10 @@ async def run_agent(args) -> int:
         print(f"\nReached max rounds ({args.max_rounds}) with unresolved error conflicts.")
         print(final_response)
 
-    # persist the round transcript for monitoring / audit
-    logs_dir = ROOT / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
-    tfile = logs_dir / f"agent-{doctype.lower().replace(' ', '-')}-{stamp}.jsonl"
-    with tfile.open("w", encoding="utf-8") as fh:
-        for entry in transcript:
-            fh.write(json.dumps(entry, default=str) + "\n")
-    print(f"\nAgent transcript: {tfile}  ({len(transcript)} round(s))")
+    log_event(event="run_end", max_rounds=args.max_rounds,
+              resolved=len(after_errs) == 0)
+    fh.close()
+    print(f"\nAgent transcript (thinking + tool calls + responses): {tfile}")
     return 0
 
 
