@@ -175,6 +175,16 @@ class MappingEngine:
             targets.append(
                 CandidateTarget(self.parent.name, None, None, f.fieldname, f.label, f)
             )
+        # For doctypes whose name is caller-supplied (autoname is None, e.g.
+        # Contact/Address), expose `name` as a target with frappe's own "ID"
+        # label so an explicit ID column maps and dedups correctly.
+        if self.parent.autoname is None:
+            targets.append(
+                CandidateTarget(
+                    self.parent.name, None, None, "name", "ID",
+                    FieldMeta(fieldname="name", label="ID", fieldtype="Data"),
+                )
+            )
         for table_field, child_name in self.parent.table_fields():
             child = self.children.get(child_name)
             if not child:
@@ -324,7 +334,7 @@ class MappingEngine:
         errors: list[dict] = []
         for r_idx, row in enumerate(source.rows, start=2):  # row 1 = header
             parent: dict[str, Any] = dict(plan.defaults)
-            child_rows: dict[str, list[dict]] = {}
+            child_rows: dict[str, dict] = {}
             row_errors: list[str] = []
             for m, t in parent_map:
                 idx = source.column_index(m.source)
@@ -349,9 +359,8 @@ class MappingEngine:
                 except ValueError as e:
                     row_errors.append(f"{m.source}: {e}")
                     continue
-                child_rows.setdefault(t.table_path, []).append(
-                    {"__erpgen_field": t.fieldname, "value": val}
-                )
+                # merge all child columns for a table into ONE row per parent
+                child_rows.setdefault(t.table_path, {})[t.fieldname] = val
             # drop fetch_from fields from payloads (can't be written)
             for m, t in parent_map:
                 if t.meta.is_fetch_field:
@@ -359,10 +368,8 @@ class MappingEngine:
             if row_errors:
                 errors.append({"row": r_idx, "errors": row_errors})
                 continue
-            for table_path, rows in child_rows.items():
-                parent[table_path] = [
-                    {r["__erpgen_field"]: r["value"]} for r in rows
-                ]
+            for table_path, row in child_rows.items():
+                parent[table_path] = [row]
             # apply value remaps (overrides value_maps) to parent and child fields
             for key, mapping in (plan.value_maps or {}).items():
                 if "." in key:

@@ -57,8 +57,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from erpgen.analysis import build_analysis, save_analysis  # noqa: E402
 from erpgen.client import ERPNextClient  # noqa: E402
 from erpgen.dedup import (  # noqa: E402
+    DEDUP_KEYS,
+    dedup_key_label,
     dedup_payloads,
+    existing_keys,
     existing_names,
+    extract_key,
     infer_id_column,
     resolve_key_field,
 )
@@ -66,6 +70,7 @@ from erpgen.loader import DataImportLoader, RestLoader  # noqa: E402
 from erpgen.logger import RunLogger  # noqa: E402
 from erpgen.mapper import MappingEngine  # noqa: E402
 from erpgen.metadata import DoctypeMeta, fetch_with_children  # noqa: E402
+from erpgen.parties import is_parties_sheet, run_parties_import  # noqa: E402
 from erpgen.overrides import (  # noqa: E402
     DEFAULT_OVERRIDES,
     apply_overrides,
@@ -203,6 +208,25 @@ def cmd_map(args) -> int:
 
 def cmd_import(args) -> int:
     source = read_source(args.source)
+
+    # Flat SMB sheet (inline contact/address columns) -> split into
+    # Customer + Contact + Address internally, same as any other import.
+    if is_parties_sheet(source):
+        client = _client(args)
+        defaults = json.loads(args.defaults) if args.defaults else {}
+        logger = RunLogger(args.log_dir, tag="parties") if args.apply else None
+        if logger:
+            logger.run_start(source=args.source, base=args.base, apply=args.apply)
+        run_parties_import(client, source, defaults=defaults, apply=args.apply, logger=logger)
+        if logger:
+            logger.run_end()
+        return 0
+
+    if not args.doctype:
+        print("ERROR: --doctype is required unless the source is a flat parties sheet "
+              "(detected by inline contact/address columns).", file=sys.stderr)
+        return 2
+
     engine, client = _engine(args, args.doctype)
     plan = engine.suggest(source)
     o_path, overrides = _overrides_for(args, plan.doctype)
@@ -229,9 +253,10 @@ def cmd_import(args) -> int:
     if args.id_column:
         _inject_id_column(source, payloads, plan, args.id_column)
 
-    key_field = resolve_key_field(payloads, plan.id_field or "name")
+    key_label = dedup_key_label(plan.doctype, plan, payloads)
+    spec = DEDUP_KEYS.get(plan.doctype)
     print(f"\nPrepared {len(payloads)} payloads for {plan.doctype}")
-    print(f"  id_field: {plan.id_field!r} | key field: {key_field!r} | id_column: {id_column!r}")
+    print(f"  id_field: {plan.id_field!r} | key: {key_label!r} | id_column: {id_column!r}")
 
     # ---- agent-consumable analysis artifact (saved on dry-run AND apply) ----
     analysis = build_analysis(
@@ -254,7 +279,7 @@ def cmd_import(args) -> int:
             base=args.base,
             mode=mode,
             id_field=plan.id_field,
-            key_field=key_field,
+            key_field=key_label,
             id_column=id_column,
             submit=args.submit,
             defaults=plan.defaults,
@@ -264,8 +289,13 @@ def cmd_import(args) -> int:
             logger.row(e["row"], "", "failed", message="; ".join(e["errors"]))
 
     # ---- predicted dedup (read-only, safe in dry-run too) ----
-    keys = [str(p.get(key_field) or "").strip() for p in payloads if p.get(key_field)]
-    existing = existing_names(client, plan.doctype, plan.id_field or "name", keys) if keys else set()
+    if spec:
+        keys = [extract_key(p, spec["source"]) for p in payloads]
+        keys = [k for k in keys if k]
+        existing = existing_keys(client, plan.doctype, spec["target"]) if keys else set()
+    else:
+        keys = [str(p.get(key_label) or "").strip() for p in payloads if p.get(key_label)]
+        existing = existing_names(client, plan.doctype, plan.id_field or "name", keys) if keys else set()
     predicted_new = [k for k in keys if k not in existing]
     print(f"  of {len(keys)} keyed rows: {len(predicted_new)} new, "
           f"{len(keys) - len(predicted_new)} already exist (will be skipped)")
@@ -281,6 +311,15 @@ def cmd_import(args) -> int:
             print(json.dumps({k: v for k, v in payloads[0].items() if k != "__row"},
                              indent=2) if payloads else "{}")
         return 0
+
+    errs = [c for c in analysis["conflicts"] if c["severity"] == "error"]
+    if errs and not args.bypass_conflicts:
+        print(f"\nERROR: {len(errs)} error-severity conflict(s) remain:")
+        for c in errs:
+            print(f"  [{c['kind']}] {c.get('source') or c.get('field')}")
+        print("Resolve them (set-mapping / createfield / create_record) and re-run, "
+              "or pass --bypass-conflicts to import anyway.")
+        return 2
 
     to_create, skipped = dedup_payloads(
         client, plan.doctype, plan, payloads, id_column=id_column, logger=logger
@@ -306,7 +345,7 @@ def cmd_import(args) -> int:
         results = RestLoader(client).upsert(
             plan.doctype,
             to_create,
-            key_field,
+            key_label,
             existing=existing,
             submit=args.submit,
             logger=logger,
@@ -315,11 +354,18 @@ def cmd_import(args) -> int:
         print(f"REST upsert: created {ok}, failed {sum(1 for r in results if not r.ok)}")
 
     # ---- post-run verification ----
-    created_keys = [str(p.get(key_field)) for p in to_create if p.get(key_field)]
-    verified = existing_names(client, plan.doctype, plan.id_field or "name",
-                              [k for k in created_keys if k])
+    if spec:
+        created_keys = [extract_key(p, spec["source"]) for p in to_create]
+        created_keys = [k for k in created_keys if k]
+        verified = existing_keys(client, plan.doctype, spec["target"])
+        verified_created = sum(1 for k in created_keys if k in verified)
+    else:
+        created_keys = [str(p.get(key_label) or "").strip() for p in to_create if p.get(key_label)]
+        verified = existing_names(client, plan.doctype, plan.id_field or "name",
+                                  [k for k in created_keys if k])
+        verified_created = len(verified)
     logger.run_end(
-        verified_created=len(verified),
+        verified_created=verified_created,
         new_keys=len(created_keys),
     )
     print()
@@ -627,7 +673,7 @@ def main() -> int:
              "everything logged)",
     )
     p_imp.add_argument("source")
-    p_imp.add_argument("--doctype", required=True)
+    p_imp.add_argument("--doctype", help="target doctype (auto-detected for flat parties sheets)")
     p_imp.add_argument("--defaults")
     p_imp.add_argument("--apply", action="store_true", help="actually run the import")
     p_imp.add_argument("--bulk", action="store_true",
@@ -635,6 +681,9 @@ def main() -> int:
     p_imp.add_argument("--submit", action="store_true", help="submit docs after creation")
     p_imp.add_argument("--id-column", help="source column carrying the natural key "
                                            "(auto-inferred when possible)")
+    p_imp.add_argument("--bypass-conflicts", action="store_true",
+                       help="import even if error-severity conflicts remain "
+                            "(default: fail before importing partial data)")
     p_imp.add_argument("--log-dir", default="logs", help="audit log directory (default: logs/)")
     p_imp.add_argument("--overrides", help=f"mapping overrides file "
                                           f"(default: {DEFAULT_OVERRIDES} if present)")

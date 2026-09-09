@@ -2,6 +2,22 @@
 
 Deterministic and verifiable data migration agent for ERPNext
 
+Full demo test run
+
+```
+# customers: 29 rows (20 will be new, nothing pre-exists)
+python3 erpgen.py import samples/customers.csv --doctype Customer \
+    --defaults '{"customer_group":"Commercial","territory":"All Territories"}' --apply
+
+# items: 12 rows, UoM→uoms.uom trap + Machinery-group conflict back
+python3 erpgen.py map samples/items.csv --doctype Item       # see conflicts first
+
+# or the full agent loop on the conflict-rich e2e file
+export DEEPSEEK_API_KEY=<your-key>
+.venv/bin/python scripts/agent.py --doctype Item \
+    --source samples/items_e2e.csv --provider deepseek
+```
+
 Running deterministic mappings:
 
 ```txt

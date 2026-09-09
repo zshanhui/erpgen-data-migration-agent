@@ -29,6 +29,50 @@ NATURAL_KEYS = (
     "party_name",
 )
 
+# Per-doctype natural dedup key, used when the document name is FORMAT-generated
+# (so `name` is not a stable key — a re-run would duplicate). Specs:
+#   "field"           -> top-level payload field
+#   "table.field"     -> first row of a child table
+#   ("a", "b")        -> composite of top-level fields (joined with "|")
+# `source` extracts from the payload; `target` reads existing records' values.
+DEDUP_KEYS = {
+    "Contact": {"source": "email_ids.email_id", "target": "email_id"},
+    "Address": {"source": ("address_title", "address_type"),
+                "target": ("address_title", "address_type")},
+}
+
+
+def extract_key(payload: dict, spec) -> str:
+    """Extract the dedup key from a payload per a key spec."""
+    if isinstance(spec, tuple):
+        return "|".join(str(payload.get(f) or "").strip() for f in spec)
+    if isinstance(spec, str) and "." in spec:
+        table, field = spec.split(".", 1)
+        rows = payload.get(table) or []
+        if rows and rows[0].get(field) not in (None, ""):
+            return str(rows[0].get(field)).strip()
+        return ""
+    return str(payload.get(spec) or "").strip()
+
+
+def existing_keys(client: ERPNextClient, doctype: str, spec) -> set[str]:
+    """Fetch the set of existing dedup-key values for a doctype."""
+    if isinstance(spec, tuple):
+        fields = list(spec)
+        rows = client.list(doctype, fields=fields, limit=0)
+        return {"|".join(str(r.get(f) or "").strip() for f in fields) for r in rows}
+    rows = client.list(doctype, fields=[spec], limit=0)
+    return {str(r.get(spec)).strip() for r in rows if r.get(spec) not in (None, "")}
+
+
+def dedup_key_label(doctype: str, plan: MappingPlan, payloads: list[dict]) -> str:
+    """Human-readable name of the dedup key for the current run."""
+    spec = DEDUP_KEYS.get(doctype)
+    if spec:
+        src = spec["source"]
+        return src if isinstance(src, str) else "+".join(src)
+    return resolve_key_field(payloads, plan.id_field or "name")
+
 
 def resolve_key_field(payloads: list[dict], id_field: str) -> str:
     """Which payload field carries the dedup key.
@@ -104,17 +148,22 @@ def dedup_payloads(
     `__skip_reason`.
     """
     id_field = plan.id_field or "name"
-    key_field = resolve_key_field(payloads, id_field)
+    key_spec = DEDUP_KEYS.get(doctype)
+    if key_spec:
+        source_spec = key_spec["source"]
+        target_spec = key_spec["target"]
+    else:
+        source_spec = target_spec = resolve_key_field(payloads, id_field)
 
     seen: set[str] = set()
     candidates: list[tuple[dict, str]] = []  # (payload, key)
     skipped: list[dict] = []
     for p in payloads:
-        key = str(p.get(key_field) or "").strip()
+        key = extract_key(p, source_spec)
         if not key:
             if logger:
                 logger.row(p.get("__row"), "", "failed",
-                           message=f"missing value for key field '{key_field}'")
+                           message=f"missing value for key '{dedup_key_label(doctype, plan, payloads)}'")
             continue
         if key in seen:
             skipped.append({**p, "__skip_reason": "duplicate within source"})
@@ -125,11 +174,14 @@ def dedup_payloads(
         seen.add(key)
         candidates.append((p, key))
 
-    existing = (
-        existing_names(client, doctype, id_field, [k for _, k in candidates])
-        if candidates
-        else set()
-    )
+    if key_spec:
+        existing = existing_keys(client, doctype, target_spec)
+    else:
+        existing = (
+            existing_names(client, doctype, id_field, [k for _, k in candidates])
+            if candidates
+            else set()
+        )
 
     to_create: list[dict] = []
     for p, key in candidates:
