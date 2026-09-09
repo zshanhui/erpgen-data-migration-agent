@@ -7,21 +7,29 @@ target site's DocType metadata** as the ground truth for mapping.
 
 ```bash
 # zero-dependency core; openpyxl optional for .xlsx (venv provided)
-python3 erpgen.py map samples/customers.csv --doctype Customer \
+# --doctype is optional: the tool infers it from the source headers
+python3 erpgen.py map samples/customers.csv \
     --defaults '{"customer_group":"Commercial","territory":"All Territories"}'
 
 # dry-run import (plan + payloads + predicted dedup, touches nothing)
-python3 erpgen.py import samples/customers.csv --doctype Customer
-python3 erpgen.py import samples/customers.csv --doctype Customer \
+python3 erpgen.py import samples/customers.csv
+python3 erpgen.py import samples/customers.csv \
     --defaults '{"customer_group":"Commercial","territory":"All Territories"}'
 
-# idempotent import: creates only NEW records, skips duplicates, logs everything
-python3 erpgen.py import samples/customers.csv --doctype Customer --apply
-python3 erpgen.py import samples/customers.csv --doctype Customer \
+# idempotent import: creates only NEW records, skips duplicates, logs everything.
+# By default it FAILS (exit 2) before applying if error-severity conflicts remain;
+# --bypass-conflicts restores the original partial-import behavior.
+python3 erpgen.py import samples/customers.csv --apply
+python3 erpgen.py import samples/customers.csv \
     --defaults '{"customer_group":"Commercial","territory":"All Territories"}' --apply
 
+# flat "SMB" sheet: contacts/addresses inline in the same file, auto-detected by
+# header (no --doctype); one Customer + Contact + Address per row, deduped
+python3 erpgen.py import samples/customers-smb.csv            # dry run
+python3 erpgen.py import samples/customers-smb.csv --apply
+
 # bulk path via the Data Import machinery (also deduped), optional submit
-python3 erpgen.py import samples/customers.csv --doctype Customer --apply --bulk --submit
+python3 erpgen.py import samples/customers.csv --apply --bulk --submit
 
 # explicit natural-key column when it isn't auto-inferred
 python3 erpgen.py import samples/sales_orders.csv --doctype "Sales Order" \
@@ -33,6 +41,41 @@ python3 erpgen.py delete --doctype Customer --names "Acme Steel Works"
 
 Defaults: `--base http://localhost:8082 --user Administrator --password admin`.
 For `.xlsx` use the venv: `.venv/bin/python erpgen.py ...` (see below).
+
+## Doctype inference & flat SMB sheets
+
+`map` and `import` **infer the doctype** when `--doctype` is omitted
+(`erpgen/infer.py`), using two signals in priority order:
+
+1. **Header identity columns** (content beats naming): a strong column such as
+   `Customer Name`/`Customer`, `Supplier Name`/`Supplier`, `Item Code`/`Item
+   Name`, `First Name`/`Contact Name`, or `Address Title`/`Address Line 1`
+   names the target.
+2. **File-name prefix** (naming convention): `customers*.csv` → Customer,
+   `items*.csv` → Item, `addresses*.csv` → Address, `contacts*.csv` → Contact
+   (case-insensitive basename match, e.g. `Items_export.csv`).
+
+Inference is a convenience — pass `--doctype` explicitly when both signals are
+absent, and the tool errors (exit 2) rather than guess when it can't tell.
+
+A **flat SMB sheet** — where contacts/addresses are inline columns in the same
+file (`Customer Name, Customer Type, Group, Territory, Contact Name, Email,
+Phone, Address Type, Address Line 1, City, State, Postal Code, Country`) — is
+detected by header and routed through the normal `import` command to the
+parties flow: one Customer + linked Contact + Address per row, all idempotent.
+No `--doctype` is required; `--defaults` still applies (e.g. Group/Territory).
+Applied runs log to `logs/parties-<ts>.jsonl` (one `row` event per doctype),
+which is **not** yet consumed by `rollback` (that reads `logs/import-*.jsonl`).
+
+## Conflict gate (fail-before-apply)
+
+By default `import --apply` **refuses to run while error-severity conflicts
+remain** (missing required fields, link values that don't exist on the target,
+etc.), printing them and exiting 2. Resolve them (`set-mapping` /
+`createfield` / `create-record`), or pass `--bypass-conflicts` to import the
+conflict-free subset anyway. Dry-run (no `--apply`) is never gated — it always
+shows the plan + predicted dedup. The agent's `run_import` tool inherits this:
+it must resolve conflicts before it can apply.
 
 ## Idempotency & logging
 
@@ -151,11 +194,17 @@ error-severity conflicts are zero.
 .venv/bin/python scripts/agent.py --analysis analysis/analysis-customer-<ts>.json  # resume
 .venv/bin/python scripts/agent.py --doctor --doctype Customer --source samples/customers.csv
 #   ^ no-LLM mode: prints the 9 tools + current conflicts, for wiring/debugging
+
+# flat SMB sheet: no LLM round-trip — detected by header, imported directly
+.venv/bin/python scripts/agent.py --source samples/customers-smb.csv            # dry run
+.venv/bin/python scripts/agent.py --source samples/customers-smb.csv --apply    # import
 ```
 
-Provider: `--provider openai|anthropic|ollama` (auto-detected from
-`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`; Ollama uses `--ollama-base-url` /
-`--model`).
+`--doctype` is optional; the agent infers it from the source headers like the
+CLI does. Provider: `--provider auto|openai|deepseek` (auto-detected from
+`OPENAI_API_KEY` / `DEEPSEEK_API_KEY`; DeepSeek defaults to model
+`deepseek-v4-flash` at `https://api.deepseek.com`, overridable with `--model` /
+`--api-base`).
 
 Tools the agent can call: `latest_analysis`, `run_map`, `run_import`,
 `create_field`, `create_record`, `set_mapping`, `describe_doctype`,
@@ -283,6 +332,8 @@ Behavior notes:
   it merely found existing.
 - Rollback is scoped to **one run's log** — records from other runs are
   untouched, so you can unwind migrations independently.
+- Flat SMB-sheet imports write `logs/parties-*.jsonl` and are **not** covered by
+  `rollback` (see "Doctype inference & flat SMB sheets").
 
 ## Verified against the demo (v16)
 

@@ -66,6 +66,7 @@ from erpgen.dedup import (  # noqa: E402
     infer_id_column,
     resolve_key_field,
 )
+from erpgen.infer import guess_doctype  # noqa: E402
 from erpgen.loader import DataImportLoader, RestLoader  # noqa: E402
 from erpgen.logger import RunLogger  # noqa: E402
 from erpgen.mapper import MappingEngine  # noqa: E402
@@ -176,6 +177,17 @@ def _overrides_for(args, doctype: str) -> tuple[Optional[str], dict]:
 
 def cmd_map(args) -> int:
     source = read_source(args.source)
+    if not args.doctype:
+        if is_parties_sheet(source):
+            print("ERROR: this is a flat parties sheet (inline contact/address). "
+                  "Use 'import', not 'map'.", file=sys.stderr)
+            return 2
+        args.doctype = guess_doctype(source)
+        if not args.doctype:
+            print("ERROR: could not infer doctype from headers; pass --doctype.",
+                  file=sys.stderr)
+            return 2
+        print(f"Inferred doctype: {args.doctype}")
     print(f"Source: {source.name} | {len(source.headers)} columns x {source.n_rows} rows")
     for p in source.profiles:
         extra = f" [{', '.join(p.messy)}]" if p.messy else ""
@@ -223,9 +235,12 @@ def cmd_import(args) -> int:
         return 0
 
     if not args.doctype:
-        print("ERROR: --doctype is required unless the source is a flat parties sheet "
-              "(detected by inline contact/address columns).", file=sys.stderr)
-        return 2
+        args.doctype = guess_doctype(source)
+        if not args.doctype:
+            print("ERROR: could not infer doctype from headers; pass --doctype.",
+                  file=sys.stderr)
+            return 2
+        print(f"Inferred doctype: {args.doctype}")
 
     engine, client = _engine(args, args.doctype)
     plan = engine.suggest(source)
@@ -657,7 +672,7 @@ def main() -> int:
 
     p_map = sub.add_parser("map", help="build a mapping plan from a source file")
     p_map.add_argument("source")
-    p_map.add_argument("--doctype", required=True)
+    p_map.add_argument("--doctype", help="target doctype (inferred from headers if omitted)")
     p_map.add_argument("--defaults", help='JSON defaults, e.g. \'{"customer_group":"Commercial"}\'')
     p_map.add_argument("--save", help="save plan JSON to this path")
     p_map.add_argument("--overrides", help=f"mapping overrides file "

@@ -41,7 +41,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from erpgen.client import ERPNextClient  # noqa: E402
+from erpgen.infer import guess_doctype  # noqa: E402
 from erpgen.overrides import DEFAULT_OVERRIDES, set_mapping  # noqa: E402
+from erpgen.parties import is_parties_sheet  # noqa: E402
+from erpgen.source import read_source  # noqa: E402
 from erpgen.tools import (  # noqa: E402
     create_field,
     create_record,
@@ -109,20 +112,25 @@ def t_latest_analysis(doctype: str) -> str:
     return _j(a)
 
 
-def t_run_map(source: str, doctype: str, defaults: str = "{}") -> str:
-    cmd = ["map", source, "--doctype", doctype]
+def t_run_map(source: str, doctype: str = "", defaults: str = "{}") -> str:
+    cmd = ["map", source]
+    if doctype:
+        cmd += ["--doctype", doctype]
     if defaults and defaults != "{}":
         cmd += ["--defaults", defaults]
     code, out = _erpgen(cmd)
-    fresh = latest_analysis(doctype)
+    dt = doctype or guess_doctype(read_source(source))
+    fresh = latest_analysis(dt) if dt else None
     if fresh is None:
         return f"map failed (exit {code}):\n{out[-1500:]}"
     return f"map exit {code}. Fresh analysis:\n{_j(fresh)}"
 
 
-def t_run_import(source: str, doctype: str, apply: bool = False,
+def t_run_import(source: str, doctype: str = "", apply: bool = False,
                  defaults: str = "{}") -> str:
-    cmd = ["import", source, "--doctype", doctype]
+    cmd = ["import", source]
+    if doctype:
+        cmd += ["--doctype", doctype]
     if defaults and defaults != "{}":
         cmd += ["--defaults", defaults]
     if apply:
@@ -356,20 +364,42 @@ async def _run_agent_round(workflow, user_msg: str) -> str:
 
 
 async def run_agent(args) -> int:
+    # Flat party sheet (inline contact/address) has no single doctype and no
+    # mapping conflicts — run the deterministic parties import directly.
+    if args.source:
+        src = read_source(args.source)
+        if is_parties_sheet(src):
+            print("Flat parties sheet detected — running deterministic import "
+                  f"({'apply' if args.apply else 'dry-run'}).")
+            cmd = ["import", args.source]
+            if args.defaults:
+                cmd += ["--defaults", args.defaults]
+            if args.apply:
+                cmd.append("--apply")
+            code, out = _erpgen(cmd, timeout=900)
+            print(out[-2500:])
+            return 0 if code == 0 else 2
+        doctype = args.doctype or guess_doctype(src)
+
     llm = get_llm(args.provider, args.model, args.api_base)
 
     # ensure we have an analysis to work from
     if args.analysis:
         a = json.loads(Path(args.analysis).read_text(encoding="utf-8"))
     elif args.source:
-        _erpgen(["map", args.source, "--doctype", args.doctype]
-                + (["--defaults", args.defaults] if args.defaults else []))
-        a = latest_analysis(args.doctype)
+        cmd = ["map", args.source]
+        if doctype:
+            cmd += ["--doctype", doctype]
+        if args.defaults:
+            cmd += ["--defaults", args.defaults]
+        _erpgen(cmd)
+        a = latest_analysis(doctype or guess_doctype(src))
         if a is None:
             print("ERROR: map produced no analysis", file=sys.stderr)
             return 2
     else:
-        a = latest_analysis(args.doctype)
+        doctype = args.doctype or None
+        a = latest_analysis(doctype) if doctype else None
         if a is None:
             print("ERROR: no analysis found. Pass --source or --analysis.", file=sys.stderr)
             return 2
@@ -476,6 +506,8 @@ def main() -> int:
                                        "(DeepSeek default: https://api.deepseek.com)")
     ap.add_argument("--max-rounds", type=int, default=20,
                     help="outer convergence loop cap (default: 20)")
+    ap.add_argument("--apply", action="store_true",
+                    help="flat sheets: import immediately instead of dry-run")
     ap.add_argument("--doctor", action="store_true",
                     help="show tools + analysis without calling an LLM")
     args = ap.parse_args()
