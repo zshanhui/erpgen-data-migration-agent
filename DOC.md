@@ -62,10 +62,18 @@ A **flat SMB sheet** — where contacts/addresses are inline columns in the same
 file (`Customer Name, Customer Type, Group, Territory, Contact Name, Email,
 Phone, Address Type, Address Line 1, City, State, Postal Code, Country`) — is
 detected by header and routed through the normal `import` command to the
-parties flow: one Customer + linked Contact + Address per row, all idempotent.
-No `--doctype` is required; `--defaults` still applies (e.g. Group/Territory).
-Applied runs log to `logs/parties-<ts>.jsonl` (one `row` event per doctype),
-which is **not** yet consumed by `rollback` (that reads `logs/import-*.jsonl`).
+customers_full flow: one Customer + linked Contact + Address per row, all
+idempotent. No `--doctype` is required; `--defaults` still applies (e.g.
+Group/Territory). A **contact shared across customers** (same email) is created
+once and gets a `Dynamic Link` row per customer (`linked` in the summary)
+instead of being re-created or silently dropped; addresses stay one-per-customer.
+Per-row insert failures (e.g. a required `address_line1`/`city`/`country`
+missing) are logged as `failed` with a `WARNING:` on stderr and skipped — they
+never abort the run. A failed record is **not** added to its dedup set, so
+fixing the source and re-running retries it and (for addresses/contacts) links
+it to its customer. Applied runs log to `logs/customers_full-<ts>.jsonl` (one
+`row` event per doctype), which is **not** yet consumed by `rollback` (that
+reads `logs/import-*.jsonl`).
 
 ## Conflict gate (fail-before-apply)
 
@@ -332,8 +340,8 @@ Behavior notes:
   it merely found existing.
 - Rollback is scoped to **one run's log** — records from other runs are
   untouched, so you can unwind migrations independently.
-- Flat SMB-sheet imports write `logs/parties-*.jsonl` and are **not** covered by
-  `rollback` (see "Doctype inference & flat SMB sheets").
+- Flat SMB-sheet imports write `logs/customers_full-*.jsonl` and are **not**
+  covered by `rollback` (see "Doctype inference & flat SMB sheets").
 
 ## Verified against the demo (v16)
 

@@ -43,7 +43,7 @@ sys.path.insert(0, str(ROOT))
 from erpgen.client import ERPNextClient  # noqa: E402
 from erpgen.infer import guess_doctype  # noqa: E402
 from erpgen.overrides import DEFAULT_OVERRIDES, set_mapping  # noqa: E402
-from erpgen.parties import is_parties_sheet  # noqa: E402
+from erpgen.customers_full import is_customers_full_sheet  # noqa: E402
 from erpgen.source import read_source  # noqa: E402
 from erpgen.tools import (  # noqa: E402
     create_field,
@@ -364,12 +364,12 @@ async def _run_agent_round(workflow, user_msg: str) -> str:
 
 
 async def run_agent(args) -> int:
-    # Flat party sheet (inline contact/address) has no single doctype and no
-    # mapping conflicts — run the deterministic parties import directly.
+    # Flat customers_full sheet (inline contact/address) has no single doctype and no
+    # mapping conflicts — run the deterministic customers_full import directly.
     if args.source:
         src = read_source(args.source)
-        if is_parties_sheet(src):
-            print("Flat parties sheet detected — running deterministic import "
+        if is_customers_full_sheet(src):
+            print("Flat customers_full sheet detected — running deterministic import "
                   f"({'apply' if args.apply else 'dry-run'}).")
             cmd = ["import", args.source]
             if args.defaults:

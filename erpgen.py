@@ -71,7 +71,7 @@ from erpgen.loader import DataImportLoader, RestLoader  # noqa: E402
 from erpgen.logger import RunLogger  # noqa: E402
 from erpgen.mapper import MappingEngine  # noqa: E402
 from erpgen.metadata import DoctypeMeta, fetch_with_children  # noqa: E402
-from erpgen.parties import is_parties_sheet, run_parties_import  # noqa: E402
+from erpgen.customers_full import is_customers_full_sheet, run_customers_full_import  # noqa: E402
 from erpgen.overrides import (  # noqa: E402
     DEFAULT_OVERRIDES,
     apply_overrides,
@@ -178,8 +178,8 @@ def _overrides_for(args, doctype: str) -> tuple[Optional[str], dict]:
 def cmd_map(args) -> int:
     source = read_source(args.source)
     if not args.doctype:
-        if is_parties_sheet(source):
-            print("ERROR: this is a flat parties sheet (inline contact/address). "
+        if is_customers_full_sheet(source):
+            print("ERROR: this is a flat customers_full sheet (inline contact/address). "
                   "Use 'import', not 'map'.", file=sys.stderr)
             return 2
         args.doctype = guess_doctype(source)
@@ -223,13 +223,13 @@ def cmd_import(args) -> int:
 
     # Flat SMB sheet (inline contact/address columns) -> split into
     # Customer + Contact + Address internally, same as any other import.
-    if is_parties_sheet(source):
+    if is_customers_full_sheet(source):
         client = _client(args)
         defaults = json.loads(args.defaults) if args.defaults else {}
-        logger = RunLogger(args.log_dir, tag="parties") if args.apply else None
+        logger = RunLogger(args.log_dir, tag="customers_full") if args.apply else None
         if logger:
             logger.run_start(source=args.source, base=args.base, apply=args.apply)
-        run_parties_import(client, source, defaults=defaults, apply=args.apply, logger=logger)
+        run_customers_full_import(client, source, defaults=defaults, apply=args.apply, logger=logger)
         if logger:
             logger.run_end()
         return 0
@@ -688,7 +688,7 @@ def main() -> int:
              "everything logged)",
     )
     p_imp.add_argument("source")
-    p_imp.add_argument("--doctype", help="target doctype (auto-detected for flat parties sheets)")
+    p_imp.add_argument("--doctype", help="target doctype (auto-detected for flat customers_full sheets)")
     p_imp.add_argument("--defaults")
     p_imp.add_argument("--apply", action="store_true", help="actually run the import")
     p_imp.add_argument("--bulk", action="store_true",
