@@ -75,6 +75,28 @@ it to its customer. Applied runs log to `logs/customers_full-<ts>.jsonl` (one
 `row` event per doctype), which is **not** yet consumed by `rollback` (that
 reads `logs/import-*.jsonl`).
 
+### Out-of-contract columns & the flat contract override
+
+Columns **not** in the fixed `FLAT_MAP` contract (e.g. `Tax ID`, `Website`,
+`Loyalty Tier`, `Customer Since`) are surfaced by `map`/`import` as
+error-severity `unmapped_column` conflicts in a `customers_full` analysis,
+each with a `suggested_action`: map it to an existing field, or create a custom
+field then map it. Resolve them by extending the flat contract with `set-mapping`:
+
+```bash
+# maps to an existing field
+python3 erpgen.py set-mapping customers_full --column "Tax ID" --target customer.tax_id
+
+# needs a new field first
+python3 erpgen.py createfield Customer --label "Customer Since" --fieldtype Date
+python3 erpgen.py set-mapping customers_full --column "Customer Since" --target customer.customer_since
+```
+
+`set-mapping customers_full` targets are `customer|contact|address.<fieldname>`
+and are validated against live metadata. Once a column is mapped, it leaves the
+conflict list and its values import into the right doctype (rerun `map` to
+confirm zero conflicts).
+
 ## Conflict gate (fail-before-apply)
 
 By default `import --apply` **refuses to run while error-severity conflicts
@@ -203,16 +225,16 @@ error-severity conflicts are zero.
 .venv/bin/python scripts/agent.py --doctor --doctype Customer --source samples/customers.csv
 #   ^ no-LLM mode: prints the 9 tools + current conflicts, for wiring/debugging
 
-# flat SMB sheet: no LLM round-trip — detected by header, imported directly
-.venv/bin/python scripts/agent.py --source samples/customers-smb.csv            # dry run
-.venv/bin/python scripts/agent.py --source samples/customers-smb.csv --apply    # import
+# flat SMB sheet (Customer + Contact + Address): full agentic loop — the LLM
+# resolves out-of-contract columns (create fields + set_mapping) then imports
+.venv/bin/python scripts/agent.py --source samples/customers-smb.csv
 ```
 
 `--doctype` is optional; the agent infers it from the source headers like the
-CLI does. Provider: `--provider auto|openai|deepseek` (auto-detected from
-`OPENAI_API_KEY` / `DEEPSEEK_API_KEY`; DeepSeek defaults to model
-`deepseek-v4-flash` at `https://api.deepseek.com`, overridable with `--model` /
-`--api-base`).
+CLI does (a flat SMB sheet is handled as doctype `customers_full`). Provider:
+`--provider auto|openai|deepseek` (auto-detected from `OPENAI_API_KEY` /
+`DEEPSEEK_API_KEY`; DeepSeek defaults to model `deepseek-v4-flash` at
+`https://api.deepseek.com`, overridable with `--model` / `--api-base`).
 
 Tools the agent can call: `latest_analysis`, `run_map`, `run_import`,
 `create_field`, `create_record`, `set_mapping`, `describe_doctype`,

@@ -1,0 +1,12 @@
+{
+  "customers_full": {
+    "mappings": {
+      "Website": "customer.website",
+      "Loyalty Tier": "customer.loyalty_program_tier",
+      "Customer Since": "customer.customer_since",
+      "Tax ID": "customer.tax_id"
+    },
+    "defaults": {},
+    "value_maps": {}
+  }
+}

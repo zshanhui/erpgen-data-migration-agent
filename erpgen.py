@@ -71,7 +71,14 @@ from erpgen.loader import DataImportLoader, RestLoader  # noqa: E402
 from erpgen.logger import RunLogger  # noqa: E402
 from erpgen.mapper import MappingEngine  # noqa: E402
 from erpgen.metadata import DoctypeMeta, fetch_with_children  # noqa: E402
-from erpgen.customers_full import is_customers_full_sheet, run_customers_full_import  # noqa: E402
+from erpgen.customers_full import (  # noqa: E402
+    FLAT_MAP,
+    build_customers_full_analysis,
+    is_customers_full_sheet,
+    load_flat_mappings,
+    parse_flat_target,
+    run_customers_full_import,
+)
 from erpgen.overrides import (  # noqa: E402
     DEFAULT_OVERRIDES,
     apply_overrides,
@@ -177,11 +184,23 @@ def _overrides_for(args, doctype: str) -> tuple[Optional[str], dict]:
 
 def cmd_map(args) -> int:
     source = read_source(args.source)
+    if is_customers_full_sheet(source):
+        # flat sheet: fixed contract + out-of-contract columns surfaced for the LLM
+        client = _client(args)
+        flat_mappings = load_flat_mappings(args.overrides or DEFAULT_OVERRIDES)
+        analysis = build_customers_full_analysis(
+            client, source, base_url=args.base, source_path=args.source,
+            flat_mappings=flat_mappings,
+        )
+        apath = save_analysis(analysis, args.analysis_dir)
+        print(f"customers_full analysis saved to {apath}")
+        print(f"  {len(analysis['known_mappings'])} contract columns, "
+              f"{len(analysis['extra_columns'])} out-of-contract column(s)")
+        for c in analysis["conflicts"]:
+            print(f"  [{c['severity']:<7}] {c['source']:<18} "
+                  f"-> {c.get('target') or c.get('suggested_action')}")
+        return 0
     if not args.doctype:
-        if is_customers_full_sheet(source):
-            print("ERROR: this is a flat customers_full sheet (inline contact/address). "
-                  "Use 'import', not 'map'.", file=sys.stderr)
-            return 2
         args.doctype = guess_doctype(source)
         if not args.doctype:
             print("ERROR: could not infer doctype from headers; pass --doctype.",
@@ -226,12 +245,29 @@ def cmd_import(args) -> int:
     if is_customers_full_sheet(source):
         client = _client(args)
         defaults = json.loads(args.defaults) if args.defaults else {}
+        flat_mappings = load_flat_mappings(args.overrides or DEFAULT_OVERRIDES)
         logger = RunLogger(args.log_dir, tag="customers_full") if args.apply else None
         if logger:
             logger.run_start(source=args.source, base=args.base, apply=args.apply)
-        run_customers_full_import(client, source, defaults=defaults, apply=args.apply, logger=logger)
+        run_customers_full_import(
+            client, source, defaults=defaults, apply=args.apply, logger=logger,
+            flat_mappings=flat_mappings,
+        )
         if logger:
             logger.run_end()
+        # surface out-of-contract columns for an LLM agent to resolve
+        extra = [h for h in source.headers if h not in FLAT_MAP and h not in flat_mappings]
+        if extra:
+            analysis = build_customers_full_analysis(
+                client, source, base_url=args.base, source_path=args.source,
+                flat_mappings=flat_mappings,
+            )
+            apath = save_analysis(analysis, args.analysis_dir)
+            print(f"\nNOTE: {len(extra)} column(s) outside the flat contract are "
+                  f"dropped at import.")
+            print(f"Analysis saved to {apath}  "
+                  f"({len(analysis['conflicts'])} conflicts, "
+                  f"{len(analysis['suggested_custom_fields'])} suggested custom fields)")
         return 0
 
     if not args.doctype:
@@ -517,6 +553,25 @@ def cmd_set_mapping(args) -> int:
         print("ERROR: --column and --target are required (or use --unset / --list)",
               file=sys.stderr)
         return 2
+
+    # flat customers_full: target is '<doctype>.<fieldname>' across the 3 doctypes
+    if args.doctype == "customers_full":
+        parsed = parse_flat_target(args.target)
+        if parsed is None:
+            print(f"ERROR: flat target must be '<doctype>.<fieldname>' where doctype "
+                  f"is customer|contact|address (got {args.target!r}).", file=sys.stderr)
+            return 2
+        dt_key, field = parsed
+        canonical = {"customer": "Customer", "contact": "Contact", "address": "Address"}[dt_key]
+        parent, children = fetch_with_children(client, canonical)
+        valid = {t.qualified for t in MappingEngine(parent, children).targets}
+        if field not in valid:
+            print(f"ERROR: target field '{field}' is not on {canonical}. "
+                  "Use createfield to add it first, or check the fieldname.", file=sys.stderr)
+            return 2
+        set_mapping(path, args.doctype, args.column, args.target)
+        print(f"Override saved: customers_full.{args.column} -> {args.target} ({path})")
+        return 0
 
     # validate the target against live metadata (incl. custom fields)
     parent, children = fetch_with_children(client, args.doctype)

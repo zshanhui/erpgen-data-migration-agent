@@ -42,8 +42,10 @@ sys.path.insert(0, str(ROOT))
 
 from erpgen.client import ERPNextClient  # noqa: E402
 from erpgen.infer import guess_doctype  # noqa: E402
+from erpgen.mapper import MappingEngine  # noqa: E402
+from erpgen.metadata import fetch_with_children  # noqa: E402
 from erpgen.overrides import DEFAULT_OVERRIDES, set_mapping  # noqa: E402
-from erpgen.customers_full import is_customers_full_sheet  # noqa: E402
+from erpgen.customers_full import is_customers_full_sheet, parse_flat_target  # noqa: E402
 from erpgen.source import read_source  # noqa: E402
 from erpgen.tools import (  # noqa: E402
     create_field,
@@ -114,12 +116,14 @@ def t_latest_analysis(doctype: str) -> str:
 
 def t_run_map(source: str, doctype: str = "", defaults: str = "{}") -> str:
     cmd = ["map", source]
-    if doctype:
+    src = read_source(source)
+    flat = is_customers_full_sheet(src)
+    if not flat and doctype:
         cmd += ["--doctype", doctype]
     if defaults and defaults != "{}":
         cmd += ["--defaults", defaults]
     code, out = _erpgen(cmd)
-    dt = doctype or guess_doctype(read_source(source))
+    dt = doctype or ("customers_full" if flat else guess_doctype(src))
     fresh = latest_analysis(dt) if dt else None
     if fresh is None:
         return f"map failed (exit {code}):\n{out[-1500:]}"
@@ -158,6 +162,20 @@ def t_create_record(doctype: str, fields_json: str) -> str:
 
 def t_set_mapping(doctype: str, column: str, target: str) -> str:
     try:
+        if doctype == "customers_full":
+            parsed = parse_flat_target(target)
+            if parsed is None:
+                return _j({"error": f"flat target must be '<doctype>.<fieldname>' "
+                                    f"with doctype in customer|contact|address "
+                                    f"(got {target!r})"})
+            dt_key, field = parsed
+            canonical = {"customer": "Customer", "contact": "Contact",
+                         "address": "Address"}[dt_key]
+            parent, children = fetch_with_children(CLIENT, canonical)
+            valid = {t.qualified for t in MappingEngine(parent, children).targets}
+            if field not in valid:
+                return _j({"error": f"field '{field}' is not on {canonical}; "
+                                    "create_field it first"})
         set_mapping(str(ROOT / DEFAULT_OVERRIDES), doctype, column, target)
         return _j({"saved": f"{doctype}.{column} -> {target}",
                    "file": str(ROOT / DEFAULT_OVERRIDES)})
@@ -205,7 +223,9 @@ TOOLS = [
                     "to learn required fields."},
     {"fn": t_set_mapping, "name": "set_mapping",
      "description": "Record a forced source-column -> target-field mapping override "
-                    "for a doctype. Fixes ambiguous/missed mappings."},
+                    "for a doctype. Fixes ambiguous/missed mappings. For flat "
+                    "customers_full sheets use doctype='customers_full' and "
+                    "target='<doctype>.<fieldname>' (e.g. customer.tax_id)."},
     {"fn": t_describe_doctype, "name": "describe_doctype",
      "description": "Summarize a doctype's structure (required fields, links, "
                     "child tables, fetch_from, id field)."},
@@ -226,6 +246,16 @@ Conflict kinds and how to fix them:
 - fetch_from: the target field is read-only (populated from another doc); you
   cannot write it directly. Note it and move on.
 - required_missing: pass defaults to run_map/run_import.
+
+Flat customers_full sheets (doctype='customers_full', one file with Customer +
+Contact + Address): every conflict is an out-of-contract column and is
+error-severity (blocking). Resolve each via its suggested_action:
+- resolution=extend_contract -> set_mapping('customers_full', column,
+  '<doctype>.<target>'), e.g. set_mapping('customers_full', 'Tax ID', 'customer.tax_id').
+- resolution=create_custom_field -> first create_field(doctype, label, fieldtype)
+  (or run the suggested create_command), then set_mapping('customers_full',
+  column, '<doctype>.<fieldname>') using the suggested fieldname.
+Then run_map again and confirm zero conflicts remain before importing.
 
 Per-iteration workflow:
 1. Read the analysis from the user message or latest_analysis.
@@ -364,22 +394,16 @@ async def _run_agent_round(workflow, user_msg: str) -> str:
 
 
 async def run_agent(args) -> int:
-    # Flat customers_full sheet (inline contact/address) has no single doctype and no
-    # mapping conflicts — run the deterministic customers_full import directly.
+    flat = False
     if args.source:
         src = read_source(args.source)
         if is_customers_full_sheet(src):
-            print("Flat customers_full sheet detected — running deterministic import "
-                  f"({'apply' if args.apply else 'dry-run'}).")
-            cmd = ["import", args.source]
-            if args.defaults:
-                cmd += ["--defaults", args.defaults]
-            if args.apply:
-                cmd.append("--apply")
-            code, out = _erpgen(cmd, timeout=900)
-            print(out[-2500:])
-            return 0 if code == 0 else 2
-        doctype = args.doctype or guess_doctype(src)
+            flat = True
+            doctype = "customers_full"
+        else:
+            doctype = args.doctype or guess_doctype(src)
+    else:
+        doctype = args.doctype or None
 
     llm = get_llm(args.provider, args.model, args.api_base)
 
@@ -388,17 +412,16 @@ async def run_agent(args) -> int:
         a = json.loads(Path(args.analysis).read_text(encoding="utf-8"))
     elif args.source:
         cmd = ["map", args.source]
-        if doctype:
+        if doctype and not flat:
             cmd += ["--doctype", doctype]
         if args.defaults:
             cmd += ["--defaults", args.defaults]
         _erpgen(cmd)
-        a = latest_analysis(doctype or guess_doctype(src))
+        a = latest_analysis(doctype)
         if a is None:
             print("ERROR: map produced no analysis", file=sys.stderr)
             return 2
     else:
-        doctype = args.doctype or None
         a = latest_analysis(doctype) if doctype else None
         if a is None:
             print("ERROR: no analysis found. Pass --source or --analysis.", file=sys.stderr)
@@ -506,8 +529,6 @@ def main() -> int:
                                        "(DeepSeek default: https://api.deepseek.com)")
     ap.add_argument("--max-rounds", type=int, default=20,
                     help="outer convergence loop cap (default: 20)")
-    ap.add_argument("--apply", action="store_true",
-                    help="flat sheets: import immediately instead of dry-run")
     ap.add_argument("--doctor", action="store_true",
                     help="show tools + analysis without calling an LLM")
     args = ap.parse_args()
