@@ -142,8 +142,12 @@ def apply_inverse(client: ERPNextClient, inv: dict, apply: bool = True) -> tuple
         return False, str(e)
 
 
-def _already_reverted(data: dict) -> Optional[dict]:
-    """The latest revert marker in this journal, if it covers all effects."""
+def already_reverted(data: dict) -> Optional[dict]:
+    """The latest revert marker in this journal, if it covers all effects.
+
+    Public because selecting the *next* journal to revert (`latest_run`) must
+    apply exactly the same rule as reverting one — they disagreed once already.
+    """
     markers = [e for e in data.get("extra", []) if e.get("event") == "revert"]
     if not markers:
         return None
@@ -171,7 +175,7 @@ def revert_journal(client: ERPNextClient, path: str | Path,
     otherwise try to delete records that are legitimately gone.
     """
     data = parse_journal(path)
-    marker = _already_reverted(data)
+    marker = already_reverted(data)
     if marker and apply and not force:
         return {"path": str(path), "run_start": data["run_start"],
                 "total": len(data["effects"]), "applied": 0, "failed": [],

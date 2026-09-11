@@ -308,14 +308,11 @@ def latest_run(doctype: str, log_dir: str | Path = "logs") -> Optional[Path]:
 
     def reverted(f: Path) -> bool:
         try:
-            from .journal import parse_journal  # noqa: PLC0415
+            from .journal import already_reverted, parse_journal  # noqa: PLC0415
 
-            data = parse_journal(f)
+            return already_reverted(parse_journal(f)) is not None
         except Exception:  # noqa: BLE001
             return False
-        markers = [e for e in data.get("extra", []) if e.get("event") == "revert"]
-        return bool(markers and markers[-1].get("status") == "ok"
-                    and markers[-1].get("reverted", 0) >= len(data["effects"]))
 
     for f in cands:
         if not reverted(f):

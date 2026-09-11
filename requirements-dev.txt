@@ -1,0 +1,2 @@
+# development / test dependencies (runtime deps are stdlib-only; openpyxl optional)
+pytest>=8

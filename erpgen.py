@@ -838,7 +838,9 @@ def cmd_revert(args) -> int:
     return 0 if not res["failed"] else 1
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser. Extracted from main() so tests can parse argv
+    without dispatching a command."""
     ap = argparse.ArgumentParser(prog="erpgen.py", description=__doc__)
     ap.add_argument("--base", default=DEFAULT_BASE, help=f"ERPNext URL (default {DEFAULT_BASE})")
     ap.add_argument("--user", default="Administrator")
@@ -985,6 +987,11 @@ def main() -> int:
     p_del.add_argument("--names", required=True, help="comma-separated names")
     p_del.set_defaults(fn=cmd_delete)
 
+    return ap
+
+
+def main() -> int:
+    ap = build_parser()
     args = ap.parse_args()
     try:
         return args.fn(args)

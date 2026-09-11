@@ -441,6 +441,41 @@ It answers the first turn with a `describe_doctype` tool call and the next with 
 final text message. Note the agent needs the venv python (`.venv/bin/python`),
 not the system `python3` — `llama_index` lives there.
 
+## Tests
+
+```bash
+.venv/bin/python -m pytest              # whole unit suite (no stack needed)
+.venv/bin/python -m pytest tests/test_journal.py -v
+```
+
+The unit suite is **pure**: no network, no live ERPNext, no Docker. Everything is
+built in-process (`DoctypeMeta.from_api`, `SourceTable`, a `FakeClient`) or written
+to pytest's `tmp_path`. It covers the P0 state machines — the layers where every
+logic bug in this project has actually lived:
+
+| file | covers |
+|---|---|
+| `tests/test_context_requirements.py` | requirement identity/ids across commands, partial coverage, condition-vs-effect satisfaction, regression reopening |
+| `tests/test_context_effects.py` | effect sequencing across processes, replay on reopen, close idempotence, corrupt-log tolerance, read views |
+| `tests/test_journal.py` | journal parsing, inverse application (incl. already-gone), LIFO replay, idempotent re-revert, revert markers |
+| `tests/test_overrides.py` | overrides load/save/set/unset, forced mappings, required-field recomputation |
+| `tests/test_run_selection.py` | `resolve_run`/`latest_run` — newest-by-mtime, skipping reverted, path-traversal safety |
+| `tests/test_cli_args.py` | every subcommand parses and carries the global flags, `_snake`, `_json_arg`, `_inject_id_column` |
+
+Regression tests are written against bugs that actually shipped, so the suite is
+verified the other way round too:
+
+```bash
+.venv/bin/python scripts/mutation-check.py
+```
+
+That script rewrites each fixed bug back to its buggy form, runs the targeted
+test, and expects a failure ("all 15 mutations caught"). Add a mutation whenever
+you add a regression test — a test that passes against the bug is worthless.
+
+Integration coverage remains the shell scripts (`scripts/test-items-import.sh`,
+`scripts/verify-demo.sh`), which need the demo stack up.
+
 ## Verified against the demo (v16)
 
 - Customers CSV → plan → import: created 4, **re-run → 0 created, 4 skipped**,
