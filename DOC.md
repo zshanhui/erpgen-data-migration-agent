@@ -72,7 +72,7 @@ missing) are logged as `failed` with a `WARNING:` on stderr and skipped — they
 never abort the run. A failed record is **not** added to its dedup set, so
 fixing the source and re-running retries it and (for addresses/contacts) links
 it to its customer. Applied runs log to `logs/customers_full-<ts>.jsonl` (one
-`row` event per doctype), which is **not** yet consumed by `rollback` (that
+`row` event per doctype), which is **not** yet consumed by `revert` (that
 reads `logs/import-*.jsonl`).
 
 ### Out-of-contract columns & the flat contract override
@@ -158,12 +158,20 @@ erpgen/
   dedup.py     natural-key resolution + existence checks (idempotency)
   logger.py    RunLogger — JSONL audit trail + run summary
   loader.py    RestLoader.upsert (default) + DataImportLoader (--bulk)
+  journal.py   MigrationJournal — effects + the inverse that undoes each
+  context.py   MigrationContext — one run file: requirements, sequenced effects
+  overrides.py mapping overrides file (source of truth for decisions)
+  tools.py     agent-facing primitives (records, fields, metadata)
 erpgen.py     CLI: map | import | createfield | describe-doctype | get-record |
-              list-records | set-mapping | rollback | rollback-schema |
-              rollback-options | delete
+              list-records | set-mapping | create-record | revert | status | delete
+scripts/agent.py  LlamaIndex AgentWorkflow agent (+ --doctor, --run)
 samples/       demo CSV + XLSX
 logs/          per-run audit logs (JSONL)
 ```
+
+One migration = one `--run <id>` context (`logs/run-<id>.jsonl`) accumulating
+requirements and sequenced effects across commands; `status` reads it, `revert`
+undoes it. Without `--run`, each command writes its own `journal-*.jsonl`.
 
 Deterministic for now; `MappingEngine.suggest(llm=...)` accepts a callback for
 LLM-assisted disambiguation of hard cases later.
@@ -322,48 +330,116 @@ before insert. Invalid targets are rejected against live metadata; unknown
 source columns are ignored with a warning. The source file is never touched —
 decisions live in the JSON and show up in every analysis artifact.
 
-## Rollback (undo a migration)
+## Revert (journal-based undo — preferred)
 
-Every import and agent run writes logs, so migrations can be **rolled back**.
-Three commands, each dry-run by default (`--apply` to execute), each accepting
-an explicit `log` path or `--latest <doctype>` to pick the newest matching log:
-
-| Command | Undoes | Log consumed |
-|---|---|---|
-| `rollback` | records created by an import run (newest-first) | `logs/import-<doctype>-*.jsonl` |
-| `rollback-options` | lookup records the agent created (Item Groups, UOMs, Territories…) | `logs/agent-<doctype>-*.jsonl` |
-| `rollback-schema` | custom fields the agent created — **drops the columns + data** | `logs/agent-<doctype>-*.jsonl` |
+Every mutation is journaled **at effect time** with the *inverse* that undoes it
+(`logs/journal-<doctype>-<ts>.jsonl`). `revert` replays those inverses
+newest-first, so **one command** undoes a whole run — records, custom fields and
+mapping overrides together:
 
 ```bash
-# preview (default)
-python3 erpgen.py rollback --latest Item
-python3 erpgen.py rollback-options --latest Item
-python3 erpgen.py rollback-schema --latest Item
-
-# execute
-python3 erpgen.py rollback --latest Item --apply
-python3 erpgen.py rollback-options --latest Item --apply
-python3 erpgen.py rollback-schema --latest Item --apply   # destructive
+python3 erpgen.py revert --latest Item          # dry run: list the inverses
+python3 erpgen.py revert --latest Item --apply  # execute them
+python3 erpgen.py revert logs/journal-item-<ts>.jsonl --apply
 ```
 
-Full undo of an agent run (records + option records + fields):
+Journaled effect → inverse:
+
+| Effect | Inverse |
+|---|---|
+| record created (import / agent `create_record`) | delete that record |
+| custom field created (`createfield` / agent `create_field`) | drop the Custom Field (drops the column + data) |
+| mapping override set/unset (`set-mapping`) | restore the previous override value |
+
+This is the **authoritative** undo path: it replays recorded inverses rather than
+re-deriving intent from logs, and it covers mixed effects in one shot. Agent runs
+journal automatically (their in-process `create_field`/`create_record`/
+`set_mapping` calls are recorded against the run's journal).
+
+Revert is **safe to repeat**: a successfully reverted journal gets an appended
+`revert` marker, so reverting it again reports `Already reverted` instead of
+re-deleting things (use `--force` to replay). Deleting something that is already
+gone counts as success, not failure.
+
+`--latest <DOCTYPE>` picks the newest log for that doctype **by modification
+time** (run ids are arbitrary, so they do not sort chronologically), looking at
+both `run-*.jsonl` and `journal-*.jsonl`, and skipping journals that were already
+reverted.
+
+## Unified migration context (`--run`)
+
+Pass the same `--run <id>` to every command and they share **one** context file,
+`logs/run-<id>.jsonl`, spanning the whole migration — mapping, field/record
+creation and the import itself:
 
 ```bash
-python3 erpgen.py rollback --latest Item --apply
-python3 erpgen.py rollback-options --latest Item --apply
-python3 erpgen.py rollback-schema --latest Item --apply
+RUN=acme-01
+python3 erpgen.py --run $RUN map samples/items_e2e.csv --doctype Item   # raises requirements
+python3 erpgen.py --run $RUN createfield Item --label "Notes"           # satisfies one
+python3 erpgen.py --run $RUN create-record UOM --fields '{"uom_name": "Dozen"}'
+python3 erpgen.py --run $RUN set-mapping Item --column Group --target item_group
+python3 erpgen.py status $RUN                                           # requirements + effects
+python3 erpgen.py --run $RUN import samples/items_e2e.csv --doctype Item --apply
+python3 erpgen.py revert $RUN --apply                                   # undo the whole run
 ```
 
-Behavior notes:
-- `rollback`/`rollback-options` report (rather than abort on) failures — e.g. a
-  record now referenced by a transaction won't delete and is listed as `FAILED`.
-- `rollback-schema` is **irreversible for column data**; it only drops fields
-  the agent actually created (`created: true` in the transcript), never fields
-  it merely found existing.
-- Rollback is scoped to **one run's log** — records from other runs are
-  untouched, so you can unwind migrations independently.
-- Flat SMB-sheet imports write `logs/customers_full-*.jsonl` and are **not**
-  covered by `rollback` (see "Doctype inference & flat SMB sheets").
+Two things make this more than bookkeeping:
+
+- **Requirements (coeffects).** `map` records every conflict as a *requirement*
+  on the run. Requirements are re-checked against **every** effect from **any**
+  later command, so a fix closes the requirement it addresses and `status` shows
+  `0 pending` — the import gate then opens on its own. Multi-value requirements
+  stay open until *all* values are fixed (creating UOM `Dozen` alone does not
+  close "`Dozen` and `Roll` are missing"), and satisfying an `ambiguous_mapping`
+  requirement requires choosing a target (`set-mapping`), not just touching it.
+- **Sequenced, cross-command effects.** Effect sequence numbers continue across
+  processes (`#1 … #11`), and because the run file is re-read on open, an effect
+  applied in one command and a requirement raised in another still meet.
+- **Requirements are identified, not counted twice.** `map` and `import` both
+  re-run the mapper, so the same conflict is seen repeatedly; a requirement is
+  keyed by `(kind, source, target, doctype, field)` and only recorded once per
+  run while it stays open. If a requirement that was satisfied is raised again
+  (its fix was undone), it reappears flagged `(REOPENED)` rather than silently
+  staying "satisfied".
+
+Effects → requirement they satisfy:
+
+| Effect | Closes |
+|---|---|
+| `custom_field_create` (label or fieldname matches) | `unmapped_column` |
+| `record_create` (all missing values present) | `link_value_conflict` |
+| `override_set` (keyed on the ambiguous source column) | `ambiguous_mapping` |
+
+If the artifact a fix needs **already exists**, the requirement is satisfied as a
+*condition* with no effect journaled — so a later `revert` never deletes data this
+run did not create:
+
+```
+[warning] ambiguous_mapping   satisfied (effect)     'Group' scores equally for item_group, ...
+[info   ] unmapped_column     satisfied (condition)  Source column has no matching ERPNext field
+```
+
+The agent joins the same context with `--run`: the mapper's conflicts seed the
+run's requirements and the agent's `create_field` / `create_record` /
+`set_mapping` tool calls close them, so an agentic migration is revertible with
+one command and leaves a single auditable log.
+
+### Testing the agent without an API key
+
+`scripts/mock-llm.py` is a tiny OpenAI-compatible stand-in (streaming included,
+since `FunctionAgent` streams) — handy for verifying a change to the agent end to
+end without spending credits or needing egress:
+
+```bash
+python3 scripts/mock-llm.py 8765 &
+DEEPSEEK_API_KEY=dummy .venv/bin/python scripts/agent.py --run mock-01 \
+    --source samples/customers_e2e.csv --doctype Customer \
+    --provider deepseek --api-base http://127.0.0.1:8765/v1 --max-rounds 1
+```
+
+It answers the first turn with a `describe_doctype` tool call and the next with a
+final text message. Note the agent needs the venv python (`.venv/bin/python`),
+not the system `python3` — `llama_index` lives there.
 
 ## Verified against the demo (v16)
 

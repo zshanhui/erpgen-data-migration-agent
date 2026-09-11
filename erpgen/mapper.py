@@ -289,7 +289,25 @@ class MappingEngine:
                         "its values will be dropped"
                     )
 
-        # required-field coverage
+        # required-field + fetch-field coverage (recomputed after overrides too)
+        self.check_coverage(plan)
+
+        return plan
+
+    # ------------------------------------------------------------ coverage
+    COVERAGE_PREFIXES = ("Required field '", "Read-only fetch field '")
+
+    def check_coverage(self, plan: MappingPlan) -> None:
+        """(Re)compute required-field and fetch-field warnings from the plan.
+
+        Called by `suggest()` and again by `apply_overrides()`, because an
+        override can satisfy a required field the scorer left uncovered (or
+        uncover one it had mapped) — warnings must reflect the *effective* plan.
+        """
+        plan.warnings = [
+            w for w in plan.warnings if not w.startswith(self.COVERAGE_PREFIXES)
+        ]
+
         covered = set(plan.mapped_fields()) | set(plan.defaults.keys())
         for f in self.parent.mandatory_fields():
             if f.fieldname not in covered and not f.is_fetch_field:
@@ -298,15 +316,12 @@ class MappingEngine:
                     f"and no default"
                 )
 
-        # fetch_from fields not touched by the source
         for f in self.parent.fetch_fields():
             if f.fieldname not in plan.mapped_fields():
                 plan.warnings.append(
                     f"Read-only fetch field '{f.fieldname}' left alone (good): "
                     f"populated from {f.fetch_from}"
                 )
-
-        return plan
 
     # ------------------------------------------------------------ payloads
     def build_payloads(

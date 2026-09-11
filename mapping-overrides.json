@@ -8,5 +8,21 @@
     },
     "defaults": {},
     "value_maps": {}
+  },
+  "Item": {
+    "mappings": {
+      "UoM": "stock_uom"
+    },
+    "defaults": {},
+    "value_maps": {}
+  },
+  "Customer": {
+    "mappings": {
+      "Group": "customer_group",
+      "Vendor Code": "customer.vendor_code",
+      "Internal Ref": "customer.internal_ref"
+    },
+    "defaults": {},
+    "value_maps": {}
   }
 }

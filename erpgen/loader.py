@@ -60,6 +60,7 @@ class DataImportLoader:
         skipped: int = 0,
         timeout: int = 300,
         logger: Optional[RunLogger] = None,
+        journal=None,
     ) -> ImportResult:
         with tempfile.NamedTemporaryFile(
             "w", suffix=".csv", delete=False, encoding="utf-8"
@@ -104,6 +105,8 @@ class DataImportLoader:
                     if logger and log.get("docname"):
                         logger.row(first_row, str(log.get("docname")), "created",
                                    docname=log.get("docname"))
+                    if journal and log.get("docname"):
+                        journal.record_created(doctype, str(log.get("docname")))
                     continue
                 if messages:
                     try:
@@ -164,6 +167,7 @@ class RestLoader:
         submit: bool = False,
         delay: float = 0.0,
         logger: Optional[RunLogger] = None,
+        journal=None,
     ) -> list[RowResult]:
         """Insert payloads whose key is not in `existing`; log everything.
 
@@ -189,6 +193,8 @@ class RestLoader:
                 results.append(RowResult(name=doc.get("name"), ok=True))
                 if logger:
                     logger.row(row, key, "created", docname=doc.get("name"))
+                if journal and doc.get("name"):
+                    journal.record_created(doctype, doc["name"])
             except Exception as e:  # noqa: BLE001 — collect per-row failures
                 results.append(RowResult(name=key or payload.get("name"), ok=False, error=str(e)))
                 if logger:

@@ -12,6 +12,10 @@ from typing import Optional
 
 from .analysis import _snake
 from .client import ERPNextClient
+
+# When set (e.g. by an agent run), create_field / create_record journal their
+# effects so a whole run can be reverted with `erpgen.py revert`.
+ACTIVE_JOURNAL = None
 from .metadata import DoctypeMeta
 
 
@@ -122,6 +126,11 @@ def create_field(
         limit=1,
     )
     if existing:
+        # the column already exists: the requirement is met even though this run
+        # creates nothing (no inverse to journal)
+        if ACTIVE_JOURNAL is not None and hasattr(ACTIVE_JOURNAL, "note_condition"):
+            ACTIVE_JOURNAL.note_condition("custom_field_create", doctype=doctype,
+                                          label=label, fieldname=fieldname)
         return {"name": existing[0]["name"], "fieldname": fieldname, "created": False}
 
     doc: dict = {
@@ -144,6 +153,8 @@ def create_field(
         doc["default"] = default
 
     cf = client.insert("Custom Field", doc)
+    if ACTIVE_JOURNAL is not None:
+        ACTIVE_JOURNAL.custom_field_created(doctype, fieldname, cf["name"], label=label)
     return {"name": cf["name"], "fieldname": fieldname, "created": True}
 
 
@@ -165,10 +176,15 @@ def create_record(client: ERPNextClient, doctype: str, fields: dict) -> dict:
                 limit=1,
             )
             if existing:
+                if ACTIVE_JOURNAL is not None and hasattr(ACTIVE_JOURNAL, "note_condition"):
+                    ACTIVE_JOURNAL.note_condition("record_create", doctype=doctype,
+                                                  name=existing[0]["name"])
                 return {"name": existing[0]["name"], "created": False}
         except Exception:
             pass
     doc = client.insert(doctype, fields)
+    if ACTIVE_JOURNAL is not None and doc.get("name"):
+        ACTIVE_JOURNAL.record_created(doctype, doc["name"])
     return {"name": doc.get("name"), "created": True}
 
 
@@ -193,151 +209,3 @@ def list_records(
     )
 
 
-def parse_import_log(path: str | Path) -> tuple[str, list[str]]:
-    """Read an import run log and return (doctype, ordered created docnames).
-
-    The import logger writes one JSON object per line; created rows carry
-    `event == "row"` and `status == "created"` with their docname.
-    """
-    doctype = None
-    names: list[str] = []
-    seen: set[str] = set()
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("event") == "run_start":
-            doctype = entry.get("doctype") or doctype
-        elif entry.get("event") == "row" and entry.get("status") == "created":
-            name = entry.get("docname")
-            if name and name not in seen:
-                seen.add(name)
-                names.append(name)
-    if not doctype:
-        raise ValueError(f"no run_start/doctype found in {path}")
-    return doctype, names
-
-
-def rollback_records(
-    client: ERPNextClient,
-    doctype: str,
-    names: list[str],
-    apply: bool = False,
-) -> dict:
-    """Delete the records a migration created, newest-first.
-
-    `apply=False` returns a dry-run preview without touching anything.
-    Deletions that fail (e.g. the record is now referenced elsewhere) are
-    collected with their error message rather than aborting the rollback.
-    """
-    deleted: list[str] = []
-    failed: list[dict] = []
-    for name in reversed(names):
-        if not apply:
-            deleted.append(name)
-            continue
-        try:
-            client.delete(doctype, name)
-            deleted.append(name)
-        except Exception as e:  # noqa: BLE001 — referenced/absent records reported
-            failed.append({"name": name, "error": str(e)})
-    return {
-        "doctype": doctype,
-        "total": len(names),
-        "deleted": len(deleted),
-        "failed": failed,
-    }
-
-
-def parse_agent_schema_changes(path: str | Path) -> list[dict]:
-    """Extract custom fields the agent created, from a transcript log.
-
-    Reads `tool_result` lines where the `create_field` tool returned
-    `created: true`; the result carries the Custom Field doc name (dropping it
-    drops the column).
-    """
-    fields: list[dict] = []
-    seen: set[str] = set()
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("event") != "tool_result" or entry.get("tool") != "create_field":
-            continue
-        try:
-            result = json.loads(entry.get("result_tail") or "{}")
-        except json.JSONDecodeError:
-            continue
-        name = result.get("name")
-        if result.get("created") and name and name not in seen:
-            seen.add(name)
-            fields.append({"custom_field": name, "fieldname": result.get("fieldname")})
-    return fields
-
-
-def rollback_schema(client: ERPNextClient, fields: list[dict],
-                    apply: bool = False) -> dict:
-    """Drop the custom fields the agent created (DROPS the columns + data).
-
-    Dry-run by default; `apply=True` deletes each Custom Field doc.
-    """
-    deleted: list[dict] = []
-    failed: list[dict] = []
-    for f in fields:
-        if not apply:
-            deleted.append(f)
-            continue
-        try:
-            client.delete("Custom Field", f["custom_field"])
-            deleted.append(f)
-        except Exception as e:  # noqa: BLE001
-            failed.append({"custom_field": f["custom_field"], "error": str(e)})
-    return {"total": len(fields), "deleted": len(deleted), "failed": failed}
-
-
-def parse_agent_option_records(path: str | Path) -> list[dict]:
-    """Extract lookup records the agent created via create_record.
-
-    Returns [{"doctype", "name"}] pairs, deduped, in transcript order.
-    """
-    records: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("event") != "tool_result" or entry.get("tool") != "create_record":
-            continue
-        try:
-            args = json.loads(entry.get("args") or "{}")
-            result = json.loads(entry.get("result_tail") or "{}")
-        except json.JSONDecodeError:
-            continue
-        doctype, name = args.get("doctype"), result.get("name")
-        if not doctype or not name or not result.get("created"):
-            continue
-        key = (doctype, name)
-        if key not in seen:
-            seen.add(key)
-            records.append({"doctype": doctype, "name": name})
-    return records
-
-
-def rollback_options(client: ERPNextClient, records: list[dict],
-                     apply: bool = False) -> dict:
-    """Delete the lookup records the agent created, newest-first."""
-    deleted: list[dict] = []
-    failed: list[dict] = []
-    for r in reversed(records):
-        if not apply:
-            deleted.append(r)
-            continue
-        try:
-            client.delete(r["doctype"], r["name"])
-            deleted.append(r)
-        except Exception as e:  # noqa: BLE001
-            failed.append({**r, "error": str(e)})
-    return {"total": len(records), "deleted": len(deleted), "failed": failed}

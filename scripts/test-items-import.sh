@@ -32,19 +32,34 @@ names="$(IFS=,; echo "${ITEM_CODES[*]}")"
 "$PY" erpgen.py delete --doctype "$DOCTYPE" --names "$names" 2>&1 || true
 
 echo
-echo "== 2. map + import (--apply) =="
+echo "== 2. resolve prerequisites (what the agent would do) =="
+# a) the UoM column scores against the child table 'uoms.uom' — force the parent field
+"$PY" erpgen.py set-mapping "$DOCTYPE" --column "UoM" --target stock_uom 2>&1 | grep -E "Override saved|Journal" || true
+# b) 'Machinery' item group is a lookup record the sample references
+"$PY" - <<'PYEOF'
+import os, sys; sys.path.insert(0, ".")
+from erpgen.client import ERPNextClient
+from erpgen.tools import create_record
+c = ERPNextClient(os.environ.get("BASE", "http://localhost:8082"))
+r = create_record(c, "Item Group", {"item_group_name": "Machinery",
+                                    "parent_item_group": "All Item Groups"})
+print(f"  item group Machinery: {r}")
+PYEOF
+
+echo
+echo "== 3. import (--apply) =="
 OUT="$("$PY" erpgen.py import "$SOURCE" --doctype "$DOCTYPE" --apply 2>&1)"
 echo "$OUT" | sed -n '/Dedup:/,$p'
 
-if echo "$OUT" | grep -qE "failed: [1-9]|failed [1-9]"; then
-    echo "FAIL: import reported failures" >&2
+if echo "$OUT" | grep -qE "failed: [1-9]|failed [1-9]|error-severity conflict"; then
+    echo "FAIL: import reported failures or was blocked by conflicts" >&2
     exit 1
 fi
 CREATED="$(echo "$OUT" | sed -n 's/.*created \([0-9]*\).*/\1/p' | head -1)"
 echo "  (import created $CREATED records)"
 
 echo
-echo "== 3. verify: all 12 items present with expected key fields =="
+echo "== 4. verify: all 12 items present with expected key fields =="
 MISSING=0
 for code in "${ITEM_CODES[@]}"; do
     doc="$("$PY" erpgen.py get-record "$DOCTYPE" "$code" 2>/dev/null)" || { MISSING=1; echo "  MISSING: $code"; continue; }

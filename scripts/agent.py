@@ -44,7 +44,7 @@ from erpgen.client import ERPNextClient  # noqa: E402
 from erpgen.infer import guess_doctype  # noqa: E402
 from erpgen.mapper import MappingEngine  # noqa: E402
 from erpgen.metadata import fetch_with_children  # noqa: E402
-from erpgen.overrides import DEFAULT_OVERRIDES, set_mapping  # noqa: E402
+from erpgen.overrides import DEFAULT_OVERRIDES, load_overrides, set_mapping  # noqa: E402
 from erpgen.customers_full import is_customers_full_sheet, parse_flat_target  # noqa: E402
 from erpgen.source import read_source  # noqa: E402
 from erpgen.tools import (  # noqa: E402
@@ -84,16 +84,28 @@ def _j(v) -> str:
 def _text(value) -> str:
     """Normalize an agent result to plain text.
 
-    llama-index may hand back a str, a ChatMessage, or an object with .content
-    depending on how the workflow finishes — unwrap any of them safely.
+    llama-index may hand back a str, a ChatMessage, or an AgentOutput depending
+    on how the workflow finishes — unwrap any of them safely.
+
+    A message with no content (the model ended its turn on a tool call) yields
+    "", never a role repr like "user: None".
     """
     if value is None:
         return ""
     if isinstance(value, str):
         return value
     content = getattr(value, "content", None)
-    if content is not None:
+    if isinstance(content, str) and content.strip():
+        return content
+    # newer llama-index keeps text in .blocks
+    blocks = getattr(value, "blocks", None) or []
+    parts = [getattr(b, "text", None) for b in blocks if getattr(b, "text", None)]
+    if parts:
+        return "\n".join(parts)
+    if content:
         return str(content)
+    if hasattr(value, "role") or hasattr(value, "blocks"):
+        return ""          # content-less chat message: no text to show
     return str(value)
 
 
@@ -176,9 +188,16 @@ def t_set_mapping(doctype: str, column: str, target: str) -> str:
             if field not in valid:
                 return _j({"error": f"field '{field}' is not on {canonical}; "
                                     "create_field it first"})
-        set_mapping(str(ROOT / DEFAULT_OVERRIDES), doctype, column, target)
-        return _j({"saved": f"{doctype}.{column} -> {target}",
-                   "file": str(ROOT / DEFAULT_OVERRIDES)})
+        path = str(ROOT / DEFAULT_OVERRIDES)
+        prev = ((load_overrides(path).get(doctype) or {}).get("mappings") or {}).get(column)
+        set_mapping(path, doctype, column, target)
+        # journal the decision like the CLI does, so it is revertible (inverse
+        # restores the previous mapping) and resolves ambiguous_mapping requirements
+        from erpgen import tools as _t  # noqa: PLC0415
+        if _t.ACTIVE_JOURNAL is not None:
+            _t.ACTIVE_JOURNAL.override_set(doctype, column, target, prev, path)
+        return _j({"saved": f"{doctype}.{column} -> {target}", "file": path,
+                   "previous": prev})
     except Exception as e:  # noqa: BLE001
         return _j({"error": str(e)})
 
@@ -390,7 +409,13 @@ async def _run_agent_round(workflow, user_msg: str) -> str:
     and return the final response text.
     """
     result = await workflow.run(user_msg=user_msg)
-    return _text(getattr(result, "response", None)) or _text(result)
+    text = _text(getattr(result, "response", None)) or _text(getattr(result, "raw", None))
+    if not text.strip():
+        calls = getattr(result, "tool_calls", None) or []
+        text = (f"(no text response; the agent ended its turn with "
+                f"{len(calls)} tool call(s) — see the transcript)") if calls \
+            else "(no text response)"
+    return text
 
 
 async def run_agent(args) -> int:
@@ -454,6 +479,31 @@ async def run_agent(args) -> int:
               provider=args.provider, model=args.model or "(provider default)",
               max_rounds=args.max_rounds)
 
+    # journal every effect this run applies (custom fields, records) so the whole
+    # run is revertible with one command: erpgen.py revert <journal>
+    from erpgen import tools as erpgen_tools  # noqa: PLC0415
+
+    # with --run the agent joins the same unified context as the CLI commands:
+    # the mapper's conflicts become the run's requirements, and the agent's tool
+    # calls satisfy them reactively. Without it, fall back to a per-run journal.
+    if getattr(args, "run", None):
+        from erpgen.context import MigrationContext  # noqa: PLC0415
+        journal = MigrationContext(args.run, logs_dir, source=source or "agent",
+                                   base_url=args.base, doctypes=[doctype],
+                                   command="agent")
+        seeded = journal.add_requirements(a["conflicts"])
+        log_event(event="run_context_open", path=str(journal.path), requirements=seeded)
+        print(f"Run context: {journal.path}  ({seeded} requirement(s) recorded)")
+    else:
+        from erpgen.journal import MigrationJournal  # noqa: PLC0415
+        journal = MigrationJournal(logs_dir, doctype=doctype, source=source or "agent",
+                                   base_url=args.base)
+        log_event(event="journal_open", path=str(journal.path))
+    erpgen_tools.ACTIVE_JOURNAL = journal
+
+    converged = False
+    final_response = ""
+    after_errs: list = []
     for round_no in range(1, args.max_rounds + 1):
         errs = [c for c in a["conflicts"] if c["severity"] == "error"]
         print(f"\n=== Round {round_no}/{args.max_rounds} — {len(errs)} error conflict(s), "
@@ -500,15 +550,31 @@ async def run_agent(args) -> int:
         if not after_errs:
             print("\n=== AGENT CONVERGED (no error-severity conflicts) ===\n")
             print(final_response)
+            converged = True
             break
         prev_error_count = len(after_errs)
     else:
         print(f"\nReached max rounds ({args.max_rounds}) with unresolved error conflicts.")
         print(final_response)
 
-    log_event(event="run_end", max_rounds=args.max_rounds,
-              resolved=len(after_errs) == 0)
+    log_event(event="run_end", max_rounds=args.max_rounds, resolved=converged)
     fh.close()
+    erpgen_tools.ACTIVE_JOURNAL = None
+
+    is_context = hasattr(journal, "pending_requirements")   # unified run context
+    if is_context:
+        pend = journal.pending_requirements()
+        print(f"\nRun context: {journal.path}  ({journal.effects} effect(s), "
+              f"{len(pend)} requirement(s) still pending)")
+        for r in pend:
+            print(f"    PENDING  {r.get('kind')}: {r.get('detail')}")
+        journal.close(status="ok")
+        print(f"  revert the whole run: python3 erpgen.py revert {journal.run_id} --apply")
+    else:
+        journal.close()
+        print(f"\nJournal: {journal.path}  ({journal.count} revertible effect(s))")
+        print(f"  revert with: python3 erpgen.py revert {journal.path}")
+
     print(f"\nAgent transcript (thinking + tool calls + responses): {tfile}")
     return 0
 
@@ -527,6 +593,9 @@ def main() -> int:
     ap.add_argument("--model", help="LLM model (provider default if omitted)")
     ap.add_argument("--api-base", help="OpenAI-compatible base URL "
                                        "(DeepSeek default: https://api.deepseek.com)")
+    ap.add_argument("--run", metavar="RUN_ID",
+                    help="join a unified migration run context (logs/run-<id>.jsonl) so "
+                         "mapper requirements, agent fixes and revert all share one log")
     ap.add_argument("--max-rounds", type=int, default=20,
                     help="outer convergence loop cap (default: 20)")
     ap.add_argument("--doctor", action="store_true",

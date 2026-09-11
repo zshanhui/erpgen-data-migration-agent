@@ -107,4 +107,9 @@ def apply_overrides(
 
     plan.defaults.update(overrides.get("defaults") or {})
     plan.value_maps = dict(overrides.get("value_maps") or {})
+
+    # an override can satisfy (or uncover) a required field — recompute warnings
+    # so they describe the effective plan, not the pre-override scoring
+    engine.check_coverage(plan)
+
     return count

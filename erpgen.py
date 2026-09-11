@@ -36,10 +36,10 @@ Examples:
   python3 erpgen.py list-records "Customer Group" --filter '[["name","like","%Whol%"]]'
   python3 erpgen.py describe-doctype "Customer Group"   # what a record needs
 
-  # rollback a migration (records / option records / custom fields)
-  python3 erpgen.py rollback --latest Item
-  python3 erpgen.py rollback-options --latest Item
-  python3 erpgen.py rollback-schema --latest Item        # drops columns (destructive)
+  # revert a migration (replays the run journal's inverses: records, custom
+  # fields and mapping overrides in one command)
+  python3 erpgen.py revert --latest Item
+  python3 erpgen.py revert --latest Item --apply
 
   # clean up demo data
   python3 erpgen.py delete --doctype Customer --names "Acme Steel Works,Bluedot Logistics"
@@ -56,6 +56,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from erpgen.analysis import build_analysis, save_analysis  # noqa: E402
 from erpgen.client import ERPNextClient  # noqa: E402
+from erpgen.context import (  # noqa: E402
+    MigrationContext,
+    latest_run,
+    load_run,
+    resolve_run,
+)
 from erpgen.dedup import (  # noqa: E402
     DEDUP_KEYS,
     dedup_key_label,
@@ -67,6 +73,11 @@ from erpgen.dedup import (  # noqa: E402
     resolve_key_field,
 )
 from erpgen.infer import guess_doctype  # noqa: E402
+from erpgen.journal import (  # noqa: E402
+    MigrationJournal,
+    parse_journal,
+    revert_journal,
+)
 from erpgen.loader import DataImportLoader, RestLoader  # noqa: E402
 from erpgen.logger import RunLogger  # noqa: E402
 from erpgen.mapper import MappingEngine  # noqa: E402
@@ -93,15 +104,41 @@ from erpgen.tools import (  # noqa: E402
     describe_doctype,
     get_record,
     list_records,
-    parse_agent_schema_changes,
-    parse_import_log,
-    parse_agent_option_records,
-    rollback_records,
-    rollback_schema,
-    rollback_options,
 )
 
 DEFAULT_BASE = "http://localhost:8082"
+
+
+def _context(args, doctype: str = "", source: str = "", command: str = ""):
+    """Shared migration context when --run <id> is given, else None.
+
+    With a run id, every command appends requirements/effects to ONE file, so
+    `revert <run-id>` undoes the whole migration.
+    """
+    run = getattr(args, "run", None)
+    if not run:
+        return None
+    return MigrationContext(
+        run,
+        log_dir=getattr(args, "log_dir", "logs"),
+        source=source,
+        base_url=getattr(args, "base", ""),
+        doctypes=[doctype] if doctype else None,
+        command=command,
+    )
+
+
+def _effect_sink(args, doctype: str = "", source: str = "", command: str = ""):
+    """Where effects are journaled: the run context, or a per-command journal."""
+    ctx = _context(args, doctype, source, command)
+    if ctx is not None:
+        return ctx
+    return MigrationJournal(
+        getattr(args, "log_dir", "logs"),
+        doctype=doctype or "migration",
+        source=source or command,
+        base_url=getattr(args, "base", ""),
+    )
 
 
 def _client(args) -> ERPNextClient:
@@ -234,6 +271,12 @@ def cmd_map(args) -> int:
     print(f"Analysis saved to {apath}  "
           f"({len(analysis['conflicts'])} conflicts, "
           f"{len(analysis['suggested_custom_fields'])} suggested custom fields)")
+
+    ctx = _context(args, plan.doctype, args.source, command="map")
+    if ctx:
+        n = ctx.add_requirements(analysis["conflicts"])
+        ctx.close()
+        print(f"Run context: {ctx.path}  ({n} requirement(s) recorded)")
     return 0
 
 
@@ -322,8 +365,14 @@ def cmd_import(args) -> int:
     # ---- run log (created before any write so conversion failures are logged) ----
     mode = "bulk (Data Import)" if args.bulk else "upsert (REST)"
     logger = None
+    journal = None
     if args.apply:
         logger = RunLogger(args.log_dir, tag=f"import-{plan.doctype.lower().replace(' ', '-')}")
+        ctx = _context(args, plan.doctype, args.source, command="import")
+        if ctx:
+            ctx.add_requirements(analysis["conflicts"])
+        journal = ctx or MigrationJournal(args.log_dir, doctype=plan.doctype,
+                                          source=args.source, base_url=args.base)
         logger.run_start(
             doctype=plan.doctype,
             source=args.source,
@@ -390,6 +439,7 @@ def cmd_import(args) -> int:
                 skipped=len(skipped),
                 timeout=args.timeout,
                 logger=logger,
+                journal=journal,
             )
             print(json.dumps(result.as_dict(), indent=2))
     else:
@@ -400,6 +450,7 @@ def cmd_import(args) -> int:
             existing=existing,
             submit=args.submit,
             logger=logger,
+            journal=journal,
         )
         ok = sum(1 for r in results if r.ok and not r.skipped)
         print(f"REST upsert: created {ok}, failed {sum(1 for r in results if not r.ok)}")
@@ -419,8 +470,15 @@ def cmd_import(args) -> int:
         verified_created=verified_created,
         new_keys=len(created_keys),
     )
+    journal.close()
     print()
     print(logger.summary(plan.doctype, args.source))
+    if ctx:
+        print(f"Run context: {journal.path}  ({journal.effects} effect(s), "
+              f"{len(journal.pending_requirements())} requirement(s) still pending)")
+        print(f"  revert the whole migration: python3 erpgen.py revert {args.run} --apply")
+    else:
+        print(f"Journal: {journal.path}  ({journal.count} revertible effect(s))")
     return 0
 
 
@@ -474,6 +532,12 @@ def cmd_createfield(args) -> int:
     )
     if result["created"]:
         print(f"Created {result['name']} ({args.fieldtype}) on {doctype}")
+        sink = _effect_sink(args, doctype, source="createfield", command="createfield")
+        sink.custom_field_created(doctype, result["fieldname"], result["name"],
+                                  label=args.label)
+        sink.close()
+        label = "Run context" if getattr(args, "run", None) else "Journal"
+        print(f"{label}: {sink.path}")
     else:
         print(f"Field already exists: {result['name']} (nothing to do)")
         return 0
@@ -545,8 +609,16 @@ def cmd_set_mapping(args) -> int:
         return 0
 
     if args.unset:
+        prev_data = load_overrides(path)
+        prev = ((prev_data.get(args.doctype) or {}).get("mappings") or {}).get(args.unset)
         ok = unset_mapping(path, args.doctype, args.unset)
         print(f"Removed override for '{args.unset}'" if ok else f"No override for '{args.unset}'")
+        if ok:
+            sink = _effect_sink(args, args.doctype, source="set-mapping",
+                                 command="set-mapping")
+            sink.override_set(args.doctype, args.unset, None, prev, path)
+            sink.close()
+            print(f"Journal: {sink.path}")
         return 0
 
     if not args.column or not args.target:
@@ -581,8 +653,15 @@ def cmd_set_mapping(args) -> int:
               "Use createfield to add it first, or check the fieldname.", file=sys.stderr)
         return 2
 
+    prev = ((load_overrides(path).get(args.doctype) or {}).get("mappings") or {}).get(args.column)
     set_mapping(path, args.doctype, args.column, args.target)
     print(f"Override saved: {args.doctype}.{args.column} -> {args.target} ({path})")
+    sink = _effect_sink(args, args.doctype, source="set-mapping", command="set-mapping")
+    sink.override_set(args.doctype, args.column, args.target, prev, path)
+    if hasattr(sink, "config_delta"):
+        sink.config_delta(path, args.doctype, {"mappings": {args.column: args.target}})
+    sink.close()
+    print(f"Journal: {sink.path}")
     return 0
 
 
@@ -633,7 +712,7 @@ def _latest_log(doctype: str, prefix: str):
 
 
 def _resolve_log(args, prefix: str) -> str:
-    """Resolve the rollback target: --latest <doctype> or an explicit path."""
+    """Resolve a log target: --latest <doctype> or an explicit path."""
     if args.latest:
         path = _latest_log(args.latest, prefix)
         if path is None:
@@ -647,73 +726,115 @@ def _resolve_log(args, prefix: str) -> str:
     return args.log
 
 
-def cmd_rollback(args) -> int:
+def cmd_create_record(args) -> int:
+    """Create a lookup record from the CLI (journaled like the agent's tool)."""
     client = _client(args)
-    path = _resolve_log(args, "import-")
-    doctype, names = parse_import_log(path)
-    if not names:
-        print(f"No created rows found in {path}")
+    fields = _json_arg("fields", args.fields)
+    if not isinstance(fields, dict):
+        print("ERROR: --fields must be a JSON object, e.g. '{\"item_group_name\": \"Tooling\"}'",
+              file=sys.stderr)
+        return 2
+
+    ctx = _context(args, args.doctype, command="create-record")
+    from erpgen import tools as erpgen_tools  # noqa: PLC0415
+
+    erpgen_tools.ACTIVE_JOURNAL = ctx
+    try:
+        result = create_record(client, args.doctype, fields)
+    finally:
+        erpgen_tools.ACTIVE_JOURNAL = None
+        if ctx:
+            ctx.close()
+    print(json.dumps(result, indent=2, default=str))
+    if ctx and result.get("created"):
+        print(f"Run context: {ctx.path}  ({ctx.effects} effect(s))")
+    return 0
+
+
+def cmd_status(args) -> int:
+    """Show a migration context: requirements (pending/satisfied) + effects."""
+    target = args.run_log
+    if target is None and getattr(args, "latest", None):
+        found = latest_run(args.latest, getattr(args, "log_dir", "logs"))
+        if found is None:
+            print(f"ERROR: no run found for doctype {args.latest!r}", file=sys.stderr)
+            return 2
+        target = str(found)
+    if target is None:
+        print("ERROR: pass a run id/path or --latest <doctype>", file=sys.stderr)
+        return 2
+    try:
+        run = resolve_run(target, getattr(args, "log_dir", "logs"))
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    data = load_run(str(run), getattr(args, "log_dir", "logs"))
+    eff = data["effects"]
+    print(f"Run {data.get('run_id')}  ({data['path']})")
+    print(f"  effects applied: {len(eff)}")
+    for i, e in enumerate(eff, 1):
+        print(f"    #{e.get('seq') or i} {e.get('kind'):<20} "
+              f"-> {e.get('inverse', {}).get('op')} {e.get('inverse', {}).get('name', '')}")
+    reqs = data["requirements"]
+    pending = [r for r in reqs if r.get("satisfied_by") is None]
+    print(f"  requirements: {len(reqs)} total, {len(pending)} pending")
+    for r in reqs:
+        if r.get("satisfied_by") is None and r.get("via") is None:
+            state = "PENDING"
+        else:
+            state = f"satisfied ({r.get('via') or 'effect'})"
+        flag = " (REOPENED)" if r.get("reopened") else ""
+        print(f"    [{r.get('severity', '?'):<7}] {r.get('kind', ''):<22} {state:<10} "
+              f"{(r.get('detail') or '')[:60]}{flag}")
+    for c in data["config_delta"]:
+        print(f"  config delta: {c.get('doctype')} {c.get('changes')}")
+    return 0
+
+
+def cmd_revert(args) -> int:
+    """Revert a migration by replaying its journal's inverses (newest-first).
+
+    Unlike re-deriving intent from import/agent logs, this consumes the effect
+    journal written at effect time — so mixed effects (records + custom fields +
+    overrides) undo in one command.
+    """
+    client = _client(args)
+    path = None
+    if args.log:
+        try:
+            path = str(resolve_run(args.log, args.log_dir))
+        except FileNotFoundError:
+            path = args.log
+    if path is None:
+        run = latest_run(args.latest, args.log_dir) if args.latest else None
+        path = str(run) if run else _resolve_log(args, "journal-")
+    data = parse_journal(path)
+    if not data["effects"]:
+        print(f"No journaled effects found in {path}")
         return 0
 
-    res = rollback_records(client, doctype, names, apply=args.apply)
+    run = data.get("run_start") or {}
+    label = run.get("doctype") or run.get("run_id") or Path(path).stem
+    print(f"Revert {label} — {len(data['effects'])} journaled "
+          f"effect(s) from {path}")
+
+    res = revert_journal(client, path, apply=args.apply,
+                         force=getattr(args, "force", False))
+    if res.get("already_reverted"):
+        m = res["already_reverted"]
+        print(f"Already reverted on {m.get('ts')} ({m.get('reverted')} effect(s)); "
+              "nothing to do. Use --force to replay anyway.")
+        return 0
     if not args.apply:
-        print(f"Rollback {doctype} — {res['total']} record(s) would be deleted "
-              f"(dry run; use --apply). Newest-first order:")
-        for n in reversed(names):
-            print(f"  - {n}")
+        print("Dry run (--apply to execute). Inverses, newest-first:")
+        for r in res["results"]:
+            print(f"  - {r['description']}")
         return 0
 
-    print(f"Rolled back {doctype}: deleted {res['deleted']}/{res['total']}, "
+    print(f"Reverted {res['applied']}/{res['total']} effect(s); "
           f"{len(res['failed'])} failed")
     for f in res["failed"]:
-        print(f"  FAILED {f['name']}: {f['error'][:160]}")
-    return 0 if not res["failed"] else 1
-
-
-def cmd_rollback_schema(args) -> int:
-    client = _client(args)
-    path = _resolve_log(args, "agent-")
-    fields = parse_agent_schema_changes(path)
-    if not fields:
-        print(f"No custom fields created (create_field) found in {path}")
-        return 0
-
-    if not args.apply:
-        print(f"Schema rollback — {len(fields)} custom field(s) would be DROPPED "
-              f"(dry run; --apply drops the columns AND their data):")
-        for f in fields:
-            print(f"  - {f['custom_field']}  (fieldname {f.get('fieldname')})")
-        print("WARNING: --apply is destructive and irreversible for column data.")
-        return 0
-
-    res = rollback_schema(client, fields, apply=True)
-    print(f"Dropped {res['deleted']}/{res['total']} custom fields; "
-          f"{len(res['failed'])} failed")
-    for f in res["failed"]:
-        print(f"  FAILED {f['custom_field']}: {f['error'][:160]}")
-    return 0 if not res["failed"] else 1
-
-
-def cmd_rollback_options(args) -> int:
-    client = _client(args)
-    path = _resolve_log(args, "agent-")
-    records = parse_agent_option_records(path)
-    if not records:
-        print(f"No created lookup records (create_record) found in {path}")
-        return 0
-
-    if not args.apply:
-        print(f"Options rollback — {len(records)} lookup record(s) would be "
-              f"deleted (dry run; --apply to delete):")
-        for r in reversed(records):
-            print(f"  - {r['doctype']}/{r['name']}")
-        return 0
-
-    res = rollback_options(client, records, apply=True)
-    print(f"Deleted {res['deleted']}/{res['total']} lookup records; "
-          f"{len(res['failed'])} failed")
-    for f in res["failed"]:
-        print(f"  FAILED {f['doctype']}/{f['name']}: {f['error'][:160]}")
+        print(f"  FAILED {f['description']}: {f['error'][:160]}")
     return 0 if not res["failed"] else 1
 
 
@@ -723,6 +844,10 @@ def main() -> int:
     ap.add_argument("--user", default="Administrator")
     ap.add_argument("--password", default="admin")
     ap.add_argument("--timeout", type=int, default=300, help="import wait timeout (s)")
+    ap.add_argument("--log-dir", default="logs",
+                    help="audit log directory (default: logs/)")
+    ap.add_argument("--run", metavar="RUN_ID",
+                    help="migration run id: all commands sharing it use one context (logs/run-<id>.jsonl), revertible in one step")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p_map = sub.add_parser("map", help="build a mapping plan from a source file")
@@ -754,7 +879,6 @@ def main() -> int:
     p_imp.add_argument("--bypass-conflicts", action="store_true",
                        help="import even if error-severity conflicts remain "
                             "(default: fail before importing partial data)")
-    p_imp.add_argument("--log-dir", default="logs", help="audit log directory (default: logs/)")
     p_imp.add_argument("--overrides", help=f"mapping overrides file "
                                           f"(default: {DEFAULT_OVERRIDES} if present)")
     p_imp.add_argument("--analysis-dir", default="analysis",
@@ -820,41 +944,41 @@ def main() -> int:
     p_sm.add_argument("--list", action="store_true", help="show current overrides")
     p_sm.set_defaults(fn=cmd_set_mapping)
 
-    p_rb = sub.add_parser(
-        "rollback",
-        help="undo a migration: delete the records a run-log created (newest-first). "
-             "Consumes logs/import-<doctype>-<ts>.jsonl",
+    p_rv = sub.add_parser(
+        "revert",
+        help="revert a migration by replaying its journal's inverses (newest-first). "
+             "Consumes logs/journal-<doctype>-<ts>.jsonl — undoes records, custom "
+             "fields and overrides in one command",
     )
-    p_rb.add_argument("log", nargs="?", help="path to a logs/import-*.jsonl run log")
-    p_rb.add_argument("--latest", metavar="DOCTYPE",
-                      help="use the newest log for this doctype instead of a path")
-    p_rb.add_argument("--apply", action="store_true",
-                      help="actually delete (default: dry-run preview)")
-    p_rb.set_defaults(fn=cmd_rollback)
+    p_rv.add_argument("log", nargs="?", metavar="journal",
+                      help="path to a logs/journal-*.jsonl file")
+    p_rv.add_argument("--latest", metavar="DOCTYPE",
+                      help="use the newest journal for this doctype instead of a path")
+    p_rv.add_argument("--apply", action="store_true",
+                      help="actually execute the inverses (default: dry-run preview)")
+    p_rv.add_argument("--force", action="store_true",
+                      help="replay a journal that was already fully reverted")
+    p_rv.set_defaults(fn=cmd_revert)
 
-    p_rs = sub.add_parser(
-        "rollback-schema",
-        help="undo agent-created custom fields (drops columns). "
-             "Consumes logs/agent-<doctype>-<ts>.jsonl",
+    p_cr = sub.add_parser(
+        "create-record",
+        help="create a lookup record (Item Group, UOM, ...); journaled, and shares "
+             "the migration context when --run is given",
     )
-    p_rs.add_argument("log", nargs="?", help="path to a logs/agent-*.jsonl transcript")
-    p_rs.add_argument("--latest", metavar="DOCTYPE",
-                      help="use the newest transcript for this doctype instead of a path")
-    p_rs.add_argument("--apply", action="store_true",
-                      help="actually drop the custom fields (destructive)")
-    p_rs.set_defaults(fn=cmd_rollback_schema)
+    p_cr.add_argument("doctype")
+    p_cr.add_argument("--fields", required=True,
+                      help='JSON object, e.g. \'{"item_group_name": "Tooling"}\'')
+    p_cr.set_defaults(fn=cmd_create_record)
 
-    p_ro = sub.add_parser(
-        "rollback-options",
-        help="undo agent-created lookup records (Item Groups, UOMs, etc.). "
-             "Consumes logs/agent-<doctype>-<ts>.jsonl",
+    p_st = sub.add_parser(
+        "status",
+        help="show a migration context: effects applied + requirements pending/satisfied",
     )
-    p_ro.add_argument("log", nargs="?", help="path to a logs/agent-*.jsonl transcript")
-    p_ro.add_argument("--latest", metavar="DOCTYPE",
-                      help="use the newest transcript for this doctype instead of a path")
-    p_ro.add_argument("--apply", action="store_true",
-                      help="actually delete (default: dry-run preview)")
-    p_ro.set_defaults(fn=cmd_rollback_options)
+    p_st.add_argument("run_log", nargs="?", metavar="run",
+                      help="run id or path to logs/run-*.jsonl")
+    p_st.add_argument("--latest", metavar="DOCTYPE",
+                      help="newest run touching this doctype")
+    p_st.set_defaults(fn=cmd_status)
 
     p_del = sub.add_parser("delete", help="delete records by name (cleanup)")
     p_del.add_argument("--doctype", required=True)

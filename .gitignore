@@ -7,3 +7,4 @@ docs/
 .env.local
 samples/
 analysis/
+erpgen-web-services/
