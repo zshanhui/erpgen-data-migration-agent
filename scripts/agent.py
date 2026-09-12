@@ -45,7 +45,13 @@ from erpgen.infer import guess_doctype  # noqa: E402
 from erpgen.mapper import MappingEngine  # noqa: E402
 from erpgen.metadata import fetch_with_children  # noqa: E402
 from erpgen.overrides import DEFAULT_OVERRIDES, load_overrides, set_mapping  # noqa: E402
-from erpgen.customers_full import is_customers_full_sheet, parse_flat_target  # noqa: E402
+from erpgen.customers_full import (  # noqa: E402
+    detect_party_sheet,
+    flat_map_for,
+    flow_for_party,
+    parse_flat_target,
+    party_for_flow,
+)
 from erpgen.source import read_source  # noqa: E402
 from erpgen.tools import (  # noqa: E402
     create_field,
@@ -129,13 +135,13 @@ def t_latest_analysis(doctype: str) -> str:
 def t_run_map(source: str, doctype: str = "", defaults: str = "{}") -> str:
     cmd = ["map", source]
     src = read_source(source)
-    flat = is_customers_full_sheet(src)
-    if not flat and doctype:
+    party = detect_party_sheet(src)
+    if not party and doctype:
         cmd += ["--doctype", doctype]
     if defaults and defaults != "{}":
         cmd += ["--defaults", defaults]
     code, out = _erpgen(cmd)
-    dt = doctype or ("customers_full" if flat else guess_doctype(src))
+    dt = doctype or (flow_for_party(party) if party else guess_doctype(src))
     fresh = latest_analysis(dt) if dt else None
     if fresh is None:
         return f"map failed (exit {code}):\n{out[-1500:]}"
@@ -174,15 +180,16 @@ def t_create_record(doctype: str, fields_json: str) -> str:
 
 def t_set_mapping(doctype: str, column: str, target: str) -> str:
     try:
-        if doctype == "customers_full":
+        flow_party = party_for_flow(doctype)
+        if flow_party:
             parsed = parse_flat_target(target)
             if parsed is None:
+                allowed = "|".join(sorted({k for k, _ in flat_map_for(flow_party).values()}))
                 return _j({"error": f"flat target must be '<doctype>.<fieldname>' "
-                                    f"with doctype in customer|contact|address "
-                                    f"(got {target!r})"})
+                                    f"with doctype in {allowed} (got {target!r})"})
             dt_key, field = parsed
-            canonical = {"customer": "Customer", "contact": "Contact",
-                         "address": "Address"}[dt_key]
+            canonical = {"customer": "Customer", "supplier": "Supplier",
+                         "contact": "Contact", "address": "Address"}[dt_key]
             parent, children = fetch_with_children(CLIENT, canonical)
             valid = {t.qualified for t in MappingEngine(parent, children).targets}
             if field not in valid:
@@ -242,9 +249,10 @@ TOOLS = [
                     "to learn required fields."},
     {"fn": t_set_mapping, "name": "set_mapping",
      "description": "Record a forced source-column -> target-field mapping override "
-                    "for a doctype. Fixes ambiguous/missed mappings. For flat "
-                    "customers_full sheets use doctype='customers_full' and "
-                    "target='<doctype>.<fieldname>' (e.g. customer.tax_id)."},
+                    "for a doctype. Fixes ambiguous/missed mappings. For flat party "
+                    "sheets use doctype='customers_full'|'suppliers_full' and "
+                    "target='<customer|supplier|contact|address>.<fieldname>' "
+                    "(e.g. customer.tax_id, supplier.tax_id)."},
     {"fn": t_describe_doctype, "name": "describe_doctype",
      "description": "Summarize a doctype's structure (required fields, links, "
                     "child tables, fetch_from, id field)."},
@@ -266,15 +274,17 @@ Conflict kinds and how to fix them:
   cannot write it directly. Note it and move on.
 - required_missing: pass defaults to run_map/run_import.
 
-Flat customers_full sheets (doctype='customers_full', one file with Customer +
-Contact + Address): every conflict is an out-of-contract column and is
+Flat party sheets (doctype='customers_full' or 'suppliers_full'; ONE file with
+a party + Contact + Address): every conflict is an out-of-contract column and is
 error-severity (blocking). Resolve each via its suggested_action:
-- resolution=extend_contract -> set_mapping('customers_full', column,
+- resolution=extend_contract -> set_mapping('<flow>', column,
   '<doctype>.<target>'), e.g. set_mapping('customers_full', 'Tax ID', 'customer.tax_id').
 - resolution=create_custom_field -> first create_field(doctype, label, fieldtype)
-  (or run the suggested create_command), then set_mapping('customers_full',
-  column, '<doctype>.<fieldname>') using the suggested fieldname.
-Then run_map again and confirm zero conflicts remain before importing.
+  (or run the suggested create_command), then set_mapping('<flow>', column,
+  '<doctype>.<fieldname>') using the suggested fieldname.
+The flow name and suggested commands are already filled in for you — use them
+verbatim. Then run_map again and confirm zero conflicts remain before importing.
+Contacts/Addresses shared between party types are linked automatically on import.
 
 Per-iteration workflow:
 1. Read the analysis from the user message or latest_analysis.
@@ -422,9 +432,10 @@ async def run_agent(args) -> int:
     flat = False
     if args.source:
         src = read_source(args.source)
-        if is_customers_full_sheet(src):
+        party = detect_party_sheet(src)
+        if party:
             flat = True
-            doctype = "customers_full"
+            doctype = flow_for_party(party)
         else:
             doctype = args.doctype or guess_doctype(src)
     else:

@@ -19,6 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 CTX = "erpgen/context.py"
 JRN = "erpgen/journal.py"
 CLI = "erpgen.py"
+CF = "erpgen/customers_full.py"
+TLS = "erpgen/tools.py"
 
 MUTATIONS = [
     ("bug: effect seq restarts per command", [
@@ -103,6 +105,68 @@ MUTATIONS = [
               '    p_imp.add_argument("--defaults")\n'
               '    p_imp.add_argument("--log-dir", default="logs")'),
     ], "tests/test_cli_args.py::test_every_subcommand_carries_the_global_flags"),
+
+    # ---- flat party sheets (Customer/Supplier) ----
+    ("bug: flat values not converted to the target field type (Check 'Yes' -> 0)", [
+        (CF, '            return convert_value(raw, ftype)',
+             '            return raw  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_check_column_is_converted_not_stored_raw"),
+
+    ("bug: Supplier.country no longer mirrored onto the party record", [
+        (CF, '        for col, field in (spec.get("mirror_columns") or {}).items():',
+             '        for col, field in ({}).items():  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_build_payloads_mirrors_country_onto_the_supplier"),
+
+    ("bug: link-merge hardcodes the Customer link type again", [
+        (CF, '    links.append({"link_doctype": link_doctype, "link_name": link_name})',
+             '    links.append({"link_doctype": "Customer", "link_name": link_name})  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_link_merge_adds_a_second_party_link"),
+
+    ("bug: a failed row is remembered, so a re-run cannot retry it", [
+        (CF, "        warn(f\"row {row_no}: {doctype} '{natural_key}' failed: {e}\")\n"
+             '        return "failed", str(e)',
+             "        warn(f\"row {row_no}: {doctype} '{natural_key}' failed: {e}\")\n"
+             "        index[natural_key] = None  # MUTANT\n"
+             '        return "failed", str(e)'),
+    ], "tests/test_party_sheets.py::test_link_or_create_failure_is_retryable"),
+
+    ("bug: contact/address created for a party that failed to insert", [
+        (CF, '        if pstatus == "failed":',
+             '        if False:  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_import_skips_contact_and_address_when_the_party_insert_fails"),
+
+    ("bug: party-sheet detection is hardcoded to Customer", [
+        (CF, '        if spec["name_column"] in hs and ("Contact Name" in hs or "Address Line 1" in hs):',
+             '        if "Customer Name" in hs and ("Contact Name" in hs or "Address Line 1" in hs):  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_detect_customer_and_supplier_sheets"),
+
+    ("bug: supplier is not a valid flat target", [
+        (CF, '_FLAT_DOCTYPES = {"customer", "supplier", "contact", "address"}',
+             '_FLAT_DOCTYPES = {"customer", "contact", "address"}  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_parse_flat_target_valid"),
+
+    ("bug: mapped Link values are never checked against the site", [
+        (CF, '    conflicts.extend(_link_value_conflicts(client, source, spec, fmap, flat, engines))',
+             '    pass  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_link_conflict_for_a_mapped_but_missing_link_value"),
+
+    ("bug: link check skips the fixed contract columns", [
+        (CF, '    for header, (kind, field) in fmap.items():\n'
+             '        if kind == "contact" and field in CONTACT_COLUMNS.values():\n'
+             '            continue  # synthetic contact keys, not real columns\n'
+             '        targets.append((header, kind, field))',
+             '    pass  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_contract_link_columns_are_validated"),
+
+    ("bug: one column reports per target instead of per linked doctype", [
+        (CF, '        g = grouped.setdefault((header, fmeta.options), {"targets": [], "missing": []})',
+             '        g = grouped.setdefault((header, f"{fmeta.options}|{kind}.{field}"), {"targets": [], "missing": []})  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_mirrored_and_address_targets_share_one_conflict"),
+
+    ("bug: child-table required fields hidden from the agent", [
+        (TLS, '            child = child_metas.get(f.options)',
+              '            child = None  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_describe_doctype_exposes_child_required_fields"),
 ]
 
 

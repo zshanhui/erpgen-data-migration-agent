@@ -16,7 +16,7 @@ from .client import ERPNextClient
 # When set (e.g. by an agent run), create_field / create_record journal their
 # effects so a whole run can be reverted with `erpgen.py revert`.
 ACTIVE_JOURNAL = None
-from .metadata import DoctypeMeta
+from .metadata import DoctypeMeta, fetch_with_children
 
 
 def get_record(client: ERPNextClient, doctype: str, name: str) -> dict:
@@ -32,11 +32,12 @@ def describe_doctype(
 ) -> dict:
     """Summarize a doctype's structure so an agent can construct records.
 
-    Categories the agent needs: required fields, Link targets, child tables,
+    Categories the agent needs: required fields, Link targets, child tables
+    (with each child's own required fields, so an agent can build a valid row),
     fetch_from (read-only) fields, custom-field count, and the id field.
     Custom fields are included (they're merged into the metadata fetch).
     """
-    meta = DoctypeMeta.fetch(client, doctype)
+    meta, child_metas = fetch_with_children(client, doctype)
 
     required: list[dict] = []
     links: list[dict] = []
@@ -47,7 +48,19 @@ def describe_doctype(
     for f in meta.fields:
         entry = {"fieldname": f.fieldname, "label": f.label}
         if f.is_table and f.options:
-            tables.append({**entry, "child_doctype": f.options})
+            # a child row is invalid without these, and the agent cannot see them
+            # from the parent alone (e.g. Payment Terms Template -> invoice_portion)
+            child = child_metas.get(f.options)
+            child_required = []
+            if child:
+                for cf in child.mandatory_fields():
+                    item = {"fieldname": cf.fieldname, "label": cf.label,
+                            "fieldtype": cf.fieldtype}
+                    if cf.fieldtype == "Select" and cf.options:
+                        item["options"] = [o for o in cf.options.split("\n") if o.strip()]
+                    child_required.append(item)
+            tables.append({**entry, "child_doctype": f.options,
+                           "required": child_required})
             continue
         if f.is_link:
             links.append({**entry, "doctype": f.options})

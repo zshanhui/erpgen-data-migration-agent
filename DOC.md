@@ -23,10 +23,12 @@ python3 erpgen.py import samples/customers.csv --apply
 python3 erpgen.py import samples/customers.csv \
     --defaults '{"customer_group":"Commercial","territory":"All Territories"}' --apply
 
-# flat "SMB" sheet: contacts/addresses inline in the same file, auto-detected by
-# header (no --doctype); one Customer + Contact + Address per row, deduped
+# flat "SMB" party sheets: contacts/addresses inline in the same file,
+# auto-detected by header (no --doctype); one party + Contact + Address per row
 python3 erpgen.py import samples/customers-smb.csv            # dry run
 python3 erpgen.py import samples/customers-smb.csv --apply
+python3 erpgen.py import samples/suppliers-smb.csv --apply    # Supplier flow
+# ^ a contact/address may be shared across parties (Acme is both customer+supplier)
 
 # bulk path via the Data Import machinery (also deduped), optional submit
 python3 erpgen.py import samples/customers.csv --apply --bulk --submit
@@ -58,44 +60,93 @@ For `.xlsx` use the venv: `.venv/bin/python erpgen.py ...` (see below).
 Inference is a convenience — pass `--doctype` explicitly when both signals are
 absent, and the tool errors (exit 2) rather than guess when it can't tell.
 
-A **flat SMB sheet** — where contacts/addresses are inline columns in the same
-file (`Customer Name, Customer Type, Group, Territory, Contact Name, Email,
-Phone, Address Type, Address Line 1, City, State, Postal Code, Country`) — is
-detected by header and routed through the normal `import` command to the
-customers_full flow: one Customer + linked Contact + Address per row, all
+A **flat party sheet** — where contacts/addresses are inline columns in the same
+file — is detected by header and routed through the normal `import` command:
+one **party** (Customer *or* Supplier) + linked Contact + Address per row, all
 idempotent. No `--doctype` is required; `--defaults` still applies (e.g.
-Group/Territory). A **contact shared across customers** (same email) is created
-once and gets a `Dynamic Link` row per customer (`linked` in the summary)
-instead of being re-created or silently dropped; addresses stay one-per-customer.
+Group/Territory for customers).
+
+| Sheet | Party column | Flow | Party doctype |
+|---|---|---|---|
+| Customers | `Customer Name`, `Customer Type`, `Group`, `Territory` | `customers_full` | Customer |
+| Suppliers | `Supplier Name`, `Supplier Type`, `Supplier Group` | `suppliers_full` | Supplier |
+
+Party types live in one registry (`PARTY_SPECS` in `erpgen/customers_full.py`),
+so adding one is data, not code; everything else (contact/address columns,
+dedup, link-merge, analysis) is shared. Party-specific quirks are declared
+there too — e.g. Supplier (unlike Customer) has its own `country` field, so
+`mirror_columns` feeds the sheet's Country column to the Address **and** the
+Supplier record.
+
+Source values are converted to each target field's type on the way in. This
+matters: Frappe coerces `"Yes"`/`"true"` on a `Check` field to **0**, so an
+uncoerced flat sheet would silently store `is_transporter = 0`.
+
+**Contacts/Addresses are shared across parties.** A Contact dedups by email and
+an Address by `address_title + address_type`; when one already exists — on the
+site, earlier in the run, **or linked to a different party type** — it receives
+an extra `Dynamic Link` row for this party instead of being re-created
+(`linked` in the summary). So the same company can be both a Customer and a
+Supplier and share one Contact and one Address:
+
+```bash
+python3 erpgen.py import samples/customers-smb.csv --apply   # creates Acme (Customer) + contact + address
+python3 erpgen.py import samples/suppliers-smb.csv --apply   # links that SAME contact/address to Acme (Supplier)
+```
+
 Per-row insert failures (e.g. a required `address_line1`/`city`/`country`
 missing) are logged as `failed` with a `WARNING:` on stderr and skipped — they
 never abort the run. A failed record is **not** added to its dedup set, so
-fixing the source and re-running retries it and (for addresses/contacts) links
-it to its customer. Applied runs log to `logs/customers_full-<ts>.jsonl` (one
-`row` event per doctype), which is **not** yet consumed by `revert` (that
-reads `logs/import-*.jsonl`).
+fixing the source and re-running retries it and re-links it. Applied runs log to
+`logs/<flow>-<ts>.jsonl` (one `row` event per doctype), which is **not** yet
+consumed by `revert` (that reads `logs/import-*.jsonl`).
 
 ### Out-of-contract columns & the flat contract override
 
-Columns **not** in the fixed `FLAT_MAP` contract (e.g. `Tax ID`, `Website`,
+Columns **not** in a flow's fixed contract (e.g. `Tax ID`, `Website`,
 `Loyalty Tier`, `Customer Since`) are surfaced by `map`/`import` as
-error-severity `unmapped_column` conflicts in a `customers_full` analysis,
-each with a `suggested_action`: map it to an existing field, or create a custom
-field then map it. Resolve them by extending the flat contract with `set-mapping`:
+error-severity `unmapped_column` conflicts in that flow's analysis
+(`customers_full` / `suppliers_full`), each with a `suggested_action`: map it to
+an existing field, or create a custom field then map it. Resolve them by
+extending the flat contract with `set-mapping`:
 
 ```bash
 # maps to an existing field
 python3 erpgen.py set-mapping customers_full --column "Tax ID" --target customer.tax_id
+python3 erpgen.py set-mapping suppliers_full --column "Tax ID" --target supplier.tax_id
 
 # needs a new field first
 python3 erpgen.py createfield Customer --label "Customer Since" --fieldtype Date
 python3 erpgen.py set-mapping customers_full --column "Customer Since" --target customer.customer_since
 ```
 
-`set-mapping customers_full` targets are `customer|contact|address.<fieldname>`
-and are validated against live metadata. Once a column is mapped, it leaves the
-conflict list and its values import into the right doctype (rerun `map` to
-confirm zero conflicts).
+Flat targets are `<party>|contact|address.<fieldname>` (`customer`/`supplier`
+for the party slot) and are validated against live metadata. Once a column is
+mapped, it leaves the conflict list and its values import into the right doctype
+(rerun `map` to confirm zero conflicts).
+
+### `link_value_conflict` (mapped, but the values don't exist)
+
+Mapping a column is only half the job: if the target field is a **Link**, its
+values must exist as records. Choosing `Payment Terms` → `supplier.payment_terms`
+is not enough — `Net 30` has to be a `Payment Terms Template`:
+
+```json
+{
+  "kind": "link_value_conflict", "severity": "error",
+  "source": "Payment Terms", "target": "supplier.payment_terms",
+  "doctype": "Payment Terms Template",
+  "missing_values": ["Letter of Credit", "Net 30", "Net 45"]
+}
+```
+
+Every mapped Link column is checked — the fixed contract (`Group` →
+`supplier_group`, `Country` → `country`) as well as resolved columns and
+mirrors; a column mapped to two targets on the same linked doctype reports once
+(`targets: ["address.country", "supplier.country"]`). The agent resolves it with
+`create_record` and re-runs `map`. `describe-doctype` lists each child table's
+**required fields and Select options** so the agent can build a valid row, e.g. a
+Payment Terms Template needs `terms: [{invoice_portion, due_date_based_on}]`.
 
 ## Conflict gate (fail-before-apply)
 
@@ -233,13 +284,15 @@ error-severity conflicts are zero.
 .venv/bin/python scripts/agent.py --doctor --doctype Customer --source samples/customers.csv
 #   ^ no-LLM mode: prints the 9 tools + current conflicts, for wiring/debugging
 
-# flat SMB sheet (Customer + Contact + Address): full agentic loop — the LLM
+# flat party sheets (party + Contact + Address): full agentic loop — the LLM
 # resolves out-of-contract columns (create fields + set_mapping) then imports
 .venv/bin/python scripts/agent.py --source samples/customers-smb.csv
+.venv/bin/python scripts/agent.py --source samples/suppliers-smb.csv
 ```
 
 `--doctype` is optional; the agent infers it from the source headers like the
-CLI does (a flat SMB sheet is handled as doctype `customers_full`). Provider:
+CLI does (flat party sheets are handled as doctype `customers_full` /
+`suppliers_full`). Provider:
 `--provider auto|openai|deepseek` (auto-detected from `OPENAI_API_KEY` /
 `DEEPSEEK_API_KEY`; DeepSeek defaults to model `deepseek-v4-flash` at
 `https://api.deepseek.com`, overridable with `--model` / `--api-base`).

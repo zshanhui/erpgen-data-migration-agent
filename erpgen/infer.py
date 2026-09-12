@@ -7,15 +7,15 @@ Lets `map`/`import` (and the orchestrator agent) run a file without an explicit
 2. File-name prefix (naming convention: customers*.csv, items*.csv,
    addresses*.csv, contacts*.csv).
 
-Flat customers_full sheets (Customer Name + inline contact/address columns) have
+Flat party sheets (Customer/Supplier Name + inline contact/address columns) have
 no single doctype and are reported as None regardless of file name — callers
-route them to the customers_full flow instead.
+route them to the customers_full / suppliers_full flow instead.
 """
 from __future__ import annotations
 
 from typing import Optional
 
-from .customers_full import is_customers_full_sheet
+from .customers_full import is_party_sheet
 from .source import SourceTable
 
 # Strong identity columns per doctype (checked case-insensitively).
@@ -37,8 +37,8 @@ _FILE_PREFIXES = [
 
 
 def guess_doctype(source: SourceTable) -> Optional[str]:
-    """Return the doctype a source maps to, or None (flat customers_full sheet / unknown)."""
-    if is_customers_full_sheet(source):
+    """Return the doctype a source maps to, or None (flat party sheet / unknown)."""
+    if is_party_sheet(source):
         return None
 
     # 1) header identity column (content beats naming)

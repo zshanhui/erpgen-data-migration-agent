@@ -83,12 +83,14 @@ from erpgen.logger import RunLogger  # noqa: E402
 from erpgen.mapper import MappingEngine  # noqa: E402
 from erpgen.metadata import DoctypeMeta, fetch_with_children  # noqa: E402
 from erpgen.customers_full import (  # noqa: E402
-    FLAT_MAP,
-    build_customers_full_analysis,
-    is_customers_full_sheet,
+    build_party_sheet_analysis,
+    detect_party_sheet,
+    flat_map_for,
+    flow_for_party,
     load_flat_mappings,
     parse_flat_target,
-    run_customers_full_import,
+    party_for_flow,
+    run_flat_parties_import,
 )
 from erpgen.overrides import (  # noqa: E402
     DEFAULT_OVERRIDES,
@@ -221,16 +223,18 @@ def _overrides_for(args, doctype: str) -> tuple[Optional[str], dict]:
 
 def cmd_map(args) -> int:
     source = read_source(args.source)
-    if is_customers_full_sheet(source):
-        # flat sheet: fixed contract + out-of-contract columns surfaced for the LLM
+    party = detect_party_sheet(source)
+    if party:
+        # flat party sheet: fixed contract + out-of-contract columns for the LLM
         client = _client(args)
-        flat_mappings = load_flat_mappings(args.overrides or DEFAULT_OVERRIDES)
-        analysis = build_customers_full_analysis(
-            client, source, base_url=args.base, source_path=args.source,
+        flow = flow_for_party(party)
+        flat_mappings = load_flat_mappings(args.overrides or DEFAULT_OVERRIDES, flow)
+        analysis = build_party_sheet_analysis(
+            client, source, party, base_url=args.base, source_path=args.source,
             flat_mappings=flat_mappings,
         )
         apath = save_analysis(analysis, args.analysis_dir)
-        print(f"customers_full analysis saved to {apath}")
+        print(f"{flow} analysis saved to {apath}")
         print(f"  {len(analysis['known_mappings'])} contract columns, "
               f"{len(analysis['extra_columns'])} out-of-contract column(s)")
         for c in analysis["conflicts"]:
@@ -283,26 +287,29 @@ def cmd_map(args) -> int:
 def cmd_import(args) -> int:
     source = read_source(args.source)
 
-    # Flat SMB sheet (inline contact/address columns) -> split into
-    # Customer + Contact + Address internally, same as any other import.
-    if is_customers_full_sheet(source):
+    # Flat party sheet (inline contact/address columns) -> split into
+    # party + Contact + Address internally, same as any other import.
+    party = detect_party_sheet(source)
+    if party:
         client = _client(args)
+        flow = flow_for_party(party)
         defaults = json.loads(args.defaults) if args.defaults else {}
-        flat_mappings = load_flat_mappings(args.overrides or DEFAULT_OVERRIDES)
-        logger = RunLogger(args.log_dir, tag="customers_full") if args.apply else None
+        flat_mappings = load_flat_mappings(args.overrides or DEFAULT_OVERRIDES, flow)
+        logger = RunLogger(args.log_dir, tag=flow) if args.apply else None
         if logger:
             logger.run_start(source=args.source, base=args.base, apply=args.apply)
-        run_customers_full_import(
-            client, source, defaults=defaults, apply=args.apply, logger=logger,
-            flat_mappings=flat_mappings,
+        run_flat_parties_import(
+            client, source, party=party, defaults=defaults, apply=args.apply,
+            logger=logger, flat_mappings=flat_mappings,
         )
         if logger:
             logger.run_end()
         # surface out-of-contract columns for an LLM agent to resolve
-        extra = [h for h in source.headers if h not in FLAT_MAP and h not in flat_mappings]
+        contract = flat_map_for(party)
+        extra = [h for h in source.headers if h not in contract and h not in flat_mappings]
         if extra:
-            analysis = build_customers_full_analysis(
-                client, source, base_url=args.base, source_path=args.source,
+            analysis = build_party_sheet_analysis(
+                client, source, party, base_url=args.base, source_path=args.source,
                 flat_mappings=flat_mappings,
             )
             apath = save_analysis(analysis, args.analysis_dir)
@@ -626,15 +633,19 @@ def cmd_set_mapping(args) -> int:
               file=sys.stderr)
         return 2
 
-    # flat customers_full: target is '<doctype>.<fieldname>' across the 3 doctypes
-    if args.doctype == "customers_full":
+    # flat party flow (customers_full|suppliers_full): target is
+    # '<party|contact|address>.<fieldname>'
+    flow_party = party_for_flow(args.doctype)
+    if flow_party:
         parsed = parse_flat_target(args.target)
         if parsed is None:
+            allowed = "|".join(sorted({k for k, _ in flat_map_for(flow_party).values()}))
             print(f"ERROR: flat target must be '<doctype>.<fieldname>' where doctype "
-                  f"is customer|contact|address (got {args.target!r}).", file=sys.stderr)
+                  f"is {allowed} (got {args.target!r}).", file=sys.stderr)
             return 2
         dt_key, field = parsed
-        canonical = {"customer": "Customer", "contact": "Contact", "address": "Address"}[dt_key]
+        canonical = {"customer": "Customer", "supplier": "Supplier",
+                     "contact": "Contact", "address": "Address"}[dt_key]
         parent, children = fetch_with_children(client, canonical)
         valid = {t.qualified for t in MappingEngine(parent, children).targets}
         if field not in valid:
@@ -642,7 +653,7 @@ def cmd_set_mapping(args) -> int:
                   "Use createfield to add it first, or check the fieldname.", file=sys.stderr)
             return 2
         set_mapping(path, args.doctype, args.column, args.target)
-        print(f"Override saved: customers_full.{args.column} -> {args.target} ({path})")
+        print(f"Override saved: {args.doctype}.{args.column} -> {args.target} ({path})")
         return 0
 
     # validate the target against live metadata (incl. custom fields)

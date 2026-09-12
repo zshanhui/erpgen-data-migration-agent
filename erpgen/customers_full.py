@@ -29,32 +29,139 @@ from typing import Optional
 
 from .client import ERPNextClient
 from .logger import RunLogger
-from .mapper import MappingEngine
+from .mapper import MappingEngine, convert_value
 from .metadata import fetch_with_children
 from .source import SourceTable
 
-# flat column -> (target doctype, payload key).  "contact_name"/"email"/"phone"
-# are synthetic keys handled specially during payload construction.
-FLAT_MAP = {
-    "Customer Name": ("customer", "customer_name"),
-    "Customer Type": ("customer", "customer_type"),
-    "Group": ("customer", "customer_group"),
-    "Territory": ("customer", "territory"),
-    "Contact Name": ("contact", "contact_name"),
-    "Email": ("contact", "email"),
-    "Phone": ("contact", "phone"),
-    "Address Type": ("address", "address_type"),
-    "Address Line 1": ("address", "address_line1"),
-    "Address Line 2": ("address", "address_line2"),
-    "City": ("address", "city"),
-    "State": ("address", "state"),
-    "Postal Code": ("address", "pincode"),
-    "Country": ("address", "country"),
+# ---------------------------------------------------------------- party specs
+# A flat party sheet has ONE party doctype (Customer/Supplier) plus inline
+# contact + address columns. Everything below is derived from this registry, so
+# adding a party type is data, not code.
+PARTY_SPECS: dict[str, dict] = {
+    "Customer": {
+        "flow": "customers_full",
+        "key": "customer",
+        "name_column": "Customer Name",
+        "name_field": "customer_name",
+        "type_column": "Customer Type",
+        "type_field": "customer_type",
+        "group_column": "Group",
+        "group_field": "customer_group",
+        "extra_columns": {"Territory": "territory"},
+    },
+    "Supplier": {
+        "flow": "suppliers_full",
+        "key": "supplier",
+        "name_column": "Supplier Name",
+        "name_field": "supplier_name",
+        "type_column": "Supplier Type",
+        "type_field": "supplier_type",
+        "group_column": "Supplier Group",
+        "group_field": "supplier_group",
+        "extra_columns": {},
+        # Supplier (unlike Customer) has its own `country` field: the sheet's
+        # Country column feeds the Address AND the party record.
+        "mirror_columns": {"Country": "country"},
+    },
+}
+
+# inline contact columns -> synthetic payload keys (handled specially)
+CONTACT_COLUMNS = {
+    "Contact Name": "contact_name",
+    "Email": "email",
+    "Phone": "phone",
+}
+
+# inline address columns -> Address fieldnames
+ADDRESS_COLUMNS = {
+    "Address Type": "address_type",
+    "Address Line 1": "address_line1",
+    "Address Line 2": "address_line2",
+    "City": "city",
+    "State": "state",
+    "Postal Code": "pincode",
+    "Country": "country",
 }
 
 
-_FLAT_DOCTYPES = {"customer", "contact", "address"}
-_DT_CANONICAL = {"customer": "Customer", "contact": "Contact", "address": "Address"}
+def spec_for(party: str) -> dict:
+    try:
+        return PARTY_SPECS[party]
+    except KeyError:
+        raise ValueError(
+            f"unknown party type {party!r} (expected one of {', '.join(PARTY_SPECS)})"
+        ) from None
+
+
+def party_for_flow(flow: str) -> Optional[str]:
+    """'suppliers_full' -> 'Supplier'; None when the flow is not a party flow."""
+    for party, spec in PARTY_SPECS.items():
+        if spec["flow"] == flow:
+            return party
+    return None
+
+
+def flow_for_party(party: str) -> str:
+    """'Supplier' -> 'suppliers_full'."""
+    return spec_for(party)["flow"]
+
+
+def flat_map_for(party: str) -> dict[str, tuple[str, str]]:
+    """header -> (payload key, fieldname) for one party type's flat contract."""
+    spec = spec_for(party)
+    key = spec["key"]
+    m: dict[str, tuple[str, str]] = {
+        spec["name_column"]: (key, spec["name_field"]),
+        spec["type_column"]: (key, spec["type_field"]),
+        spec["group_column"]: (key, spec["group_field"]),
+    }
+    for col, field in (spec["extra_columns"] or {}).items():
+        m[col] = (key, field)
+    for col, field in CONTACT_COLUMNS.items():
+        m[col] = ("contact", field)
+    for col, field in ADDRESS_COLUMNS.items():
+        m[col] = ("address", field)
+    return m
+
+
+# Customer's contract, kept for callers that inspect the default flat map.
+FLAT_MAP = flat_map_for("Customer")
+
+
+def detect_party_sheet(source: SourceTable) -> Optional[str]:
+    """Return the party doctype for a flat party sheet, else None.
+
+    Signature: a '<Party> Name' column AND at least one inline contact or
+    address column.
+    """
+    hs = set(source.headers)
+    for party, spec in PARTY_SPECS.items():
+        if spec["name_column"] in hs and ("Contact Name" in hs or "Address Line 1" in hs):
+            return party
+    return None
+
+
+def is_party_sheet(source: SourceTable) -> bool:
+    return detect_party_sheet(source) is not None
+
+
+# backward-compatible alias (pre-Supplier naming)
+is_customers_full_sheet = is_party_sheet
+
+
+_FLAT_DOCTYPES = {"customer", "supplier", "contact", "address"}
+_DT_CANONICAL = {
+    "customer": "Customer",
+    "supplier": "Supplier",
+    "contact": "Contact",
+    "address": "Address",
+}
+_KEY_FOR_DT = {v: k for k, v in _DT_CANONICAL.items()}
+
+
+def flat_key(doctype: str) -> str:
+    """Canonical doctype -> flat target key ('Supplier' -> 'supplier')."""
+    return _KEY_FOR_DT.get(doctype, doctype.lower())
 
 
 def _split_contact_name(name: str) -> tuple[str, str]:
@@ -80,15 +187,16 @@ def parse_flat_target(target: str) -> Optional[tuple[str, str]]:
     return dt, field
 
 
-def load_flat_mappings(path) -> dict[str, tuple[str, str]]:
-    """Read the customers_full contract extensions from the overrides file.
+def load_flat_mappings(path, flow: str = "customers_full") -> dict[str, tuple[str, str]]:
+    """Read one flat flow's contract extensions from the overrides file.
 
-    Returns {header: (doctype_key, fieldname)} for every `customers_full`
-    mapping whose target parses as '<doctype>.<fieldname>'.
+    Returns {header: (key, fieldname)} for every mapping under `flow`
+    ('customers_full' | 'suppliers_full') whose target parses as
+    '<customer|supplier|contact|address>.<fieldname>'.
     """
     from .overrides import load_overrides
 
-    raw = (load_overrides(path).get("customers_full") or {}).get("mappings") or {}
+    raw = (load_overrides(path).get(flow) or {}).get("mappings") or {}
     out: dict[str, tuple[str, str]] = {}
     for header, target in raw.items():
         parsed = parse_flat_target(target)
@@ -97,16 +205,53 @@ def load_flat_mappings(path) -> dict[str, tuple[str, str]]:
     return out
 
 
+def type_maps(client: ERPNextClient, party: str) -> dict[str, dict[str, str]]:
+    """{kind: {fieldname: fieldtype}} for a party flow's three doctypes.
+
+    Used to convert raw source strings to the target field's type — without this
+    a Check field receiving "Yes"/"true" is coerced to 0 by Frappe (silent data
+    loss), and Float/Date/Int columns stay strings.
+    """
+    kinds = {party: spec_for(party)["key"], "Contact": "contact", "Address": "address"}
+    maps: dict[str, dict[str, str]] = {}
+    for dt, kind in kinds.items():
+        parent, _children = fetch_with_children(client, dt)
+        maps[kind] = {f.fieldname: f.fieldtype for f in parent.fields}
+    return maps
+
+
 def build_payloads(
     source: SourceTable,
+    party: str = "Customer",
     flat_mappings: Optional[dict[str, tuple[str, str]]] = None,
+    type_map: Optional[dict[str, dict[str, str]]] = None,
 ) -> list[dict]:
-    """Turn each source row into {customer, contact, address} payload dicts.
+    """Turn each source row into {<party key>, contact, address} payload dicts.
 
-    `flat_mappings` (header -> (doctype_key, fieldname)) carries resolved
-    out-of-contract columns; their values are routed into the matching doctype.
+    Links are NOT set here — the importer attaches them with the real document
+    name returned by the insert (Customer/Supplier docs are named by the party
+    name, but the insert result is authoritative).
+
+    `flat_mappings` (header -> (key, fieldname)) carries resolved
+    out-of-contract columns; values are routed into the matching doctype.
+    `type_map` (see `type_maps`) drives value conversion per target fieldtype.
     """
+    spec = spec_for(party)
+    key = spec["key"]
+    fmap = flat_map_for(party)
     extra = flat_mappings or {}
+    tmap = type_map or {}
+
+    def conv(kind: str, field: str, raw: str):
+        """Convert a raw cell to the target field's type (fallback: raw string)."""
+        ftype = (tmap.get(kind) or {}).get(field)
+        if not ftype:
+            return raw
+        try:
+            return convert_value(raw, ftype)
+        except (ValueError, TypeError):
+            return raw
+
     idx = {h: i for i, h in enumerate(source.headers)}
     payloads: list[dict] = []
     for row in source.rows:
@@ -114,11 +259,8 @@ def build_payloads(
             i = idx.get(h)
             return str(row[i]).strip() if i is not None and i < len(row) else ""
 
-        customer = {
-            k: cell(h)
-            for h, (dt, k) in FLAT_MAP.items()
-            if dt == "customer" and cell(h)
-        }
+        record = {k: conv(key, k, cell(h))
+                  for h, (kind, k) in fmap.items() if kind == key and cell(h)}
         contact_name = cell("Contact Name")
         email = cell("Email")
         phone = cell("Phone")
@@ -134,199 +276,235 @@ def build_payloads(
             contact["email_ids"] = [{"email_id": email, "is_primary": 1}]
         if phone:
             contact["phone_nos"] = [{"phone": phone, "is_primary_phone": 1}]
-        contact["links"] = [{"link_doctype": "Customer", "link_name": cell("Customer Name")}]
 
-        address = {
-            k: cell(h)
-            for h, (dt, k) in FLAT_MAP.items()
-            if dt == "address" and cell(h)
-        }
+        address = {k: conv("address", k, cell(h))
+                   for h, (kind, k) in fmap.items() if kind == "address" and cell(h)}
         address_type = address.get("address_type") or "Billing"
         address["address_type"] = address_type
-        address["address_title"] = f"{cell('Customer Name')} - {address_type}"
-        address["links"] = [{"link_doctype": "Customer", "link_name": cell("Customer Name")}]
+        address["address_title"] = f"{cell(spec['name_column'])} - {address_type}"
+
+        # columns the party doctype also carries itself (e.g. Supplier.country)
+        for col, field in (spec.get("mirror_columns") or {}).items():
+            val = cell(col)
+            if val and field not in record:
+                record[field] = conv(key, field, val)
 
         # resolved out-of-contract columns -> route into the right doctype payload
-        for header, (dt, field) in extra.items():
+        for header, (kind, field) in extra.items():
             val = cell(header)
             if not val:
                 continue
-            if dt == "customer":
-                customer[field] = val
-            elif dt == "contact":
-                contact[field] = val
-            elif dt == "address":
-                address[field] = val
+            if kind == key:
+                record[field] = conv(kind, field, val)
+            elif kind == "contact":
+                contact[field] = conv("contact", field, val)
+            elif kind == "address":
+                address[field] = conv("address", field, val)
 
-        payloads.append({"customer": customer, "contact": contact, "address": address})
+        payloads.append({key: record, "contact": contact, "address": address})
     return payloads
 
 
-def _ensure_contact_link(client: ERPNextClient, name: str, customer: str,
-                         apply: bool) -> tuple[str, str]:
-    """Append a Customer link to an existing Contact if missing.
+def _ensure_doc_link(client: ERPNextClient, doctype: str, name: str,
+                     link_doctype: str, link_name: str,
+                     apply: bool) -> tuple[str, str]:
+    """Append a Dynamic Link row to an existing Contact/Address if missing.
 
     Returns (status, message):
       ("skipped", "") — already linked (no-op)
       ("linked", "")  — link added (apply) or would be added (dry-run)
       ("failed", msg) — the update errored on apply
+
+    This is what lets ONE Contact/Address be shared across parties: a contact
+    already linked to Customer/Acme still receives a Supplier/Steel Ltd row
+    rather than being treated as "already present".
     """
     try:
-        existing = client.get("Contact", name)
+        existing = client.get(doctype, name)
     except Exception as e:
         return ("failed" if apply else "skipped"), (str(e) if apply else "")
     links = list(existing.get("links") or [])
-    if any(str(r.get("link_doctype")) == "Customer"
-           and str(r.get("link_name")) == customer for r in links):
+    if any(str(r.get("link_doctype")) == link_doctype
+           and str(r.get("link_name")) == link_name for r in links):
         return "skipped", ""
-    links.append({"link_doctype": "Customer", "link_name": customer})
+    links.append({"link_doctype": link_doctype, "link_name": link_name})
     if apply:
         try:
-            client.update("Contact", name, {"links": links})
+            client.update(doctype, name, {"links": links})
         except Exception as e:
             return "failed", str(e)
     return "linked", ""
 
 
-def import_customers_full(
+def _link_or_create(
+    client: ERPNextClient,
+    doctype: str,
+    payload: dict,
+    natural_key: str,
+    link: dict,
+    index: dict[str, Optional[str]],
+    seen_links: dict[str, set],
+    apply: bool,
+    warn,
+    row_no: int,
+) -> tuple[str, str]:
+    """Dedup one Contact/Address by natural key, link-merging on duplicates.
+
+    `index` maps natural key -> document name (None = created earlier in this
+    dry run); `seen_links` tracks (link_doctype, link_name) pairs already known
+    to be attached, so dry runs predict `linked` vs `skipped` accurately.
+    """
+    payload = dict(payload)
+    lkey = (link["link_doctype"], link["link_name"])
+    payload["links"] = [dict(link)]
+
+    if natural_key in index:
+        existing = index[natural_key]
+        if existing is None:
+            seen = seen_links.setdefault(natural_key, set())
+            status = "skipped" if lkey in seen else "linked"
+            seen.add(lkey)
+            return status, ""
+        return _ensure_doc_link(client, doctype, existing, *lkey, apply)
+
+    try:
+        if apply:
+            created = client.insert(doctype, payload)
+            index[natural_key] = str(created.get("name") or natural_key)
+        else:
+            index[natural_key] = None
+        seen_links.setdefault(natural_key, set()).add(lkey)
+        return "created", ""
+    except Exception as e:
+        warn(f"row {row_no}: {doctype} '{natural_key}' failed: {e}")
+        return "failed", str(e)
+
+
+def import_flat_parties(
     client: ERPNextClient,
     source: SourceTable,
+    party: str = "Customer",
     defaults: Optional[dict] = None,
     apply: bool = False,
     logger: Optional[RunLogger] = None,
     flat_mappings: Optional[dict[str, tuple[str, str]]] = None,
 ) -> dict:
-    """Import the flat customers_full sheet, deduping each doctype independently.
+    """Import a flat party sheet (party + inline contact/address), deduped per doctype.
 
-    Contacts dedup by email; when a contact is already present (on the site or
-    earlier in this run) it is linked to each additional customer via a Dynamic
-    Link row instead of being re-created.
+    Contacts dedup by email, addresses by title+type. When a Contact/Address is
+    already present — on the site, earlier in this run, or linked to a DIFFERENT
+    party type — it receives a Dynamic Link row for this party instead of being
+    re-created. That is what lets one Contact serve a Customer and a Supplier.
 
     Per-row insert failures are logged as `failed` (with a stderr warning) and
     skipped, never aborting the run. A failed record is NOT added to its dedup
-    set, so fixing the source and re-running will retry it — and re-link the
-    address/contact to its customer.
+    set, so fixing the source and re-running retries it — and re-links it.
     """
+    spec = spec_for(party)
+    key = spec["key"]
+    name_field = spec["name_field"]
+    name_column = spec["name_column"]
     defaults = defaults or {}
 
-    cust_names = {str(r["name"]) for r in client.list("Customer", fields=["name"], limit=0)}
+    # natural party name -> document name (Customer/Supplier docs are named by
+    # the party name, but the insert result is authoritative)
+    party_by_name: dict[str, str] = {}
+    for r in client.list(party, fields=["name", name_field], limit=0):
+        nat = str(r.get(name_field) or "").strip()
+        if nat:
+            party_by_name[nat] = str(r["name"])
+
     # email -> contact name (None for contacts created within this dry run)
     contact_by_email: dict[str, Optional[str]] = {
         str(r["email_id"]).strip(): str(r["name"])
         for r in client.list("Contact", fields=["name", "email_id"], limit=0)
         if r.get("email_id")
     }
-    # customers already attached per email (dry-run prediction for in-run contacts)
-    contact_customers: dict[str, set] = {}
-    addr_keys = {
-        f"{r.get('address_title')}|{r.get('address_type')}".strip()
-        for r in client.list("Address", fields=["address_title", "address_type"], limit=0)
+    contact_links: dict[str, set] = {}  # email -> {(link_doctype, link_name)}
+
+    addr_by_key: dict[str, Optional[str]] = {
+        f"{r.get('address_title')}|{r.get('address_type')}".strip(): str(r["name"])
+        for r in client.list("Address", fields=["name", "address_title", "address_type"], limit=0)
     }
+    address_links: dict[str, set] = {}
 
     counts = {
-        "customer": {"created": 0, "skipped": 0, "failed": 0},
+        key: {"created": 0, "skipped": 0, "failed": 0},
         "contact": {"created": 0, "skipped": 0, "linked": 0, "failed": 0},
-        "address": {"created": 0, "skipped": 0, "failed": 0},
+        "address": {"created": 0, "skipped": 0, "linked": 0, "failed": 0},
     }
 
     def warn(msg: str) -> None:
         print(f"WARNING: {msg}", file=sys.stderr)
 
-    for i, p in enumerate(build_payloads(source, flat_mappings), start=2):
-        # ---- customer ----
-        cust = dict(p["customer"])
+    tmap = type_maps(client, party)
+    for i, p in enumerate(build_payloads(source, party, flat_mappings, tmap), start=2):
+        # ---- party (Customer/Supplier) ----
+        rec = dict(p[key])
         for k, v in defaults.items():
-            cust.setdefault(k, v)
-        name = cust.get("customer_name", "").strip()
-        cstatus = ""
-        cmessage = ""
+            rec.setdefault(k, v)
+        name = rec.get(name_field, "").strip()
+        pstatus = ""
+        pmessage = ""
+        docname = ""
         if not name:
-            counts["customer"]["failed"] += 1
-            cstatus = "failed"
-            cmessage = "missing Customer Name"
-            warn(f"row {i}: missing Customer Name (skipped)")
+            counts[key]["failed"] += 1
+            pstatus = "failed"
+            pmessage = f"missing {name_column}"
+            warn(f"row {i}: missing {name_column} (skipped)")
             if logger:
-                logger.log(event="row", row=i, doctype="Customer", name="",
-                           status=cstatus, message=cmessage)
+                logger.log(event="row", row=i, doctype=party, name="",
+                           status=pstatus, message=pmessage)
             continue
-        if name in cust_names:
-            counts["customer"]["skipped"] += 1
-            cstatus = "skipped"
+        if name in party_by_name:
+            counts[key]["skipped"] += 1
+            pstatus = "skipped"
+            docname = party_by_name[name]
         else:
             try:
                 if apply:
-                    client.insert("Customer", cust)
-                counts["customer"]["created"] += 1
-                cust_names.add(name)
-                cstatus = "created"
+                    created = client.insert(party, rec)
+                    docname = str(created.get("name") or name)
+                else:
+                    docname = name
+                party_by_name[name] = docname
+                counts[key]["created"] += 1
+                pstatus = "created"
             except Exception as e:
-                counts["customer"]["failed"] += 1
-                cstatus = "failed"
-                cmessage = str(e)
-                warn(f"row {i}: Customer '{name}' failed: {e}")
+                counts[key]["failed"] += 1
+                pstatus = "failed"
+                pmessage = str(e)
+                warn(f"row {i}: {party} '{name}' failed: {e}")
         if logger:
-            logger.log(event="row", row=i, doctype="Customer", name=name,
-                       status=cstatus, message=cmessage)
-        if cstatus == "failed":
-            # contact/address link to a customer that does not exist — skip them
+            logger.log(event="row", row=i, doctype=party, name=name,
+                       status=pstatus, message=pmessage)
+        if pstatus == "failed":
+            # contact/address link to a party that does not exist — skip them
             continue
+
+        link = {"link_doctype": party, "link_name": docname}
 
         # ---- contact ----
         contact = p["contact"]
         email = (contact.get("email_ids") or [{}])[0].get("email_id", "")
         if email:
-            customer = (contact.get("links") or [{}])[0].get("link_name", "")
-            if email in contact_by_email:
-                cname = contact_by_email[email]
-                if cname is None:
-                    # created earlier in this run (dry-run placeholder)
-                    seen = contact_customers.setdefault(email, set())
-                    cstatus = "skipped" if customer in seen else "linked"
-                    seen.add(customer)
-                    cmessage = ""
-                else:
-                    cstatus, cmessage = _ensure_contact_link(client, cname, customer, apply)
-                counts["contact"][cstatus] += 1
-            else:
-                try:
-                    if apply:
-                        created = client.insert("Contact", contact)
-                        contact_by_email[email] = created.get("name")
-                    else:
-                        contact_by_email[email] = None
-                    contact_customers.setdefault(email, set()).add(customer)
-                    counts["contact"]["created"] += 1
-                    cstatus = "created"
-                    cmessage = ""
-                except Exception as e:
-                    counts["contact"]["failed"] += 1
-                    cstatus = "failed"
-                    cmessage = str(e)
-                    warn(f"row {i}: Contact '{email}' failed: {e}")
+            cstatus, cmessage = _link_or_create(
+                client, "Contact", contact, email, link,
+                contact_by_email, contact_links, apply, warn, i,
+            )
+            counts["contact"][cstatus] += 1
             if logger:
                 logger.log(event="row", row=i, doctype="Contact", key=email,
-                           status=cstatus, customer=customer, message=cmessage)
+                           status=cstatus, party=docname, message=cmessage)
 
         # ---- address ----
         addr = p["address"]
         akey = f"{addr.get('address_title')}|{addr.get('address_type')}".strip()
-        if akey in addr_keys:
-            counts["address"]["skipped"] += 1
-            astatus = "skipped"
-            amessage = ""
-        else:
-            try:
-                if apply:
-                    client.insert("Address", addr)
-                counts["address"]["created"] += 1
-                addr_keys.add(akey)
-                astatus = "created"
-                amessage = ""
-            except Exception as e:
-                counts["address"]["failed"] += 1
-                astatus = "failed"
-                amessage = str(e)
-                warn(f"row {i}: Address '{addr.get('address_title')}' failed: {e}")
+        astatus, amessage = _link_or_create(
+            client, "Address", addr, akey, link,
+            addr_by_key, address_links, apply, warn, i,
+        )
+        counts["address"][astatus] += 1
         if logger:
             logger.log(event="row", row=i, doctype="Address",
                        key=addr.get("address_title"), status=astatus, message=amessage)
@@ -334,36 +512,28 @@ def import_customers_full(
     return counts
 
 
-def is_customers_full_sheet(source: SourceTable) -> bool:
-    """Detect the flat SMB format from the header columns.
-
-    True when the sheet has a customer-identity column AND at least one inline
-    contact or address column (the signature of a flat customers_full sheet).
-    """
-    hs = set(source.headers)
-    return "Customer Name" in hs and ("Contact Name" in hs or "Address Line 1" in hs)
-
-
-def run_customers_full_import(
+def run_flat_parties_import(
     client: ERPNextClient,
     source: SourceTable,
+    party: str = "Customer",
     defaults: Optional[dict] = None,
     apply: bool = False,
     logger: Optional[RunLogger] = None,
     flat_mappings: Optional[dict[str, tuple[str, str]]] = None,
 ) -> dict:
-    counts = import_customers_full(
-        client, source, defaults=defaults, apply=apply, logger=logger,
+    spec = spec_for(party)
+    counts = import_flat_parties(
+        client, source, party=party, defaults=defaults, apply=apply, logger=logger,
         flat_mappings=flat_mappings,
     )
-    print(f"customers_full import ({'APPLY' if apply else 'dry run'}):")
-    for doctype, c in counts.items():
+    print(f"{spec['flow']} import ({'APPLY' if apply else 'dry run'}):")
+    for label, c in counts.items():
         extra = ""
         if c.get("linked"):
             extra += f" | linked {c['linked']}"
         if c.get("failed"):
             extra += f" | failed {c['failed']}"
-        print(f"  {doctype:<10} created {c['created']} | skipped {c['skipped']}{extra}")
+        print(f"  {label:<10} created {c['created']} | skipped {c['skipped']}{extra}")
     return counts
 
 
@@ -384,37 +554,139 @@ def _fieldtype_for(profile) -> str:
     }.get(profile.inferred_type, "Data")
 
 
-def build_customers_full_analysis(
+def _distinct_values(source: SourceTable, header: str, cap: int = 50) -> list[str]:
+    idx = source.column_index(header)
+    if idx is None:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for row in source.rows:
+        if idx < len(row):
+            v = str(row[idx]).strip()
+            if v and v not in seen:
+                seen.add(v)
+                out.append(v)
+                if len(out) >= cap:
+                    break
+    return out
+
+
+def _link_value_conflicts(
     client: ERPNextClient,
     source: SourceTable,
+    spec: dict,
+    fmap: dict,
+    flat: dict,
+    engines: dict,
+) -> list[dict]:
+    """`link_value_conflict` for every mapped Link column whose values are absent.
+
+    Without this a mapped-but-missing Link value (e.g. `Payment Terms` ->
+    `Supplier.payment_terms` -> Payment Terms Template) only surfaces as a
+    per-row import failure, giving the agent nothing actionable. Covers the fixed
+    contract (Group/Country), resolved out-of-contract columns and mirrors. One
+    conflict per (column, linked doctype).
+    """
+    key = spec["key"]
+    targets: list[tuple[str, str, str]] = []
+    for header, (kind, field) in fmap.items():
+        if kind == "contact" and field in CONTACT_COLUMNS.values():
+            continue  # synthetic contact keys, not real columns
+        targets.append((header, kind, field))
+    for header, (kind, field) in flat.items():
+        targets.append((header, kind, field))
+    for header, field in (spec.get("mirror_columns") or {}).items():
+        targets.append((header, key, field))
+
+    grouped: dict[tuple[str, str], dict] = {}
+    existing_cache: dict[str, set] = {}
+    for header, kind, field in targets:
+        if header not in source.headers:
+            continue
+        engine = engines.get(_DT_CANONICAL.get(kind, ""))
+        if engine is None:
+            continue
+        fmeta = engine.parent.get(field)
+        if not fmeta or not fmeta.is_link or not fmeta.options:
+            continue
+        values = _distinct_values(source, header)
+        if not values:
+            continue
+        existing = existing_cache.get(fmeta.options)
+        if existing is None:
+            try:
+                existing = {str(r.get("name")) for r in
+                            client.list(fmeta.options, fields=["name"], limit=0)}
+            except Exception:
+                existing = set()
+            existing_cache[fmeta.options] = existing
+        missing = [v for v in values if v not in existing]
+        if not missing:
+            continue
+        g = grouped.setdefault((header, fmeta.options), {"targets": [], "missing": []})
+        qual = f"{kind}.{field}"
+        if qual not in g["targets"]:
+            g["targets"].append(qual)
+        g["missing"] = sorted(set(g["missing"]) | set(missing))
+
+    out: list[dict] = []
+    for (header, linked), g in grouped.items():
+        qual_targets = sorted(g["targets"])
+        out.append({
+            "kind": "link_value_conflict",
+            "severity": "error",
+            "source": header,
+            "target": qual_targets[0],
+            "targets": qual_targets,
+            "doctype": linked,
+            "missing_values": g["missing"][:25],
+            "detail": (
+                f"{len(g['missing'])} source value(s) for '{header}' do not exist "
+                f"in {linked}."
+            ),
+            "suggested_action": (
+                f"create the missing {linked} record(s) with create_record — "
+                f"describe_doctype('{linked}') lists the required fields, including "
+                "child-table ones — then re-run map."
+            ),
+        })
+    return out
+
+
+def build_party_sheet_analysis(
+    client: ERPNextClient,
+    source: SourceTable,
+    party: str = "Customer",
     *,
     base_url: str = "",
     source_path: str = "",
     flat_mappings: Optional[dict[str, tuple[str, str]]] = None,
 ) -> dict:
-    """Build the flat customers_full mapping analysis for an LLM agent.
+    """Build a flat party-sheet mapping analysis (for the LLM agent).
 
-    Columns in the fixed contract (FLAT_MAP) are deterministic; every column
-    outside that contract is surfaced as an `unmapped_column` conflict with one
-    of two resolutions: map it to an existing field (extend_contract) or create
-    a custom field (create_custom_field, with a ready `create_command`).
-    Already-resolved flat overrides are treated as in-contract and NOT flagged.
+    Columns in the fixed contract are deterministic; every column outside it is
+    surfaced as an `unmapped_column` conflict with one of two resolutions: map
+    it to an existing field (extend_contract) or create a custom field
+    (create_custom_field, with a ready `create_command`). Already-resolved flat
+    overrides are treated as in-contract and NOT flagged.
     """
+    spec = spec_for(party)
+    fmap = flat_map_for(party)
     engines: dict[str, MappingEngine] = {}
-    for dt in ("Customer", "Contact", "Address"):
+    for dt in (party, "Contact", "Address"):
         parent, children = fetch_with_children(client, dt)
         engines[dt] = MappingEngine(parent, children)
 
     flat = flat_mappings or {}
-    known = set(FLAT_MAP.keys()) | set(flat.keys())
+    known = set(fmap.keys()) | set(flat.keys())
     known_mappings = [
-        {"header": h, "doctype": dt, "target": target, "method": "flat_contract"}
-        for h, (dt, target) in FLAT_MAP.items()
+        {"header": h, "doctype": kind, "target": target, "method": "flat_contract"}
+        for h, (kind, target) in fmap.items()
         if h in source.headers
     ]
     known_mappings += [
-        {"header": h, "doctype": dt, "target": field, "method": "flat_override"}
-        for h, (dt, field) in flat.items()
+        {"header": h, "doctype": kind, "target": field, "method": "flat_override"}
+        for h, (kind, field) in flat.items()
         if h in source.headers
     ]
 
@@ -459,7 +731,7 @@ def build_customers_full_analysis(
                 },
                 "resolution": "extend_contract",
             })
-            flat_target = f"{best_doctype.lower()}.{best_target.qualified}"
+            flat_target = f"{flat_key(best_doctype)}.{best_target.qualified}"
             conflicts.append({
                 "kind": "unmapped_column",
                 "severity": "error",
@@ -472,12 +744,12 @@ def build_customers_full_analysis(
                     f"({best_method}, score {best_score:.2f})."
                 ),
                 "suggested_action": (
-                    f"set_mapping('customers_full', '{header}', '{flat_target}') "
+                    f"set_mapping('{spec['flow']}', '{header}', '{flat_target}') "
                     "so the values import."
                 ),
             })
         else:
-            doctype = best_doctype or "Customer"
+            doctype = best_doctype or party
             fieldname = _snake(header)
             fieldtype = _fieldtype_for(profile)
             entry.update({
@@ -485,18 +757,18 @@ def build_customers_full_analysis(
                 "resolution": "create_custom_field",
                 "suggested_doctype": doctype,
             })
-            flat_target = f"{doctype.lower()}.{fieldname}"
+            flat_target = f"{flat_key(doctype)}.{fieldname}"
             conflicts.append({
                 "kind": "unmapped_column",
                 "severity": "error",
                 "source": header,
                 "detail": (
                     f"Column '{header}' has no matching field in "
-                    "Customer/Contact/Address."
+                    f"{party}/Contact/Address."
                 ),
                 "suggested_action": (
                     f"create_field('{doctype}', '{header}', '{fieldtype}') then "
-                    f"set_mapping('customers_full', '{header}', '{flat_target}')."
+                    f"set_mapping('{spec['flow']}', '{header}', '{flat_target}')."
                 ),
             })
             suggested.append({
@@ -505,7 +777,7 @@ def build_customers_full_analysis(
                 "fieldname": fieldname,
                 "label": header,
                 "fieldtype": fieldtype,
-                "reason": "unmapped non-empty source column (flat customers_full)",
+                "reason": f"unmapped non-empty source column ({spec['flow']})",
                 "create_command": (
                     f"python3 erpgen.py createfield {doctype} "
                     f"--label '{header}' --fieldtype {fieldtype}"
@@ -513,16 +785,26 @@ def build_customers_full_analysis(
             })
         extra_columns.append(entry)
 
+    # ---- link values: every mapped Link column must point at records that
+    # exist, or the import fails row-by-row (e.g. Supplier.payment_terms ->
+    # Payment Terms Template). Checked for contract AND resolved columns.
+    conflicts.extend(_link_value_conflicts(client, source, spec, fmap, flat, engines))
+
+    flow = spec["flow"]
     agent_instructions = (
-        "You are the migration-fix agent for a flat customers_full sheet "
-        "(Customer + Contact + Address in one file). The columns below are NOT "
-        "in the fixed mapping contract and are dropped at import. Resolve EVERY "
-        "conflict (all are error-severity, so none may remain before import):\n"
-        "- resolution=extend_contract -> set_mapping('customers_full', column, "
+        f"You are the migration-fix agent for a flat {flow} sheet "
+        f"({party} + Contact + Address in one file). Columns NOT in the fixed "
+        "mapping contract are dropped at import. Resolve EVERY conflict (all are "
+        "error-severity, so none may remain before import):\n"
+        f"- resolution=extend_contract -> set_mapping('{flow}', column, "
         "'<doctype>.<target>') using the suggested target.\n"
         "- resolution=create_custom_field -> first create_field with the "
-        "suggested doctype/label/fieldtype, then set_mapping('customers_full', "
+        f"suggested doctype/label/fieldtype, then set_mapping('{flow}', "
         "column, '<doctype>.<fieldname>') using the suggested fieldname.\n"
+        "- link_value_conflict -> the column is mapped, but some of its values "
+        "do not exist in the linked doctype. Create those records with "
+        "create_record (describe_doctype shows the required fields, including "
+        "child-table fields), then re-run map.\n"
         "After resolving, re-run map to confirm the conflicts are gone, then "
         "import. Do not import until the analysis has zero conflicts."
     )
@@ -530,7 +812,8 @@ def build_customers_full_analysis(
     return {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "doctype": "customers_full",
+        "doctype": flow,
+        "party": party,
         "source": source_path,
         "source_rows": source.n_rows,
         "base_url": base_url,
