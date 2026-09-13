@@ -26,6 +26,53 @@ def test_load_overrides_rejects_invalid_json(tmp_path):
     assert "not valid JSON" in str(e.value)
 
 
+def test_load_overrides_error_names_the_line_and_how_to_recover(tmp_path):
+    """Seen in the wild: stray trailing braces made the file unreadable and
+    blocked the whole migration with only 'Extra data' to go on."""
+    p = tmp_path / "bad.json"
+    p.write_text('{\n  "Item": {}\n}\n}\n}\n', encoding="utf-8")
+    with pytest.raises(ValueError) as e:
+        load_overrides(p)
+    msg = str(e.value)
+    # note: the raw JSONDecodeError text already says "line 4 column 1", so assert
+    # on our own formatted line specifically — otherwise this test never fails
+    assert "at line 4, column 1" in msg, "the offending line must be named"
+    assert "delete the file" in msg, "must say how to recover"
+
+
+def test_save_overrides_writes_atomically_via_rename(tmp_path, monkeypatch):
+    """A crash mid-write must not corrupt the file the next run reads."""
+    import os as _os
+    calls = []
+    real_replace = _os.replace
+
+    def _spy(src, dst):
+        calls.append((str(src), str(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(_os, "replace", _spy)
+    p = tmp_path / "ov.json"
+    save_overrides(p, {"Item": {"mappings": {"UoM": "stock_uom"}}})
+    assert calls, "must publish via rename, not an in-place write"
+    assert calls[0][1] == str(p)
+    assert calls[0][0] != str(p), "must write a temp file first"
+
+
+def test_save_overrides_leaves_no_temp_file_behind(tmp_path):
+    p = tmp_path / "ov.json"
+    save_overrides(p, {"Item": {"mappings": {"UoM": "stock_uom"}}})
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["ov.json"]
+
+
+def test_save_overrides_replaces_an_existing_file_completely(tmp_path):
+    """No stale tail from the previous, longer content."""
+    p = tmp_path / "ov.json"
+    save_overrides(p, {"Item": {"mappings": {"A": "a", "B": "b"}}})
+    save_overrides(p, {"Item": {"mappings": {"C": "c"}}})
+    assert load_overrides(p) == {"Item": {"mappings": {"C": "c"}}}
+    assert '"A"' not in p.read_text(encoding="utf-8")
+
+
 def test_save_and_load_round_trip_unicode(tmp_path):
     p = tmp_path / "ov.json"
     data = {"Item": {"mappings": {"Größe": "size"}, "defaults": {}, "value_maps": {}}}

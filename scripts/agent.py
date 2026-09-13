@@ -34,8 +34,10 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -362,7 +364,13 @@ def llm_preflight(api_base: str, api_key: str, *, timeout: int = 10,
         if e.code in (401, 403):
             return True, (f"{url} reachable (HTTP {e.code}) — network is fine, "
                           "check the API key")
-        return True, f"{url} reachable (HTTP {e.code}) — check --api-base"
+        if e.code == 404:
+            # DNS, TCP and TLS all succeeded — an API root routinely has no
+            # handler, so blaming --api-base here is misleading noise.
+            return True, (f"{url} reachable (HTTP 404 at the root — normal for "
+                          "many API hosts)")
+        return True, (f"{url} reachable (HTTP {e.code}) — if calls also fail, "
+                      "check --api-base")
     except Exception as e:  # noqa: BLE001
         return False, (f"cannot reach {url}: {type(e).__name__}: {e}\n"
                        f"  resolved {host} -> {', '.join(ips)}\n"
@@ -428,6 +436,14 @@ def describe_llm_error(exc: BaseException, api_base: str, model: str = "",
     out += ["", "  No LLM needed (builds every analysis offline):",
             "    DOCTOR=1 scripts/run-all-agentic.sh"]
     return "\n".join(out)
+
+
+def _is_iteration_exhausted(exc: BaseException) -> bool:
+    """True when the workflow stopped because its internal step budget ran out."""
+    name = type(exc).__name__
+    if "WorkflowRuntimeError" in name or "MaxIterations" in name:
+        return True
+    return "max iterations" in str(exc).lower()
 
 
 def _is_llm_error(exc: BaseException) -> bool:
@@ -511,11 +527,13 @@ def build_workflow(llm):
 
 # ---------------------------------------------------------------- main
 def cmd_doctor(args) -> int:
-    print(f"Agent doctor (no LLM call) — doctype={args.doctype}")
-    a = latest_analysis(args.doctype)
+    doctype, flat = resolve_doctype(args)
+    where = "inferred from headers" if doctype and not args.doctype else "from --doctype"
+    print(f"Agent doctor (no LLM call) — doctype={doctype or '(unresolved)'} "
+          f"({where}{', flat party sheet' if flat else ''})")
+    a = latest_analysis(doctype) if doctype else None
     if a is None:
-        print("  no analysis yet; run: python3 erpgen.py map <source> --doctype "
-              f"{args.doctype}")
+        print("  no analysis yet; run: python3 erpgen.py map <source>")
     else:
         print(f"  latest analysis: {a['source_rows']} rows, "
               f"{len(a['conflicts'])} conflicts, "
@@ -529,15 +547,20 @@ def cmd_doctor(args) -> int:
     return 0
 
 
-async def _run_agent_round(workflow, user_msg: str) -> str:
+async def _run_agent_round(workflow, user_msg: str, max_iterations: int = 0) -> str:
     """Run one agent round.
 
     Tool calls and results are logged by the tool wrappers via _TRANSCRIPT_CTX
     (set by run_agent before each round). Here we await the workflow — the
     WorkflowHandler is awaitable but NOT async-iterable in llama-index 0.14 —
     and return the final response text.
+
+    `max_iterations` caps the workflow's INTERNAL step budget (llama-index
+    defaults to 20, which a conflict-heavy sheet can exhaust while still making
+    progress). 0 means "use the library default".
     """
-    result = await workflow.run(user_msg=user_msg)
+    kwargs = {"max_iterations": max_iterations} if max_iterations else {}
+    result = await workflow.run(user_msg=user_msg, **kwargs)
     text = _text(getattr(result, "response", None)) or _text(getattr(result, "raw", None))
     if not text.strip():
         calls = getattr(result, "tool_calls", None) or []
@@ -547,95 +570,120 @@ async def _run_agent_round(workflow, user_msg: str) -> str:
     return text
 
 
-async def run_agent(args) -> int:
-    flat = False
-    if args.source:
-        src = read_source(args.source)
-        party = detect_party_sheet(src)
-        if party:
-            flat = True
-            doctype = flow_for_party(party)
-        else:
-            doctype = args.doctype or guess_doctype(src)
-    else:
-        doctype = args.doctype or None
+def resolve_doctype(args) -> tuple[Optional[str], bool]:
+    """Resolve the target doctype for a run.
 
-    llm = get_llm(args.provider, args.model, args.api_base)
+    Returns `(doctype_or_flow_name, is_flat_party_sheet)`. An explicit `--doctype`
+    always wins; otherwise it is **inferred from the source headers**.
 
-    # fail fast with a useful message instead of a transport traceback mid-loop
-    if args.provider != "openai":
-        base = args.api_base or "https://api.deepseek.com"
-        key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
-        ok, detail = llm_preflight(base, key)
-        if not ok:
-            # the probe knows *why*; the shared help block knows the next steps
-            print(f"ERROR: LLM endpoint unreachable — {detail}", file=sys.stderr)
-            print(describe_llm_error(ConnectionError(detail), base,
-                                     args.model or "", args.provider),
-                  file=sys.stderr)
-            return 2
-        print(f"LLM preflight: {detail}")
+    `--doctype` deliberately has no argparse default: a default would shadow the
+    inference entirely and silently map every sheet against that one doctype
+    (e.g. Item columns analysed as Customer fields).
+    """
+    if not args.source:
+        return args.doctype, False
+    src = read_source(args.source)
+    party = detect_party_sheet(src)
+    if party:
+        return flow_for_party(party), True
+    return args.doctype or guess_doctype(src), False
 
-    # ensure we have an analysis to work from
+
+@dataclass
+class Transcript:
+    """The agent's monotonic audit log: run_start, tool calls, rounds, run_end."""
+
+    logs_dir: Path
+    path: Path
+    _fh: Any
+
+    @classmethod
+    def open(cls, doctype: str) -> "Transcript":
+        logs_dir = ROOT / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
+        path = logs_dir / f"agent-{doctype.lower().replace(' ', '-')}-{stamp}.jsonl"
+        return cls(logs_dir, path, path.open("w", encoding="utf-8"))
+
+    def log(self, **entry) -> None:
+        row = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), **entry}
+        self._fh.write(json.dumps(row, default=str) + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        self._fh.close()
+
+
+@dataclass
+class RunOutcome:
+    """How the convergence loop finished."""
+
+    converged: bool = False
+    response: str = ""
+    exit_code: int = 0  # non-zero => bailed out (LLM failure / step budget)
+
+
+def _llm_base(args) -> str:
+    return args.api_base or "https://api.deepseek.com"
+
+
+def _preflight_llm(args) -> bool:
+    """Probe the endpoint once, so a network problem is not a mid-loop traceback."""
+    if args.provider == "openai":
+        return True
+    base = _llm_base(args)
+    key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+    ok, detail = llm_preflight(base, key)
+    if not ok:
+        # the probe knows *why*; the shared help block knows the next steps
+        print(f"ERROR: LLM endpoint unreachable — {detail}", file=sys.stderr)
+        print(describe_llm_error(ConnectionError(detail), base,
+                                 args.model or "", args.provider), file=sys.stderr)
+        return False
+    print(f"LLM preflight: {detail}")
+    return True
+
+
+def _load_analysis(args, doctype: Optional[str], flat: bool) -> Optional[dict]:
+    """The analysis to work from: --analysis, or freshly mapped, or the newest."""
     if args.analysis:
-        a = json.loads(Path(args.analysis).read_text(encoding="utf-8"))
-    elif args.source:
+        return json.loads(Path(args.analysis).read_text(encoding="utf-8"))
+    if args.source:
         cmd = ["map", args.source]
         if doctype and not flat:
             cmd += ["--doctype", doctype]
         if args.defaults:
             cmd += ["--defaults", args.defaults]
         _erpgen(cmd)
-        a = latest_analysis(doctype)
-        if a is None:
+        analysis = latest_analysis(doctype)
+        if analysis is None:
             print("ERROR: map produced no analysis", file=sys.stderr)
-            return 2
-    else:
-        a = latest_analysis(doctype) if doctype else None
-        if a is None:
-            print("ERROR: no analysis found. Pass --source or --analysis.", file=sys.stderr)
-            return 2
+        return analysis
+    analysis = latest_analysis(doctype) if doctype else None
+    if analysis is None:
+        print("ERROR: no analysis found. Pass --source or --analysis.", file=sys.stderr)
+    return analysis
 
-    print(f"Starting agent for {a['doctype']} — {len(a['conflicts'])} conflicts")
-    for c in a["conflicts"]:
-        print(f"  [{c['severity']:<7}] {c['kind']:<22} {c.get('source') or c.get('field')}")
 
-    workflow = build_workflow(llm)
-    doctype = a["doctype"]
-    source = a.get("source") or args.source or "unknown"
-    prev_error_count = None
-    final_response = ""
-    after_errs: list = []
+def _error_conflicts(analysis: dict) -> list:
+    return [c for c in analysis["conflicts"] if c["severity"] == "error"]
 
-    # monotonic audit transcript: run_start, thinking/tool events, rounds, run_end
-    logs_dir = ROOT / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
-    tfile = logs_dir / f"agent-{doctype.lower().replace(' ', '-')}-{stamp}.jsonl"
-    fh = tfile.open("w", encoding="utf-8")
 
-    def log_event(**entry) -> None:
-        row = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), **entry}
-        fh.write(json.dumps(row, default=str) + "\n")
-        fh.flush()
+def _open_journal(args, doctype: str, source: str, conflicts: list,
+                  logs_dir: Path, log_event):
+    """Join the unified run context when --run is given, else a per-run journal.
 
-    log_event(event="run_start", doctype=doctype, source=source, base=args.base,
-              provider=args.provider, model=args.model or "(provider default)",
-              max_rounds=args.max_rounds)
-
-    # journal every effect this run applies (custom fields, records) so the whole
-    # run is revertible with one command: erpgen.py revert <journal>
+    Either way every effect the agent applies is journaled, so the whole run is
+    revertible with one command.
+    """
     from erpgen import tools as erpgen_tools  # noqa: PLC0415
 
-    # with --run the agent joins the same unified context as the CLI commands:
-    # the mapper's conflicts become the run's requirements, and the agent's tool
-    # calls satisfy them reactively. Without it, fall back to a per-run journal.
     if getattr(args, "run", None):
         from erpgen.context import MigrationContext  # noqa: PLC0415
         journal = MigrationContext(args.run, logs_dir, source=source or "agent",
                                    base_url=args.base, doctypes=[doctype],
                                    command="agent")
-        seeded = journal.add_requirements(a["conflicts"])
+        seeded = journal.add_requirements(conflicts)
         log_event(event="run_context_open", path=str(journal.path), requirements=seeded)
         print(f"Run context: {journal.path}  ({seeded} requirement(s) recorded)")
     else:
@@ -644,83 +692,117 @@ async def run_agent(args) -> int:
                                    base_url=args.base)
         log_event(event="journal_open", path=str(journal.path))
     erpgen_tools.ACTIVE_JOURNAL = journal
+    return journal
 
-    converged = False
-    final_response = ""
-    after_errs: list = []
+
+def _round_message(round_no: int, doctype: str, source: str, analysis: dict) -> str:
+    """Round 1 gets the whole analysis; later rounds get what is still failing."""
+    if round_no == 1:
+        return (
+            f"Resolve the migration conflicts for doctype '{doctype}' and import the data.\n"
+            f"Source file: {source}\n"
+            f"Base URL: {analysis.get('base_url', '')}\n\n"
+            f"Current analysis:\n{json.dumps(analysis, indent=2, default=str)}"
+        )
+    return (
+        f"Round {round_no}. These error-severity conflicts REMAIN after your last "
+        f"round:\n{json.dumps(_error_conflicts(analysis), indent=2, default=str)}\n\n"
+        "Fix them (create_field / create_record / set_mapping), then run_map to "
+        "confirm they are gone. Import only once no error conflicts remain."
+    )
+
+
+def _report_round_error(exc: BaseException, args, round_no: int,
+                        transcript: Transcript) -> Optional[int]:
+    """Classify a failed round: an exit code to bail with, or None to re-raise."""
+    if _is_iteration_exhausted(exc):
+        print(f"\nERROR: the agent exhausted its internal step budget "
+              f"({args.max_iterations or 20} iterations) in round {round_no}.\n"
+              "  This usually means the sheet has many conflicts, or the "
+              "model is looping on a tool.\n"
+              "  Next steps:\n"
+              f"    raise the budget:  --max-iterations "
+              f"{max((args.max_iterations or 20) * 2, 40)}\n"
+              "    or run this sheet alone and inspect the transcript:\n"
+              f"      {transcript.path}\n"
+              "    or use the offline path: DOCTOR=1 scripts/run-all-agentic.sh",
+              file=sys.stderr)
+        transcript.log(event="iteration_exhausted", round=round_no,
+                       max_iterations=args.max_iterations,
+                       error=f"{type(exc).__name__}: {exc}")
+        return 3
+    if not _is_llm_error(exc):
+        return None
+    print("\n" + describe_llm_error(exc, _llm_base(args), args.model or "",
+                                    args.provider), file=sys.stderr)
+    transcript.log(event="llm_error", round=round_no,
+                   error=f"{type(exc).__name__}: {exc}")
+    return 2
+
+
+async def _run_rounds(args, workflow, transcript: Transcript, analysis: dict,
+                      doctype: str, source: str) -> RunOutcome:
+    """Loop until no error-severity conflicts remain, or the round cap is hit.
+
+    Each round re-reads the analysis artifact rather than trusting the model's
+    own claim of success.
+    """
+    outcome = RunOutcome()
+    prev_error_count: Optional[int] = None
+
     for round_no in range(1, args.max_rounds + 1):
-        errs = [c for c in a["conflicts"] if c["severity"] == "error"]
+        errs = _error_conflicts(analysis)
         print(f"\n=== Round {round_no}/{args.max_rounds} — {len(errs)} error conflict(s), "
-              f"{len(a['conflicts'])} total ===")
+              f"{len(analysis['conflicts'])} total ===")
         for c in errs:
             print(f"    [error] {c['kind']}: {c.get('source') or c.get('field')}")
 
-        if round_no == 1:
-            user_msg = (
-                f"Resolve the migration conflicts for doctype '{doctype}' and import the data.\n"
-                f"Source file: {source}\n"
-                f"Base URL: {a.get('base_url', '')}\n\n"
-                f"Current analysis:\n{json.dumps(a, indent=2, default=str)}"
-            )
-        else:
-            remaining = [c for c in a["conflicts"] if c["severity"] == "error"]
-            user_msg = (
-                f"Round {round_no}. These error-severity conflicts REMAIN after your last "
-                f"round:\n{json.dumps(remaining, indent=2, default=str)}\n\n"
-                "Fix them (create_field / create_record / set_mapping), then run_map to "
-                "confirm they are gone. Import only once no error conflicts remain."
-            )
-
-        log_event(event="round_start", round=round_no, errors_before=len(errs),
-                  conflicts_total=len(a["conflicts"]))
-        _TRANSCRIPT_CTX.update({"round": round_no, "log_event": log_event})
+        transcript.log(event="round_start", round=round_no, errors_before=len(errs),
+                       conflicts_total=len(analysis["conflicts"]))
+        _TRANSCRIPT_CTX.update({"round": round_no, "log_event": transcript.log})
         try:
-            final_response = await _run_agent_round(workflow, user_msg)
+            outcome.response = await _run_agent_round(
+                workflow, _round_message(round_no, doctype, source, analysis),
+                args.max_iterations)
         except Exception as e:  # noqa: BLE001 — classify, don't dump a traceback
-            if not _is_llm_error(e):
+            code = _report_round_error(e, args, round_no, transcript)
+            if code is None:
                 raise
-            base = args.api_base or "https://api.deepseek.com"
-            print("\n" + describe_llm_error(e, base, args.model or "", args.provider),
-                  file=sys.stderr)
-            log_event(event="llm_error", round=round_no, error=f"{type(e).__name__}: {e}")
-            fh.close()
-            return 2
+            outcome.exit_code = code
+            return outcome
 
         # programmatic verification: re-read the newest analysis artifact
         fresh = latest_analysis(doctype)
         if fresh is not None:
-            a = fresh
-        after_errs = [c for c in a["conflicts"] if c["severity"] == "error"]
-
-        note = ""
-        if prev_error_count is not None and len(after_errs) >= prev_error_count:
-            note = "  [no decrease vs previous round]"
+            analysis = fresh
+        after_errs = _error_conflicts(analysis)
+        note = ("  [no decrease vs previous round]"
+                if prev_error_count is not None and len(after_errs) >= prev_error_count
+                else "")
         print(f"--- Round {round_no}: {len(after_errs)} error(s) remain{note}")
-        log_event(event="round_end", round=round_no, errors_before=len(errs),
-                  errors_after=len(after_errs),
-                  conflicts_total=len(a["conflicts"]),
-                  response=final_response[-2000:])
+        transcript.log(event="round_end", round=round_no, errors_before=len(errs),
+                       errors_after=len(after_errs),
+                       conflicts_total=len(analysis["conflicts"]),
+                       response=outcome.response[-2000:])
 
         if not after_errs:
             print("\n=== AGENT CONVERGED (no error-severity conflicts) ===\n")
-            print(final_response)
-            converged = True
-            break
+            print(outcome.response)
+            outcome.converged = True
+            return outcome
         prev_error_count = len(after_errs)
-    else:
-        print(f"\nReached max rounds ({args.max_rounds}) with unresolved error conflicts.")
-        print(final_response)
 
-    log_event(event="run_end", max_rounds=args.max_rounds, resolved=converged)
-    fh.close()
-    erpgen_tools.ACTIVE_JOURNAL = None
+    print(f"\nReached max rounds ({args.max_rounds}) with unresolved error conflicts.")
+    print(outcome.response)
+    return outcome
 
-    is_context = hasattr(journal, "pending_requirements")   # unified run context
-    if is_context:
-        pend = journal.pending_requirements()
+
+def _report_run_end(journal, transcript: Transcript) -> None:
+    if hasattr(journal, "pending_requirements"):  # unified run context
+        pending = journal.pending_requirements()
         print(f"\nRun context: {journal.path}  ({journal.effects} effect(s), "
-              f"{len(pend)} requirement(s) still pending)")
-        for r in pend:
+              f"{len(pending)} requirement(s) still pending)")
+        for r in pending:
             print(f"    PENDING  {r.get('kind')}: {r.get('detail')}")
         journal.close(status="ok")
         print(f"  revert the whole run: python3 erpgen.py revert {journal.run_id} --apply")
@@ -728,14 +810,59 @@ async def run_agent(args) -> int:
         journal.close()
         print(f"\nJournal: {journal.path}  ({journal.count} revertible effect(s))")
         print(f"  revert with: python3 erpgen.py revert {journal.path}")
+    print(f"\nAgent transcript (thinking + tool calls + responses): {transcript.path}")
 
-    print(f"\nAgent transcript (thinking + tool calls + responses): {tfile}")
+
+async def run_agent(args) -> int:
+    doctype, flat = resolve_doctype(args)
+
+    llm = get_llm(args.provider, args.model, args.api_base)
+    if not _preflight_llm(args):
+        return 2
+
+    analysis = _load_analysis(args, doctype, flat)
+    if analysis is None:
+        return 2
+
+    print(f"Starting agent for {analysis['doctype']} — {len(analysis['conflicts'])} conflicts")
+    for c in analysis["conflicts"]:
+        print(f"  [{c['severity']:<7}] {c['kind']:<22} "
+              f"{c.get('source') or c.get('field')}")
+
+    doctype = analysis["doctype"]
+    source = analysis.get("source") or args.source or "unknown"
+    workflow = build_workflow(llm)
+
+    transcript = Transcript.open(doctype)
+    transcript.log(event="run_start", doctype=doctype, source=source, base=args.base,
+                   provider=args.provider, model=args.model or "(provider default)",
+                   max_rounds=args.max_rounds)
+    journal = _open_journal(args, doctype, source, analysis["conflicts"],
+                            transcript.logs_dir, transcript.log)
+
+    outcome = await _run_rounds(args, workflow, transcript, analysis, doctype, source)
+    if outcome.exit_code == 0:
+        transcript.log(event="run_end", max_rounds=args.max_rounds,
+                       resolved=outcome.converged)
+    transcript.close()
+
+    from erpgen import tools as erpgen_tools  # noqa: PLC0415
+    erpgen_tools.ACTIVE_JOURNAL = None
+    if outcome.exit_code:
+        return outcome.exit_code
+
+    _report_run_end(journal, transcript)
     return 0
 
 
-def main() -> int:
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI parser, exposed so tests can assert flag defaults."""
     ap = argparse.ArgumentParser(prog="agent.py", description=__doc__)
-    ap.add_argument("--doctype", default="Customer")
+    # no default: a default would shadow header inference (see resolve_doctype)
+    ap.add_argument("--doctype", default=None,
+                    help="target doctype (inferred from --source headers if omitted)")
     ap.add_argument("--source", help="source CSV/XLSX to analyze (runs map first)")
     ap.add_argument("--analysis", help="path to an existing analysis JSON")
     ap.add_argument("--defaults", help='JSON defaults for map/import, e.g. \'{"customer_group":"Commercial"}\'')
@@ -750,11 +877,18 @@ def main() -> int:
     ap.add_argument("--run", metavar="RUN_ID",
                     help="join a unified migration run context (logs/run-<id>.jsonl) so "
                          "mapper requirements, agent fixes and revert all share one log")
+    ap.add_argument("--max-iterations", type=int, default=50,
+                    help="internal tool-call budget per round (llama-index "
+                         "default: 20; raise it for conflict-heavy sheets)")
     ap.add_argument("--max-rounds", type=int, default=20,
                     help="outer convergence loop cap (default: 20)")
     ap.add_argument("--doctor", action="store_true",
                     help="show tools + analysis without calling an LLM")
-    args = ap.parse_args()
+    return ap
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     if args.doctor:
         # doctor only inspects files + tools — no ERPNext connection needed

@@ -21,6 +21,7 @@ JRN = "erpgen/journal.py"
 CLI = "erpgen.py"
 CF = "erpgen/customers_full.py"
 TLS = "erpgen/tools.py"
+OVR = "erpgen/overrides.py"
 AGT = "scripts/agent.py"
 
 MUTATIONS = [
@@ -132,7 +133,7 @@ MUTATIONS = [
     ], "tests/test_party_sheets.py::test_link_or_create_failure_is_retryable"),
 
     ("bug: contact/address created for a party that failed to insert", [
-        (CF, '        if pstatus == "failed":',
+        (CF, '        if status == "failed":',
              '        if False:  # MUTANT'),
     ], "tests/test_party_sheets.py::test_import_skips_contact_and_address_when_the_party_insert_fails"),
 
@@ -142,8 +143,8 @@ MUTATIONS = [
     ], "tests/test_party_sheets.py::test_detect_customer_and_supplier_sheets"),
 
     ("bug: supplier is not a valid flat target", [
-        (CF, '_FLAT_DOCTYPES = {"customer", "supplier", "contact", "address"}',
-             '_FLAT_DOCTYPES = {"customer", "contact", "address"}  # MUTANT'),
+        (CF, '_FLAT_KEYS = frozenset(_DT_CANONICAL)',
+             '_FLAT_KEYS = frozenset({"customer", "contact", "address"})  # MUTANT'),
     ], "tests/test_party_sheets.py::test_parse_flat_target_valid"),
 
     ("bug: mapped Link values are never checked against the site", [
@@ -170,9 +171,26 @@ MUTATIONS = [
     ], "tests/test_party_sheets.py::test_describe_doctype_exposes_child_required_fields"),
 
     ("bug: link check reads values from rows that never import", [
-        (CF, '        values = _distinct_values(source, header, require_column=spec["name_column"])',
-             '        values = _distinct_values(source, header)  # MUTANT'),
+        (CF, '        values = distinct_values(source, header,\n'
+             '                                 require_column=spec["name_column"])',
+             '        values = distinct_values(source, header)  # MUTANT'),
     ], "tests/test_party_sheets.py::test_values_from_rows_that_cannot_import_are_ignored"),
+
+    # ---- the decomposed run loop ----
+    ("bug: every conflict treated as blocking (not just error severity)", [
+        (AGT, '    return [c for c in analysis["conflicts"] if c["severity"] == "error"]',
+              '    return list(analysis["conflicts"])  # MUTANT'),
+    ], "tests/test_agent_loop.py::test_error_conflicts_filters_by_severity"),
+
+    ("bug: later rounds re-send the whole analysis instead of what failed", [
+        (AGT, '    if round_no == 1:',
+              '    if True:  # MUTANT'),
+    ], "tests/test_agent_loop.py::test_later_rounds_get_only_what_still_fails"),
+
+    ("bug: iteration exhaustion bails with the wrong exit code", [
+        (AGT, '        return 3',
+              '        return 0  # MUTANT'),
+    ], "tests/test_agent_loop.py::test_iteration_exhaustion_bails_with_a_budget_hint"),
 
     # ---- LLM endpoint preflight ----
     ("bug: DNS failure no longer fails fast (endpoint reported reachable)", [
@@ -196,6 +214,49 @@ MUTATIONS = [
               '        return True',
               '    if True:  # MUTANT\n        return True'),
     ], "tests/test_agent_preflight.py::test_is_llm_error_rejects_our_own_bugs"),
+
+    # ---- the doctype-shadowing bug (items.csv analysed as Customer) ----
+    ("bug: --doctype default shadows header inference", [
+        (AGT, '    ap.add_argument("--doctype", default=None,',
+              '    ap.add_argument("--doctype", default="Customer",  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_doctype_flag_has_no_argparse_default"),
+
+    ("bug: inference falls back to Customer instead of the headers", [
+        (AGT, '    return args.doctype or guess_doctype(src), False',
+              '    return args.doctype or "Customer", False  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_doctype_is_inferred_from_the_source_headers"),
+
+    ("bug: flat party sheets no longer resolve to their flow", [
+        (AGT, '        return flow_for_party(party), True',
+              '        return None, False  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_flat_party_sheet_resolves_to_its_flow"),
+
+    # ---- iteration budget ----
+    ("bug: exhausted iteration budget not recognized", [
+        (AGT, '    if "WorkflowRuntimeError" in name or "MaxIterations" in name:\n'
+              '        return True',
+              '    if False:  # MUTANT\n        return True'),
+    ], "tests/test_agent_preflight.py::test_iteration_exhaustion_is_recognized_by_name"),
+
+    ("bug: a reachable API root 404 blamed on --api-base", [
+        (AGT, '        if e.code == 404:',
+              '        if False:  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_root_404_is_reachable_and_does_not_blame_api_base"),
+
+    # ---- overrides file integrity ----
+    ("bug: overrides written in place instead of atomically", [
+        (OVR, '    tmp.write_text(\n'
+              '        json.dumps(data, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8"\n'
+              '    )\n'
+              '    os.replace(tmp, p)',
+              '    p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\\n",  # MUTANT\n'
+              '                 encoding="utf-8")'),
+    ], "tests/test_overrides.py::test_save_overrides_writes_atomically_via_rename"),
+
+    ("bug: corrupt overrides error hides the offending line", [
+        (OVR, '            f"  at line {e.lineno}, column {e.colno}\\n"',
+              '            ""  # MUTANT'),
+    ], "tests/test_overrides.py::test_load_overrides_error_names_the_line_and_how_to_recover"),
 ]
 
 

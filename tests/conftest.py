@@ -40,6 +40,23 @@ def cli():
     return sys.modules["erpgen_cli"]
 
 
+# --------------------------------------------------------------- agent module
+@pytest.fixture(scope="session")
+def agent_mod():
+    """`scripts/agent.py` loaded by path (it is a script, not a package module).
+
+    The module must be registered in sys.modules *before* exec_module, or
+    dataclasses cannot resolve `cls.__module__` and blow up at import time.
+    """
+    if "agent_under_test" not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "agent_under_test", ROOT / "scripts" / "agent.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["agent_under_test"] = mod
+        spec.loader.exec_module(mod)
+    return sys.modules["agent_under_test"]
+
+
 # ----------------------------------------------------------------- factories
 def make_field(fieldname: str, label: str | None = None, fieldtype: str = "Data",
                **kw) -> FieldMeta:

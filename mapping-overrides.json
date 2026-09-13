@@ -39,7 +39,15 @@
     },
     "defaults": {},
     "value_maps": {}
+  },
+  "Contact": {
+    "mappings": {
+      "Is Primary Phone (Contact Numbers)": "phone_nos.is_primary_phone",
+      "Link Document Type (Links)": "links.link_doctype",
+      "ID": "name",
+      "Link Name (Links)": "links.link_name"
+    },
+    "defaults": {},
+    "value_maps": {}
   }
-}
-}
 }

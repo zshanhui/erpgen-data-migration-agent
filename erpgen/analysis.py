@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Optional
 
 from .client import ERPNextClient
+from .conflicts import (distinct_values, fieldtype_for, link_value_conflict,
+                        missing_link_values, suggested_custom_field,
+                        unmapped_column_conflict)
 from .mapper import MappingEngine, MappingPlan
 from .source import SourceTable
 
@@ -28,23 +31,6 @@ from .source import SourceTable
 def _snake(label: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "_", label.strip()).strip("_").lower()
     return re.sub(r"_+", "_", s)
-
-
-def _distinct_source_values(source: SourceTable, header: str, cap: int = 50) -> list[str]:
-    idx = source.column_index(header)
-    if idx is None:
-        return []
-    seen: set[str] = set()
-    out: list[str] = []
-    for row in source.rows:
-        if idx < len(row):
-            v = str(row[idx]).strip()
-            if v and v not in seen:
-                seen.add(v)
-                out.append(v)
-                if len(out) >= cap:
-                    break
-    return out
 
 
 def build_analysis(
@@ -60,31 +46,19 @@ def build_analysis(
     conflicts: list[dict] = []
     suggested: list[dict] = []
     by_target = {t.qualified: t for t in engine.targets}
+    existing_cache: dict[str, set] = {}  # one lookup per linked doctype
 
     for m in plan.mappings:
         if not m.target:
             idx = source.column_index(m.source)
             profile = source.profiles[idx] if idx is not None and idx < len(source.profiles) else None
             if profile and profile.non_empty > 0:
-                fieldname = _snake(m.source)
-                conflicts.append({
-                    "kind": "unmapped_column",
-                    "severity": "info",
-                    "source": m.source,
-                    "detail": "Source column has no matching ERPNext field; values are dropped.",
-                    "suggested_action": "create a custom field (see suggested_custom_fields) or ignore.",
-                })
-                suggested.append({
-                    "source": m.source,
-                    "fieldname": fieldname,
-                    "label": m.source,
-                    "fieldtype": "Data",
-                    "reason": "unmapped non-empty source column",
-                    "create_command": (
-                        f"python3 erpgen.py createfield {plan.doctype} "
-                        f"--label '{m.source}' --fieldtype Data"
-                    ),
-                })
+                conflicts.append(unmapped_column_conflict(m.source))
+                suggested.append(suggested_custom_field(
+                    m.source, plan.doctype, _snake(m.source),
+                    fieldtype=fieldtype_for(profile),
+                    reason="unmapped non-empty source column",
+                ))
             continue
 
         t = by_target.get(m.target)
@@ -114,32 +88,11 @@ def build_analysis(
             })
 
         if t.meta.is_link and t.meta.options:
-            values = _distinct_source_values(source, m.source)
-            if values:
-                try:
-                    existing = {
-                        str(r.get("name")) for r in client.list(t.meta.options, fields=["name"], limit=0)
-                    }
-                except Exception:
-                    existing = set()
-                missing = [v for v in values if v not in existing]
-                if missing:
-                    conflicts.append({
-                        "kind": "link_value_conflict",
-                        "severity": "error",
-                        "source": m.source,
-                        "target": m.target,
-                        "doctype": t.meta.options,
-                        "missing_values": missing[:25],
-                        "detail": (
-                            f"{len(missing)} source value(s) for '{m.target}' do not exist "
-                            f"in {t.meta.options}."
-                        ),
-                        "suggested_action": (
-                            f"map values to existing {t.meta.options} records, or create the "
-                            "missing option records first."
-                        ),
-                    })
+            missing = missing_link_values(client, distinct_values(source, m.source),
+                                          t.meta.options, existing_cache)
+            if missing:
+                conflicts.append(link_value_conflict(
+                    m.source, [m.target], t.meta.options, missing))
 
     covered = set(plan.mapped_fields()) | set(plan.defaults.keys())
     for f in engine.parent.mandatory_fields():

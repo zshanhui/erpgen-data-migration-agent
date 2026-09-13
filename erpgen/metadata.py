@@ -6,7 +6,7 @@ options (Link targets / Table children) are all discoverable at runtime.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Optional
 
 from .client import ERPNextClient
 

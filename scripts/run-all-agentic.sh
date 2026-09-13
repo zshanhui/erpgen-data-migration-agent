@@ -16,6 +16,7 @@ cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"
 PROVIDER="${PROVIDER:-deepseek}"
 MAX_ROUNDS="${MAX_ROUNDS:-20}"
+MAX_ITERATIONS="${MAX_ITERATIONS:-50}"
 RUN_ID="${RUN_ID:-master-$(date +%Y%m%d-%H%M%S)}"
 DOCTOR="${DOCTOR:-}"
 
@@ -54,8 +55,10 @@ for sheet in "${SHEETS[@]}"; do
     fi
   else
     if ! "$PY" scripts/agent.py --source "samples/$sheet" \
-         --provider "$PROVIDER" --max-rounds "$MAX_ROUNDS" --run "$RUN_ID"; then
-      echo "!! agent failed for $sheet" >&2
+         --provider "$PROVIDER" --max-iterations "$MAX_ITERATIONS" \
+         --max-rounds "$MAX_ROUNDS" --run "$RUN_ID"; then
+      echo "!! agent failed for $sheet — re-run just this sheet with:" >&2
+      echo "     $PY scripts/agent.py --source samples/$sheet --run $RUN_ID" >&2
       exit 1
     fi
   fi

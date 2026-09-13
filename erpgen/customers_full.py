@@ -24,10 +24,14 @@ from __future__ import annotations
 
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
 from .client import ERPNextClient
+from .conflicts import (distinct_values, fieldtype_for, link_value_conflict,
+                        missing_link_values, suggested_custom_field,
+                        unmapped_column_conflict)
 from .logger import RunLogger
 from .mapper import MappingEngine, convert_value
 from .metadata import fetch_with_children
@@ -124,10 +128,6 @@ def flat_map_for(party: str) -> dict[str, tuple[str, str]]:
     return m
 
 
-# Customer's contract, kept for callers that inspect the default flat map.
-FLAT_MAP = flat_map_for("Customer")
-
-
 def detect_party_sheet(source: SourceTable) -> Optional[str]:
     """Return the party doctype for a flat party sheet, else None.
 
@@ -145,17 +145,14 @@ def is_party_sheet(source: SourceTable) -> bool:
     return detect_party_sheet(source) is not None
 
 
-# backward-compatible alias (pre-Supplier naming)
-is_customers_full_sheet = is_party_sheet
-
-
-_FLAT_DOCTYPES = {"customer", "supplier", "contact", "address"}
+# the flat target key <-> canonical doctype, in one place
 _DT_CANONICAL = {
     "customer": "Customer",
     "supplier": "Supplier",
     "contact": "Contact",
     "address": "Address",
 }
+_FLAT_KEYS = frozenset(_DT_CANONICAL)
 _KEY_FOR_DT = {v: k for k, v in _DT_CANONICAL.items()}
 
 
@@ -182,7 +179,7 @@ def parse_flat_target(target: str) -> Optional[tuple[str, str]]:
     dt, field = target.split(".", 1)
     dt = dt.strip().lower()
     field = field.strip()
-    if dt not in _FLAT_DOCTYPES or not field:
+    if dt not in _FLAT_KEYS or not field:
         return None
     return dt, field
 
@@ -380,6 +377,85 @@ def _link_or_create(
         return "failed", str(e)
 
 
+@dataclass
+class _FlatIndex:
+    """What already exists, so a flat import can skip it and link-merge the rest."""
+
+    party_by_name: dict[str, str]           # natural party name -> document name
+    contact_by_email: dict[str, Optional[str]]   # None = created in this dry run
+    contact_links: dict[str, set]           # email -> {(link_doctype, link_name)}
+    addr_by_key: dict[str, Optional[str]]   # "title|type" -> document name
+    address_links: dict[str, set]
+
+
+def _seed_flat_index(client: ERPNextClient, party: str, name_field: str) -> _FlatIndex:
+    """Read the three tables once, up front."""
+    party_by_name: dict[str, str] = {}
+    for r in client.list(party, fields=["name", name_field], limit=0):
+        natural = str(r.get(name_field) or "").strip()
+        if natural:
+            party_by_name[natural] = str(r["name"])
+    return _FlatIndex(
+        party_by_name=party_by_name,
+        contact_by_email={
+            str(r["email_id"]).strip(): str(r["name"])
+            for r in client.list("Contact", fields=["name", "email_id"], limit=0)
+            if r.get("email_id")
+        },
+        contact_links={},
+        addr_by_key={
+            f"{r.get('address_title')}|{r.get('address_type')}".strip(): str(r["name"])
+            for r in client.list("Address",
+                                 fields=["name", "address_title", "address_type"],
+                                 limit=0)
+        },
+        address_links={},
+    )
+
+
+def _upsert_party(client: ERPNextClient, party: str, spec: dict, payload: dict,
+                  defaults: dict, index: _FlatIndex, apply: bool, logger,
+                  warn, row_no: int) -> tuple[str, str]:
+    """Create the party if it is new. Returns `(status, document_name)`.
+
+    A `failed` status means the caller must skip this row's contact/address —
+    they would otherwise link to a party that does not exist.
+    """
+    name_field = spec["name_field"]
+    name_column = spec["name_column"]
+    record = dict(payload)
+    for k, v in defaults.items():
+        record.setdefault(k, v)
+    name = record.get(name_field, "").strip()
+
+    if not name:
+        warn(f"row {row_no}: missing {name_column} (skipped)")
+        if logger:
+            logger.log(event="row", row=row_no, doctype=party, name="",
+                       status="failed", message=f"missing {name_column}")
+        return "failed", ""
+
+    if name in index.party_by_name:
+        docname, status, message = index.party_by_name[name], "skipped", ""
+    else:
+        try:
+            docname = (str(client.insert(party, record).get("name") or name)
+                       if apply else name)
+            index.party_by_name[name] = docname
+            status, message = "created", ""
+        except Exception as e:  # noqa: BLE001 — a bad row must not abort the run
+            warn(f"row {row_no}: {party} '{name}' failed: {e}")
+            if logger:
+                logger.log(event="row", row=row_no, doctype=party, name=name,
+                           status="failed", message=str(e))
+            return "failed", ""
+
+    if logger:
+        logger.log(event="row", row=row_no, doctype=party, name=name,
+                   status=status, message=message)
+    return status, docname
+
+
 def import_flat_parties(
     client: ERPNextClient,
     source: SourceTable,
@@ -402,32 +478,7 @@ def import_flat_parties(
     """
     spec = spec_for(party)
     key = spec["key"]
-    name_field = spec["name_field"]
-    name_column = spec["name_column"]
-    defaults = defaults or {}
-
-    # natural party name -> document name (Customer/Supplier docs are named by
-    # the party name, but the insert result is authoritative)
-    party_by_name: dict[str, str] = {}
-    for r in client.list(party, fields=["name", name_field], limit=0):
-        nat = str(r.get(name_field) or "").strip()
-        if nat:
-            party_by_name[nat] = str(r["name"])
-
-    # email -> contact name (None for contacts created within this dry run)
-    contact_by_email: dict[str, Optional[str]] = {
-        str(r["email_id"]).strip(): str(r["name"])
-        for r in client.list("Contact", fields=["name", "email_id"], limit=0)
-        if r.get("email_id")
-    }
-    contact_links: dict[str, set] = {}  # email -> {(link_doctype, link_name)}
-
-    addr_by_key: dict[str, Optional[str]] = {
-        f"{r.get('address_title')}|{r.get('address_type')}".strip(): str(r["name"])
-        for r in client.list("Address", fields=["name", "address_title", "address_type"], limit=0)
-    }
-    address_links: dict[str, set] = {}
-
+    index = _seed_flat_index(client, party, spec["name_field"])
     counts = {
         key: {"created": 0, "skipped": 0, "failed": 0},
         "contact": {"created": 0, "skipped": 0, "linked": 0, "failed": 0},
@@ -437,79 +488,41 @@ def import_flat_parties(
     def warn(msg: str) -> None:
         print(f"WARNING: {msg}", file=sys.stderr)
 
-    tmap = type_maps(client, party)
-    for i, p in enumerate(build_payloads(source, party, flat_mappings, tmap), start=2):
-        # ---- party (Customer/Supplier) ----
-        rec = dict(p[key])
-        for k, v in defaults.items():
-            rec.setdefault(k, v)
-        name = rec.get(name_field, "").strip()
-        pstatus = ""
-        pmessage = ""
-        docname = ""
-        if not name:
-            counts[key]["failed"] += 1
-            pstatus = "failed"
-            pmessage = f"missing {name_column}"
-            warn(f"row {i}: missing {name_column} (skipped)")
-            if logger:
-                logger.log(event="row", row=i, doctype=party, name="",
-                           status=pstatus, message=pmessage)
-            continue
-        if name in party_by_name:
-            counts[key]["skipped"] += 1
-            pstatus = "skipped"
-            docname = party_by_name[name]
-        else:
-            try:
-                if apply:
-                    created = client.insert(party, rec)
-                    docname = str(created.get("name") or name)
-                else:
-                    docname = name
-                party_by_name[name] = docname
-                counts[key]["created"] += 1
-                pstatus = "created"
-            except Exception as e:
-                counts[key]["failed"] += 1
-                pstatus = "failed"
-                pmessage = str(e)
-                warn(f"row {i}: {party} '{name}' failed: {e}")
-        if logger:
-            logger.log(event="row", row=i, doctype=party, name=name,
-                       status=pstatus, message=pmessage)
-        if pstatus == "failed":
-            # contact/address link to a party that does not exist — skip them
-            continue
+    type_map = type_maps(client, party)
+    payloads = build_payloads(source, party, flat_mappings, type_map)
+    for row_no, payload in enumerate(payloads, start=2):
+        status, docname = _upsert_party(client, party, spec, payload[key], defaults or {},
+                                        index, apply, logger, warn, row_no)
+        counts[key][status] += 1
+        if status == "failed":
+            continue  # no contact/address for a party that does not exist
 
         link = {"link_doctype": party, "link_name": docname}
 
-        # ---- contact ----
-        contact = p["contact"]
+        contact = payload["contact"]
         email = (contact.get("email_ids") or [{}])[0].get("email_id", "")
         if email:
-            cstatus, cmessage = _link_or_create(
+            status, message = _link_or_create(
                 client, "Contact", contact, email, link,
-                contact_by_email, contact_links, apply, warn, i,
-            )
-            counts["contact"][cstatus] += 1
+                index.contact_by_email, index.contact_links, apply, warn, row_no)
+            counts["contact"][status] += 1
             if logger:
-                logger.log(event="row", row=i, doctype="Contact", key=email,
-                           status=cstatus, party=docname, message=cmessage)
+                logger.log(event="row", row=row_no, doctype="Contact", key=email,
+                           status=status, party=docname, message=message)
 
-        # ---- address ----
-        addr = p["address"]
-        akey = f"{addr.get('address_title')}|{addr.get('address_type')}".strip()
-        astatus, amessage = _link_or_create(
-            client, "Address", addr, akey, link,
-            addr_by_key, address_links, apply, warn, i,
-        )
-        counts["address"][astatus] += 1
+        address = payload["address"]
+        addr_key = f"{address.get('address_title')}|{address.get('address_type')}".strip()
+        status, message = _link_or_create(
+            client, "Address", address, addr_key, link,
+            index.addr_by_key, index.address_links, apply, warn, row_no)
+        counts["address"][status] += 1
         if logger:
-            logger.log(event="row", row=i, doctype="Address",
-                       key=addr.get("address_title"), status=astatus, message=amessage)
+            logger.log(event="row", row=row_no, doctype="Address",
+                       key=address.get("address_title"), status=status, message=message)
 
     return counts
+
+
 
 
 def run_flat_parties_import(
@@ -541,45 +554,6 @@ def run_flat_parties_import(
 def _snake(label: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "_", label.strip()).strip("_").lower()
     return re.sub(r"_+", "_", s)
-
-
-def _fieldtype_for(profile) -> str:
-    if profile is None:
-        return "Data"
-    return {
-        "int": "Int",
-        "float": "Float",
-        "date": "Date",
-        "bool": "Check",
-    }.get(profile.inferred_type, "Data")
-
-
-def _distinct_values(source: SourceTable, header: str, cap: int = 50,
-                     require_column: Optional[str] = None) -> list[str]:
-    """Distinct non-empty values of `header`.
-
-    `require_column` restricts the scan to rows that will actually import (e.g.
-    rows carrying a party name). Without it a junk value sitting in a row that is
-    skipped anyway becomes a phantom link conflict, and the agent would "fix" it
-    by creating nonsense master data.
-    """
-    idx = source.column_index(header)
-    if idx is None:
-        return []
-    req = source.column_index(require_column) if require_column else None
-    seen: set[str] = set()
-    out: list[str] = []
-    for row in source.rows:
-        if req is not None and (req >= len(row) or not str(row[req]).strip()):
-            continue  # row has no party name -> skipped at import
-        if idx < len(row):
-            v = str(row[idx]).strip()
-            if v and v not in seen:
-                seen.add(v)
-                out.append(v)
-                if len(out) >= cap:
-                    break
-    return out
 
 
 def _link_value_conflicts(
@@ -620,18 +594,9 @@ def _link_value_conflicts(
         fmeta = engine.parent.get(field)
         if not fmeta or not fmeta.is_link or not fmeta.options:
             continue
-        values = _distinct_values(source, header, require_column=spec["name_column"])
-        if not values:
-            continue
-        existing = existing_cache.get(fmeta.options)
-        if existing is None:
-            try:
-                existing = {str(r.get("name")) for r in
-                            client.list(fmeta.options, fields=["name"], limit=0)}
-            except Exception:
-                existing = set()
-            existing_cache[fmeta.options] = existing
-        missing = [v for v in values if v not in existing]
+        values = distinct_values(source, header,
+                                 require_column=spec["name_column"])
+        missing = missing_link_values(client, values, fmeta.options, existing_cache)
         if not missing:
             continue
         g = grouped.setdefault((header, fmeta.options), {"targets": [], "missing": []})
@@ -640,169 +605,133 @@ def _link_value_conflicts(
             g["targets"].append(qual)
         g["missing"] = sorted(set(g["missing"]) | set(missing))
 
-    out: list[dict] = []
-    for (header, linked), g in grouped.items():
-        qual_targets = sorted(g["targets"])
-        out.append({
-            "kind": "link_value_conflict",
-            "severity": "error",
-            "source": header,
-            "target": qual_targets[0],
-            "targets": qual_targets,
-            "doctype": linked,
-            "missing_values": g["missing"][:25],
-            "detail": (
-                f"{len(g['missing'])} source value(s) for '{header}' do not exist "
-                f"in {linked}."
-            ),
-            "suggested_action": (
-                f"create the missing {linked} record(s) with create_record — "
-                f"describe_doctype('{linked}') lists the required fields, including "
-                "child-table ones — then re-run map."
-            ),
-        })
-    return out
+    return [
+        link_value_conflict(header, sorted(g["targets"]), linked, g["missing"])
+        for (header, linked), g in grouped.items()
+    ]
 
 
-def build_party_sheet_analysis(
-    client: ERPNextClient,
-    source: SourceTable,
-    party: str = "Customer",
-    *,
-    base_url: str = "",
-    source_path: str = "",
-    flat_mappings: Optional[dict[str, tuple[str, str]]] = None,
-) -> dict:
-    """Build a flat party-sheet mapping analysis (for the LLM agent).
+#: score at or above which an out-of-contract column is treated as mapping onto
+#: an existing field rather than needing a custom one
+MATCH_THRESHOLD = 0.7
 
-    Columns in the fixed contract are deterministic; every column outside it is
-    surfaced as an `unmapped_column` conflict with one of two resolutions: map
-    it to an existing field (extend_contract) or create a custom field
-    (create_custom_field, with a ready `create_command`). Already-resolved flat
-    overrides are treated as in-contract and NOT flagged.
-    """
-    spec = spec_for(party)
-    fmap = flat_map_for(party)
+
+def _party_engines(client: ERPNextClient, party: str) -> dict[str, MappingEngine]:
+    """MappingEngines for the three doctypes a flat party sheet feeds."""
     engines: dict[str, MappingEngine] = {}
     for dt in (party, "Contact", "Address"):
         parent, children = fetch_with_children(client, dt)
         engines[dt] = MappingEngine(parent, children)
+    return engines
 
-    flat = flat_mappings or {}
-    known = set(fmap.keys()) | set(flat.keys())
-    known_mappings = [
+
+def _known_mappings(source: SourceTable, fmap: dict, flat: dict) -> list[dict]:
+    """The fixed contract plus any resolved overrides, for the artifact."""
+    out = [
         {"header": h, "doctype": kind, "target": target, "method": "flat_contract"}
         for h, (kind, target) in fmap.items()
         if h in source.headers
     ]
-    known_mappings += [
+    out += [
         {"header": h, "doctype": kind, "target": field, "method": "flat_override"}
         for h, (kind, field) in flat.items()
         if h in source.headers
     ]
+    return out
 
-    conflicts: list[dict] = []
-    suggested: list[dict] = []
-    extra_columns: list[dict] = []
 
-    for header in source.headers:
-        if header in known:
-            continue
-        idx = source.column_index(header)
-        profile = source.profiles[idx] if idx is not None and idx < len(source.profiles) else None
+def _profile_of(source: SourceTable, header: str):
+    idx = source.column_index(header)
+    if idx is None or idx >= len(source.profiles):
+        return None
+    return source.profiles[idx]
 
-        # best existing-field match across the three doctypes (skip the
-        # synthetic "name"/"ID" dedup target — it would token-match e.g. "Tax ID")
-        best_doctype: Optional[str] = None
-        best_target = None
-        best_score = 0.0
-        best_method = "none"
-        for dt, engine in engines.items():
-            for t in engine.targets:
-                if t.fieldname == "name":
-                    continue
-                score, method = engine._score(header, t)
-                if score > best_score:
-                    best_doctype, best_target, best_score, best_method = dt, t, score, method
 
-        entry: dict = {
-            "header": header,
-            "non_empty": round(profile.non_empty, 3) if profile else 0.0,
-            "sample": (profile.sample[:5] if profile else []),
-            "inferred_type": (profile.inferred_type if profile else "text"),
-        }
-        if best_target is not None and best_score >= 0.7:
-            entry.update({
-                "best_match": {
-                    "doctype": best_doctype,
-                    "target": best_target.qualified,
-                    "label": best_target.label,
-                    "score": round(best_score, 3),
-                    "method": best_method,
-                },
-                "resolution": "extend_contract",
-            })
-            flat_target = f"{flat_key(best_doctype)}.{best_target.qualified}"
-            conflicts.append({
-                "kind": "unmapped_column",
-                "severity": "error",
-                "source": header,
-                "target": best_target.qualified,
-                "doctype": best_doctype,
-                "detail": (
-                    f"Column '{header}' is not in the flat contract but matches "
-                    f"{best_doctype}.{best_target.qualified} "
-                    f"({best_method}, score {best_score:.2f})."
-                ),
-                "suggested_action": (
-                    f"set_mapping('{spec['flow']}', '{header}', '{flat_target}') "
-                    "so the values import."
-                ),
-            })
-        else:
-            doctype = best_doctype or party
-            fieldname = _snake(header)
-            fieldtype = _fieldtype_for(profile)
-            entry.update({
-                "best_match": None,
-                "resolution": "create_custom_field",
-                "suggested_doctype": doctype,
-            })
-            flat_target = f"{flat_key(doctype)}.{fieldname}"
-            conflicts.append({
-                "kind": "unmapped_column",
-                "severity": "error",
-                "source": header,
-                "detail": (
-                    f"Column '{header}' has no matching field in "
-                    f"{party}/Contact/Address."
-                ),
-                "suggested_action": (
-                    f"create_field('{doctype}', '{header}', '{fieldtype}') then "
-                    f"set_mapping('{spec['flow']}', '{header}', '{flat_target}')."
-                ),
-            })
-            suggested.append({
-                "source": header,
-                "doctype": doctype,
-                "fieldname": fieldname,
-                "label": header,
-                "fieldtype": fieldtype,
-                "reason": f"unmapped non-empty source column ({spec['flow']})",
-                "create_command": (
-                    f"python3 erpgen.py createfield {doctype} "
-                    f"--label '{header}' --fieldtype {fieldtype}"
-                ),
-            })
-        extra_columns.append(entry)
+def _best_field_match(header: str, engines: dict):
+    """Highest-scoring existing field for `header`, across the three doctypes.
 
-    # ---- link values: every mapped Link column must point at records that
-    # exist, or the import fails row-by-row (e.g. Supplier.payment_terms ->
-    # Payment Terms Template). Checked for contract AND resolved columns.
-    conflicts.extend(_link_value_conflicts(client, source, spec, fmap, flat, engines))
+    Skips the synthetic "name"/"ID" dedup target, which would otherwise
+    token-match unrelated columns (e.g. "Tax ID").
+    """
+    best_doctype: Optional[str] = None
+    best_target = None
+    best_score = 0.0
+    best_method = "none"
+    for dt, engine in engines.items():
+        for t in engine.targets:
+            if t.fieldname == "name":
+                continue
+            score, method = engine._score(header, t)
+            if score > best_score:
+                best_doctype, best_target, best_score, best_method = dt, t, score, method
+    return best_doctype, best_target, best_score, best_method
 
+
+def _classify_extra_column(header: str, source: SourceTable, engines: dict,
+                           party: str, spec: dict):
+    """Classify one out-of-contract column.
+
+    Returns `(entry, conflict, suggested_field_or_None)` — either the column can
+    extend the contract onto an existing field, or it needs a custom field first.
+    """
     flow = spec["flow"]
-    agent_instructions = (
+    profile = _profile_of(source, header)
+    best_doctype, best_target, best_score, best_method = _best_field_match(header, engines)
+
+    entry: dict = {
+        "header": header,
+        "non_empty": round(profile.non_empty, 3) if profile else 0.0,
+        "sample": (profile.sample[:5] if profile else []),
+        "inferred_type": (profile.inferred_type if profile else "text"),
+    }
+
+    if best_target is not None and best_score >= MATCH_THRESHOLD:
+        entry.update({
+            "best_match": {
+                "doctype": best_doctype,
+                "target": best_target.qualified,
+                "label": best_target.label,
+                "score": round(best_score, 3),
+                "method": best_method,
+            },
+            "resolution": "extend_contract",
+        })
+        flat_target = f"{flat_key(best_doctype)}.{best_target.qualified}"
+        conflict = unmapped_column_conflict(
+            header, severity="error",
+            detail=(f"Column '{header}' is not in the flat contract but matches "
+                    f"{best_doctype}.{best_target.qualified} "
+                    f"({best_method}, score {best_score:.2f})."),
+            suggested_action=(f"set_mapping('{flow}', '{header}', "
+                              f"'{flat_target}') so the values import."),
+            target=best_target.qualified, doctype=best_doctype,
+        )
+        return entry, conflict, None
+
+    doctype = best_doctype or party
+    fieldname = _snake(header)
+    fieldtype = fieldtype_for(profile)
+    entry.update({
+        "best_match": None,
+        "resolution": "create_custom_field",
+        "suggested_doctype": doctype,
+    })
+    flat_target = f"{flat_key(doctype)}.{fieldname}"
+    conflict = unmapped_column_conflict(
+        header, severity="error",
+        detail=f"Column '{header}' has no matching field in {party}/Contact/Address.",
+        suggested_action=(f"create_field('{doctype}', '{header}', '{fieldtype}') then "
+                          f"set_mapping('{flow}', '{header}', '{flat_target}')."),
+    )
+    suggestion = suggested_custom_field(
+        header, doctype, fieldname, fieldtype=fieldtype,
+        reason=f"unmapped non-empty source column ({flow})",
+    )
+    return entry, conflict, suggestion
+
+
+def _agent_instructions(party: str, flow: str) -> str:
+    return (
         f"You are the migration-fix agent for a flat {flow} sheet "
         f"({party} + Contact + Address in one file). Columns NOT in the fixed "
         "mapping contract are dropped at import. Resolve EVERY conflict (all are "
@@ -820,6 +749,49 @@ def build_party_sheet_analysis(
         "import. Do not import until the analysis has zero conflicts."
     )
 
+
+def build_party_sheet_analysis(
+    client: ERPNextClient,
+    source: SourceTable,
+    party: str = "Customer",
+    *,
+    base_url: str = "",
+    source_path: str = "",
+    flat_mappings: Optional[dict[str, tuple[str, str]]] = None,
+) -> dict:
+    """Build a flat party-sheet mapping analysis (for the LLM agent).
+
+    Columns in the fixed contract are deterministic; every column outside it is
+    surfaced as an `unmapped_column` conflict with one of two resolutions: map
+    it to an existing field (extend_contract) or create a custom field
+    (create_custom_field, with a ready `create_command`). Already-resolved flat
+    overrides are treated as in-contract and NOT flagged. Link columns whose
+    values do not exist on the site become `link_value_conflict`s.
+    """
+    spec = spec_for(party)
+    fmap = flat_map_for(party)
+    flat = flat_mappings or {}
+    engines = _party_engines(client, party)
+    known = set(fmap) | set(flat)
+
+    conflicts: list[dict] = []
+    suggested: list[dict] = []
+    extra_columns: list[dict] = []
+    for header in source.headers:
+        if header in known:
+            continue
+        entry, conflict, suggestion = _classify_extra_column(
+            header, source, engines, party, spec)
+        extra_columns.append(entry)
+        conflicts.append(conflict)
+        if suggestion is not None:
+            suggested.append(suggestion)
+
+    # every mapped Link column must point at records that exist, or the import
+    # fails row-by-row (e.g. Supplier.payment_terms -> Payment Terms Template)
+    conflicts.extend(_link_value_conflicts(client, source, spec, fmap, flat, engines))
+
+    flow = spec["flow"]
     return {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -828,12 +800,14 @@ def build_party_sheet_analysis(
         "source": source_path,
         "source_rows": source.n_rows,
         "base_url": base_url,
-        "known_mappings": known_mappings,
+        "known_mappings": _known_mappings(source, fmap, flat),
         "extra_columns": extra_columns,
         "column_profiles": [p.as_dict() for p in source.profiles],
         "conflicts": conflicts,
         "suggested_custom_fields": suggested,
-        "agent_instructions": agent_instructions,
+        "agent_instructions": _agent_instructions(party, flow),
     }
+
+
 
 

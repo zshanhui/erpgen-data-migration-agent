@@ -70,7 +70,6 @@ from erpgen.dedup import (  # noqa: E402
     existing_names,
     extract_key,
     infer_id_column,
-    resolve_key_field,
 )
 from erpgen.infer import guess_doctype  # noqa: E402
 from erpgen.journal import (  # noqa: E402
@@ -284,57 +283,151 @@ def cmd_map(args) -> int:
     return 0
 
 
-def cmd_import(args) -> int:
-    source = read_source(args.source)
+def _import_flat_party_sheet(args, source, party: str) -> int:
+    """Flat party sheet: split one file into party + Contact + Address."""
+    client = _client(args)
+    flow = flow_for_party(party)
+    defaults = json.loads(args.defaults) if args.defaults else {}
+    flat_mappings = load_flat_mappings(args.overrides or DEFAULT_OVERRIDES, flow)
+    logger = RunLogger(args.log_dir, tag=flow) if args.apply else None
+    if logger:
+        logger.run_start(source=args.source, base=args.base, apply=args.apply)
+    run_flat_parties_import(
+        client, source, party=party, defaults=defaults, apply=args.apply,
+        logger=logger, flat_mappings=flat_mappings,
+    )
+    if logger:
+        logger.run_end()
+    _report_out_of_contract(args, client, source, party, flat_mappings)
+    return 0
 
-    # Flat party sheet (inline contact/address columns) -> split into
-    # party + Contact + Address internally, same as any other import.
-    party = detect_party_sheet(source)
-    if party:
-        client = _client(args)
-        flow = flow_for_party(party)
-        defaults = json.loads(args.defaults) if args.defaults else {}
-        flat_mappings = load_flat_mappings(args.overrides or DEFAULT_OVERRIDES, flow)
-        logger = RunLogger(args.log_dir, tag=flow) if args.apply else None
-        if logger:
-            logger.run_start(source=args.source, base=args.base, apply=args.apply)
-        run_flat_parties_import(
-            client, source, party=party, defaults=defaults, apply=args.apply,
-            logger=logger, flat_mappings=flat_mappings,
+
+def _report_out_of_contract(args, client, source, party: str, flat_mappings: dict) -> None:
+    """Surface columns outside the flat contract so an agent can resolve them."""
+    contract = flat_map_for(party)
+    extra = [h for h in source.headers if h not in contract and h not in flat_mappings]
+    if not extra:
+        return
+    analysis = build_party_sheet_analysis(
+        client, source, party, base_url=args.base, source_path=args.source,
+        flat_mappings=flat_mappings,
+    )
+    apath = save_analysis(analysis, args.analysis_dir)
+    print(f"\nNOTE: {len(extra)} column(s) outside the flat contract are "
+          f"dropped at import.")
+    print(f"Analysis saved to {apath}  "
+          f"({len(analysis['conflicts'])} conflicts, "
+          f"{len(analysis['suggested_custom_fields'])} suggested custom fields)")
+
+
+def _open_import_run(args, plan, analysis: dict, row_errors: list,
+                     key_label: str, id_column: str):
+    """Open the audit log and the journal / unified run context.
+
+    Only called when applying, so callers can rely on a live logger/journal.
+    """
+    mode = "bulk (Data Import)" if args.bulk else "upsert (REST)"
+    logger = RunLogger(args.log_dir, tag=f"import-{plan.doctype.lower().replace(' ', '-')}")
+    ctx = _context(args, plan.doctype, args.source, command="import")
+    if ctx:
+        ctx.add_requirements(analysis["conflicts"])
+    journal = ctx or MigrationJournal(args.log_dir, doctype=plan.doctype,
+                                      source=args.source, base_url=args.base)
+    logger.run_start(
+        doctype=plan.doctype,
+        source=args.source,
+        base=args.base,
+        mode=mode,
+        id_field=plan.id_field,
+        key_field=key_label,
+        id_column=id_column,
+        submit=args.submit,
+        defaults=plan.defaults,
+        plan=plan.as_dict(),
+    )
+    for e in row_errors:
+        logger.row(e["row"], "", "failed", message="; ".join(e["errors"]))
+    return logger, journal, ctx
+
+
+def _predicted_dedup(client, plan, payloads: list, spec, key_label: str):
+    """(source keys, keys that already exist) — read-only, so dry-run safe."""
+    if spec:
+        keys = [k for k in (extract_key(p, spec["source"]) for p in payloads) if k]
+        existing = existing_keys(client, plan.doctype, spec["target"]) if keys else set()
+    else:
+        keys = [str(p.get(key_label) or "").strip() for p in payloads if p.get(key_label)]
+        existing = (existing_names(client, plan.doctype, plan.id_field or "name", keys)
+                    if keys else set())
+    return keys, existing
+
+
+def _print_dry_run_preview(args, engine, plan, payloads: list) -> None:
+    print("\nDry run (use --apply to import). ")
+    if args.bulk:
+        csv_text = engine.build_template_csv(plan, payloads)
+        print("CSV preview (bulk path):")
+        print("\n".join(csv_text.splitlines()[:6]))
+    else:
+        print("First payload (REST upsert path):")
+        print(json.dumps({k: v for k, v in payloads[0].items() if k != "__row"},
+                         indent=2) if payloads else "{}")
+
+
+def _load_payloads(args, client, engine, plan, to_create: list, skipped: list,
+                   existing: set, key_label: str, logger, journal) -> None:
+    """Push the new rows via the Data Import machinery or REST upsert."""
+    if args.bulk:
+        if not to_create:
+            print("Nothing new to import; skipping Data Import run.")
+            return
+        csv_text = engine.build_template_csv(plan, to_create)
+        result = DataImportLoader(client).load(
+            plan.doctype,
+            csv_text,
+            import_type="Insert New Records",
+            submit_after_import=args.submit,
+            skipped=len(skipped),
+            timeout=args.timeout,
+            logger=logger,
+            journal=journal,
         )
-        if logger:
-            logger.run_end()
-        # surface out-of-contract columns for an LLM agent to resolve
-        contract = flat_map_for(party)
-        extra = [h for h in source.headers if h not in contract and h not in flat_mappings]
-        if extra:
-            analysis = build_party_sheet_analysis(
-                client, source, party, base_url=args.base, source_path=args.source,
-                flat_mappings=flat_mappings,
-            )
-            apath = save_analysis(analysis, args.analysis_dir)
-            print(f"\nNOTE: {len(extra)} column(s) outside the flat contract are "
-                  f"dropped at import.")
-            print(f"Analysis saved to {apath}  "
-                  f"({len(analysis['conflicts'])} conflicts, "
-                  f"{len(analysis['suggested_custom_fields'])} suggested custom fields)")
-        return 0
+        print(json.dumps(result.as_dict(), indent=2))
+        return
+    results = RestLoader(client).upsert(
+        plan.doctype,
+        to_create,
+        key_label,
+        existing=existing,
+        submit=args.submit,
+        logger=logger,
+        journal=journal,
+    )
+    ok = sum(1 for r in results if r.ok and not r.skipped)
+    print(f"REST upsert: created {ok}, failed {sum(1 for r in results if not r.ok)}")
 
-    if not args.doctype:
-        args.doctype = guess_doctype(source)
-        if not args.doctype:
-            print("ERROR: could not infer doctype from headers; pass --doctype.",
-                  file=sys.stderr)
-            return 2
-        print(f"Inferred doctype: {args.doctype}")
 
+def _verified_created(client, plan, spec, to_create: list, key_label: str) -> int:
+    """Re-read the site and count how many of the new keys really landed."""
+    if spec:
+        created = [k for k in (extract_key(p, spec["source"]) for p in to_create) if k]
+        return sum(1 for k in created if k in existing_keys(client, plan.doctype,
+                                                            spec["target"]))
+    created = [str(p.get(key_label) or "").strip() for p in to_create if p.get(key_label)]
+    return len(existing_names(client, plan.doctype, plan.id_field or "name",
+                              [k for k in created if k]))
+
+
+def _build_plan(args, source):
+    """Score the mapping, apply overrides, and build the payloads.
+
+    Returns `(engine, client, plan, payloads, row_errors)`.
+    """
     engine, client = _engine(args, args.doctype)
     plan = engine.suggest(source)
-    o_path, overrides = _overrides_for(args, plan.doctype)
-    if overrides:
-        n = apply_overrides(plan, source, engine, overrides)
-        if n:
-            print(f"Applied {n} mapping override(s) from {o_path}")
+    overrides_path, overrides = _overrides_for(args, plan.doctype)
+    if overrides and apply_overrides(plan, source, engine, overrides):
+        print(f"Applied mapping override(s) from {overrides_path}")
     _print_plan(plan, source)
 
     payloads, row_errors = engine.build_payloads(source, plan)
@@ -344,6 +437,27 @@ def cmd_import(args) -> int:
             print(f"  row {e['row']}: {e['errors']}")
     if plan.fetch_from_conflicts:
         print("NOTE: fetch_from fields were dropped from payloads (see conflicts above)")
+    return engine, client, plan, payloads, row_errors
+
+
+def cmd_import(args) -> int:
+    source = read_source(args.source)
+
+    # Flat party sheet (inline contact/address columns) -> split into
+    # party + Contact + Address internally, same as any other import.
+    party = detect_party_sheet(source)
+    if party:
+        return _import_flat_party_sheet(args, source, party)
+
+    if not args.doctype:
+        args.doctype = guess_doctype(source)
+        if not args.doctype:
+            print("ERROR: could not infer doctype from headers; pass --doctype.",
+                  file=sys.stderr)
+            return 2
+        print(f"Inferred doctype: {args.doctype}")
+
+    engine, client, plan, payloads, row_errors = _build_plan(args, source)
 
     # ---- idempotency setup ----
     id_column = infer_id_column(plan, source, args.id_column)
@@ -369,54 +483,20 @@ def cmd_import(args) -> int:
           f"({len(analysis['conflicts'])} conflicts, "
           f"{len(analysis['suggested_custom_fields'])} suggested custom fields)")
 
-    # ---- run log (created before any write so conversion failures are logged) ----
-    mode = "bulk (Data Import)" if args.bulk else "upsert (REST)"
-    logger = None
-    journal = None
+    # ---- run log (opened before any write so failures are logged) ----
+    logger = journal = ctx = None
     if args.apply:
-        logger = RunLogger(args.log_dir, tag=f"import-{plan.doctype.lower().replace(' ', '-')}")
-        ctx = _context(args, plan.doctype, args.source, command="import")
-        if ctx:
-            ctx.add_requirements(analysis["conflicts"])
-        journal = ctx or MigrationJournal(args.log_dir, doctype=plan.doctype,
-                                          source=args.source, base_url=args.base)
-        logger.run_start(
-            doctype=plan.doctype,
-            source=args.source,
-            base=args.base,
-            mode=mode,
-            id_field=plan.id_field,
-            key_field=key_label,
-            id_column=id_column,
-            submit=args.submit,
-            defaults=plan.defaults,
-            plan=plan.as_dict(),
-        )
-        for e in row_errors:
-            logger.row(e["row"], "", "failed", message="; ".join(e["errors"]))
+        logger, journal, ctx = _open_import_run(args, plan, analysis, row_errors,
+                                                key_label, id_column)
 
     # ---- predicted dedup (read-only, safe in dry-run too) ----
-    if spec:
-        keys = [extract_key(p, spec["source"]) for p in payloads]
-        keys = [k for k in keys if k]
-        existing = existing_keys(client, plan.doctype, spec["target"]) if keys else set()
-    else:
-        keys = [str(p.get(key_label) or "").strip() for p in payloads if p.get(key_label)]
-        existing = existing_names(client, plan.doctype, plan.id_field or "name", keys) if keys else set()
+    keys, existing = _predicted_dedup(client, plan, payloads, spec, key_label)
     predicted_new = [k for k in keys if k not in existing]
     print(f"  of {len(keys)} keyed rows: {len(predicted_new)} new, "
           f"{len(keys) - len(predicted_new)} already exist (will be skipped)")
 
     if not args.apply:
-        print("\nDry run (use --apply to import). ")
-        if args.bulk:
-            csv_text = engine.build_template_csv(plan, payloads)
-            print("CSV preview (bulk path):")
-            print("\n".join(csv_text.splitlines()[:6]))
-        else:
-            print("First payload (REST upsert path):")
-            print(json.dumps({k: v for k, v in payloads[0].items() if k != "__row"},
-                             indent=2) if payloads else "{}")
+        _print_dry_run_preview(args, engine, plan, payloads)
         return 0
 
     errs = [c for c in analysis["conflicts"] if c["severity"] == "error"]
@@ -432,51 +512,13 @@ def cmd_import(args) -> int:
         client, plan.doctype, plan, payloads, id_column=id_column, logger=logger
     )
     print(f"\nDedup: {len(to_create)} to create, {len(skipped)} skipped")
-
-    if args.bulk:
-        if not to_create:
-            print("Nothing new to import; skipping Data Import run.")
-        else:
-            csv_text = engine.build_template_csv(plan, to_create)
-            result = DataImportLoader(client).load(
-                plan.doctype,
-                csv_text,
-                import_type="Insert New Records",
-                submit_after_import=args.submit,
-                skipped=len(skipped),
-                timeout=args.timeout,
-                logger=logger,
-                journal=journal,
-            )
-            print(json.dumps(result.as_dict(), indent=2))
-    else:
-        results = RestLoader(client).upsert(
-            plan.doctype,
-            to_create,
-            key_label,
-            existing=existing,
-            submit=args.submit,
-            logger=logger,
-            journal=journal,
-        )
-        ok = sum(1 for r in results if r.ok and not r.skipped)
-        print(f"REST upsert: created {ok}, failed {sum(1 for r in results if not r.ok)}")
+    _load_payloads(args, client, engine, plan, to_create, skipped, existing,
+                   key_label, logger, journal)
 
     # ---- post-run verification ----
-    if spec:
-        created_keys = [extract_key(p, spec["source"]) for p in to_create]
-        created_keys = [k for k in created_keys if k]
-        verified = existing_keys(client, plan.doctype, spec["target"])
-        verified_created = sum(1 for k in created_keys if k in verified)
-    else:
-        created_keys = [str(p.get(key_label) or "").strip() for p in to_create if p.get(key_label)]
-        verified = existing_names(client, plan.doctype, plan.id_field or "name",
-                                  [k for k in created_keys if k])
-        verified_created = len(verified)
-    logger.run_end(
-        verified_created=verified_created,
-        new_keys=len(created_keys),
-    )
+    logger.run_end(verified_created=_verified_created(client, plan, spec, to_create,
+                                                      key_label),
+                   new_keys=len(to_create))
     journal.close()
     print()
     print(logger.summary(plan.doctype, args.source))
@@ -849,10 +891,7 @@ def cmd_revert(args) -> int:
     return 0 if not res["failed"] else 1
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Build the CLI parser. Extracted from main() so tests can parse argv
-    without dispatching a command."""
-    ap = argparse.ArgumentParser(prog="erpgen.py", description=__doc__)
+def _add_global_flags(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--base", default=DEFAULT_BASE, help=f"ERPNext URL (default {DEFAULT_BASE})")
     ap.add_argument("--user", default="Administrator")
     ap.add_argument("--password", default="admin")
@@ -861,8 +900,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="audit log directory (default: logs/)")
     ap.add_argument("--run", metavar="RUN_ID",
                     help="migration run id: all commands sharing it use one context (logs/run-<id>.jsonl), revertible in one step")
-    sub = ap.add_subparsers(dest="cmd", required=True)
 
+
+def _add_source_parsers(sub) -> None:
+    """The two commands that consume a source file."""
     p_map = sub.add_parser("map", help="build a mapping plan from a source file")
     p_map.add_argument("source")
     p_map.add_argument("--doctype", help="target doctype (inferred from headers if omitted)")
@@ -899,6 +940,9 @@ def build_parser() -> argparse.ArgumentParser:
                             "(default: analysis/)")
     p_imp.set_defaults(fn=cmd_import)
 
+
+def _add_definition_parsers(sub) -> None:
+    """Commands that inspect or extend a doctype's schema."""
     p_cf = sub.add_parser(
         "createfield",
         help="create a custom field (column) on a doctype, e.g. to hold an "
@@ -928,6 +972,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_dd.add_argument("--all", action="store_true", help="include the full field list")
     p_dd.set_defaults(fn=cmd_describe_doctype)
 
+
+def _add_query_parsers(sub) -> None:
+    """Read-only lookups plus the mapping-override writer."""
     p_gr = sub.add_parser("get-record", help="fetch a single record as JSON")
     p_gr.add_argument("doctype")
     p_gr.add_argument("name")
@@ -957,22 +1004,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_sm.add_argument("--list", action="store_true", help="show current overrides")
     p_sm.set_defaults(fn=cmd_set_mapping)
 
-    p_rv = sub.add_parser(
-        "revert",
-        help="revert a migration by replaying its journal's inverses (newest-first). "
-             "Consumes logs/journal-<doctype>-<ts>.jsonl — undoes records, custom "
-             "fields and overrides in one command",
-    )
-    p_rv.add_argument("log", nargs="?", metavar="journal",
-                      help="path to a logs/journal-*.jsonl file")
-    p_rv.add_argument("--latest", metavar="DOCTYPE",
-                      help="use the newest journal for this doctype instead of a path")
-    p_rv.add_argument("--apply", action="store_true",
-                      help="actually execute the inverses (default: dry-run preview)")
-    p_rv.add_argument("--force", action="store_true",
-                      help="replay a journal that was already fully reverted")
-    p_rv.set_defaults(fn=cmd_revert)
 
+def _add_lifecycle_parsers(sub) -> None:
+    """Create lookup records, inspect a run, revert a run, delete records."""
     p_cr = sub.add_parser(
         "create-record",
         help="create a lookup record (Item Group, UOM, ...); journaled, and shares "
@@ -993,12 +1027,41 @@ def build_parser() -> argparse.ArgumentParser:
                       help="newest run touching this doctype")
     p_st.set_defaults(fn=cmd_status)
 
+    p_rv = sub.add_parser(
+        "revert",
+        help="revert a migration by replaying its journal's inverses (newest-first). "
+             "Consumes logs/journal-<doctype>-<ts>.jsonl — undoes records, custom "
+             "fields and overrides in one command",
+    )
+    p_rv.add_argument("log", nargs="?", metavar="journal",
+                      help="path to a logs/journal-*.jsonl file")
+    p_rv.add_argument("--latest", metavar="DOCTYPE",
+                      help="use the newest journal for this doctype instead of a path")
+    p_rv.add_argument("--apply", action="store_true",
+                      help="actually execute the inverses (default: dry-run preview)")
+    p_rv.add_argument("--force", action="store_true",
+                      help="replay a journal that was already fully reverted")
+    p_rv.set_defaults(fn=cmd_revert)
+
     p_del = sub.add_parser("delete", help="delete records by name (cleanup)")
     p_del.add_argument("--doctype", required=True)
     p_del.add_argument("--names", required=True, help="comma-separated names")
     p_del.set_defaults(fn=cmd_delete)
 
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser. Extracted from main() so tests can parse argv
+    without dispatching a command."""
+    ap = argparse.ArgumentParser(prog="erpgen.py", description=__doc__)
+    _add_global_flags(ap)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    _add_source_parsers(sub)
+    _add_definition_parsers(sub)
+    _add_query_parsers(sub)
+    _add_lifecycle_parsers(sub)
     return ap
+
+
 
 
 def main() -> int:

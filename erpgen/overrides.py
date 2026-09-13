@@ -12,8 +12,8 @@ source file is never modified and every decision is reproducible/reviewable.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from typing import Optional
 
 from .mapper import ColumnMapping, MappingEngine, MappingPlan
 from .source import SourceTable
@@ -22,19 +22,39 @@ DEFAULT_OVERRIDES = "mapping-overrides.json"
 
 
 def load_overrides(path: str | Path) -> dict:
+    """Read the overrides file, failing loudly and usefully when it is corrupt.
+
+    Silently ignoring a corrupt file would drop the user's/agent's decisions and
+    silently produce wrong mappings, so this raises — but says exactly where the
+    problem is and how to recover.
+    """
     p = Path(path)
     if not p.exists():
         return {}
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError as e:
-        raise ValueError(f"overrides file {p} is not valid JSON: {e}") from e
+        raise ValueError(
+            f"overrides file {p} is not valid JSON: {e}\n"
+            f"  at line {e.lineno}, column {e.colno}\n"
+            "  Fix that line, or delete the file to start over — the agent will "
+            "re-derive the decisions."
+        ) from e
 
 
 def save_overrides(path: str | Path, data: dict) -> None:
-    Path(path).write_text(
+    """Write the overrides file atomically (temp file + rename).
+
+    A plain `write_text` can leave a truncated or half-written file if the
+    process dies mid-write, and readers then hard-fail on invalid JSON — which
+    blocks the entire migration. Rename is atomic on the same filesystem.
+    """
+    p = Path(path)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
+    os.replace(tmp, p)
 
 
 def _doc_block(data: dict, doctype: str) -> dict:

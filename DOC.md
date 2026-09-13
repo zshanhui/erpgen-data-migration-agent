@@ -81,6 +81,11 @@ Run one sheet at a time the same way:
 Notes:
 - Run from `data-migration/`, and use `.venv/bin/python` — the agent needs
   llama-index and `.xlsx` needs openpyxl. `python3` alone will not work.
+- The doctype is **inferred per sheet** from its headers (`--doctype` overrides
+  it). Check the `Starting agent for <doctype>` line matches the sheet — a
+  mismatch means every column is being analysed against the wrong doctype.
+- `--max-iterations` (default 50) caps the agent's internal tool calls per
+  round; llama-index's own default of 20 is low for conflict-heavy sheets.
 - `--run <id>` joins one unified context (`logs/run-<id>.jsonl`) so the mapper's
   conflicts become the run's requirements and every effect is revertible
   together. Without it the agent writes a per-doctype journal instead.
@@ -130,6 +135,29 @@ traceback.
 
 If the network is genuinely blocked, use the offline path —
 `DOCTOR=1 ./scripts/run-all-agentic.sh` builds every analysis without an LLM.
+
+### Other failure modes
+
+**The agent exhausted its step budget** (`WorkflowRuntimeError: Max iterations of
+20 reached!`). llama-index caps the agent's internal tool calls per round, and a
+sheet with many conflicts can use them up while still making progress. Raise the
+budget (exit code 3):
+
+```bash
+python3 scripts/agent.py --source samples/suppliers-smb.csv --max-iterations 100
+```
+
+**A sheet is analysed against the wrong doctype.** Check the
+`Starting agent for <doctype>` line: it must match the sheet (`items.csv` →
+`Item`). Doctype inference is per sheet — `--doctype` has no default in the agent
+precisely so it cannot shadow inference.
+
+**`overrides file ... is not valid JSON`.** `mapping-overrides.json` holds the
+resolved decisions; a corrupt file blocks the whole migration rather than being
+silently ignored (which would drop the decisions and mis-map). The error names
+the offending line. The file is written atomically (temp + rename), so repair is
+just deleting the stray content — or delete the file and let the agent re-derive
+everything.
 
 ## Doctype inference & flat SMB sheets
 
