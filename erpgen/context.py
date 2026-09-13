@@ -242,6 +242,15 @@ class MigrationContext:
                     doctype=doctype, name=custom_field_name, fieldname=fieldname,
                     label=label or fieldname)
 
+    def link_added(self, doctype: str, name: str, link_doctype: str,
+                   link_name: str) -> None:
+        """A Dynamic Link row added to an EXISTING record (e.g. link-merge)."""
+        self.effect("record_link_add",
+                    {"op": "remove_record_link", "doctype": doctype, "name": name,
+                     "link_doctype": link_doctype, "link_name": link_name},
+                    doctype=doctype, name=name, link_doctype=link_doctype,
+                    link_name=link_name)
+
     def override_set(self, doctype: str, column: str, target: Optional[str],
                      previous: Optional[str], overrides_path: str) -> None:
         self.effect("override_set",

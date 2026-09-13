@@ -264,13 +264,26 @@ MUTATIONS = [
 
     # ---- overrides file integrity ----
     ("bug: overrides written in place instead of atomically", [
-        (OVR, '    tmp.write_text(\n'
-              '        json.dumps(data, indent=2, ensure_ascii=False) + "\\n", encoding="utf-8"\n'
-              '    )\n'
-              '    os.replace(tmp, p)',
-              '    p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\\n",  # MUTANT\n'
-              '                 encoding="utf-8")'),
+        (OVR, '        with os.fdopen(fd, "w", encoding="utf-8") as fh:\n'
+              '            fh.write(json.dumps(data, indent=2, ensure_ascii=False) + "\\n")\n'
+              '        os.replace(tmp_name, p)',
+              '        p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\\n",  # MUTANT\n'
+              '                     encoding="utf-8")'),
     ], "tests/test_overrides.py::test_save_overrides_writes_atomically_via_rename"),
+
+    # The agent issues set_mapping as parallel tool calls: two writers must not
+    # share a temp path, and load -> modify -> save must not interleave.
+    ("bug: concurrent overrides writers share one temp file", [
+        (OVR, '    fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".",\n'
+              '                                    suffix=".tmp")',
+              '    tmp_name = str(p.with_name(p.name + ".tmp"))  # MUTANT\n'
+              '    fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)'),
+    ], "tests/test_overrides.py::test_save_overrides_gives_each_writer_its_own_temp_file"),
+
+    ("bug: overrides read-modify-write is not serialised", [
+        (OVR, '        fcntl.flock(fh, fcntl.LOCK_EX)',
+              '        pass  # MUTANT: no exclusive lock'),
+    ], "tests/test_overrides.py::test_concurrent_set_mapping_keeps_both_decisions"),
 
     ("bug: corrupt overrides error hides the offending line", [
         (OVR, '            f"  at line {e.lineno}, column {e.colno}\\n"',
@@ -307,6 +320,62 @@ MUTATIONS = [
               '        return stalled + 1',
               '    if False:  # MUTANT\n        return stalled + 1'),
     ], "tests/test_agent_preflight.py::test_stall_counter_starts_at_zero_then_counts_identical_rounds"),
+
+    # ---- revertibility of flat imports + link-merge ----
+    ("bug: flat imports journal nothing (not revertible)", [
+        (CF, '            if apply and journal:\n'
+             '                journal.record_created(party, docname)',
+             '            pass  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_flat_import_journals_every_created_record"),
+
+    ("bug: created Contact/Address not journaled", [
+        (CF, '            if journal:\n'
+             '                journal.record_created(doctype, index[natural_key])',
+             '            pass  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_flat_import_journals_every_created_record"),
+
+    ("bug: added links are not journaled (link-merge unrevertible)", [
+        (CF, '        if journal:\n'
+             '            journal.link_added(doctype, name, link_doctype, link_name)',
+             '        pass  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_flat_import_journals_the_link_merge_but_not_the_creates_it_replaces"),
+
+    ("bug: remove_record_link drops the wrong links", [
+        (JRN, '    kept = [r for r in links\n'
+              '            if (r.get("link_doctype"), r.get("link_name")) != want]',
+              '    kept = []  # MUTANT'),
+    ], "tests/test_journal.py::test_remove_record_link_drops_only_that_link"),
+
+    # ---- deterministic-first dispatch ----
+    ("bug: clean analysis still burns LLM calls", [
+        (AGT, '    if args.source and not _error_conflicts(analysis) and not args.always_llm:',
+              '    if False:  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_no_conflicts_imports_without_any_llm_call"),
+
+    ("bug: row failures do not engage the agent", [
+        (AGT, '        pre_import = warning_digest(out) or out[-1500:]\n'
+              '        print(f"  {failed} row(s) failed — engaging the agent to investigate.")',
+              '        return 0  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_row_failures_engage_the_agent_with_the_context"),
+
+    ("bug: pre-import drops the run id", [
+        (AGT, '        cmd = (["--run", args.run] if getattr(args, "run", None) else [])',
+              '        cmd = []  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_pre_import_carries_the_run_id_before_the_subcommand"),
+
+    ("bug: --always-llm ignored", [
+        (AGT, '    if args.source and not _error_conflicts(analysis) and not args.always_llm:',
+              '    if args.source and not _error_conflicts(analysis):  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_always_llm_skips_the_deterministic_pre_import"),
+
+    ("bug: import failures misread as success", [
+        (AGT, '    m = re.search(r"REST upsert: created \\d+, failed (\\d+)", out)\n'
+              '    if m:\n'
+              '        return int(m.group(1))',
+              '    m = None  # MUTANT\n'
+              '    if m:\n'
+              '        return int(m.group(1))'),
+    ], "tests/test_agent_preflight.py::test_import_failure_count_parses_every_output_shape"),
 
     # ---- live progress stream (so the user need not guess) ----
     ("bug: --quiet does not silence the live stream", [

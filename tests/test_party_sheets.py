@@ -810,3 +810,54 @@ def test_describe_doctype_without_child_tables():
     from erpgen.tools import describe_doctype
 
     assert describe_doctype(FakeSite(), "Supplier")["fields"]["tables"] == []
+
+
+# ------------------------------------------------- journaling the flat import
+class _Journal:
+    """Records what the flat import asks to be journaled."""
+
+    def __init__(self):
+        self.created: list = []
+        self.links: list = []
+
+    def record_created(self, doctype, name):
+        self.created.append((doctype, name))
+
+    def link_added(self, doctype, name, link_doctype, link_name):
+        self.links.append((doctype, name, link_doctype, link_name))
+
+
+def test_flat_import_journals_every_created_record():
+    site, journal = FakeSite(), _Journal()
+    import_flat_parties(site, make_sheet(SUPPLIER_HEADERS, [SHENZHEN_ROW]),
+                        "Supplier", apply=True, journal=journal)
+    assert [dt for dt, _ in journal.created] == ["Supplier", "Contact", "Address"]
+    assert journal.links == []
+
+
+def test_flat_import_journals_the_link_merge_but_not_the_creates_it_replaces():
+    """Only the added link is an effect; the existing contact is untouched."""
+    site = FakeSite({
+        "Customer": {"Acme Steel Works": {"name": "Acme Steel Works",
+                                          "customer_name": "Acme Steel Works"}},
+        "Contact": {"C1": {"name": "C1", "email_id": "alicia@acmesteel.example",
+                           "links": [{"link_doctype": "Customer",
+                                      "link_name": "Acme Steel Works"}]}},
+        "Address": {"A1": {"name": "A1",
+                           "address_title": "Acme Steel Works - Billing",
+                           "address_type": "Billing"}},
+    })
+    journal = _Journal()
+    import_flat_parties(site, make_sheet(SUPPLIER_HEADERS, [ACME_SUPPLIER_ROW]),
+                        "Supplier", apply=True, journal=journal)
+    assert ("Contact", "C1", "Supplier", "Acme Steel Works") in journal.links
+    assert ("Address", "A1", "Supplier", "Acme Steel Works") in journal.links
+    assert [dt for dt, _ in journal.created] == ["Supplier"], \
+        "the reused contact/address must not be journaled as created"
+
+
+def test_flat_import_journals_nothing_on_a_dry_run():
+    journal = _Journal()
+    import_flat_parties(FakeSite(), make_sheet(SUPPLIER_HEADERS, [SHENZHEN_ROW]),
+                        "Supplier", apply=False, journal=journal)
+    assert journal.created == [] and journal.links == []

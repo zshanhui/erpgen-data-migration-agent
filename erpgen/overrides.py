@@ -11,8 +11,11 @@ source file is never modified and every decision is reproducible/reviewable.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from .mapper import ColumnMapping, MappingEngine, MappingPlan
@@ -48,13 +51,42 @@ def save_overrides(path: str | Path, data: dict) -> None:
     A plain `write_text` can leave a truncated or half-written file if the
     process dies mid-write, and readers then hard-fail on invalid JSON — which
     blocks the entire migration. Rename is atomic on the same filesystem.
+
+    The temp file name must be unique per writer: the agent issues parallel
+    tool calls, so two savers sharing one temp path either interleave into it
+    (publishing invalid JSON) or lose the file to the other's rename.
     """
     p = Path(path)
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
-    os.replace(tmp, p)
+    fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=p.name + ".",
+                                    suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        os.replace(tmp_name, p)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+@contextmanager
+def _locked(path: str | Path):
+    """Serialise one read-modify-write of the overrides file.
+
+    `set_mapping`/`unset_mapping` are load -> modify -> save, and the agent
+    fires them as parallel tool calls: without this, the second writer
+    publishes a snapshot taken before the first decision landed and silently
+    drops it. flock covers threads and processes alike; the lock is a sibling
+    file because `os.replace` swaps the overrides file's inode, so locking the
+    file itself would not exclude anyone.
+    """
+    lock = Path(str(path) + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def _doc_block(data: dict, doctype: str) -> dict:
@@ -67,22 +99,24 @@ def set_mapping(
     path: str | Path, doctype: str, column: str, target: str
 ) -> dict:
     """Record `source column -> target field` in the overrides file."""
-    data = load_overrides(path)
-    block = _doc_block(data, doctype)
-    block["mappings"][column] = target
-    save_overrides(path, data)
+    with _locked(path):
+        data = load_overrides(path)
+        block = _doc_block(data, doctype)
+        block["mappings"][column] = target
+        save_overrides(path, data)
     return block
 
 
 def unset_mapping(path: str | Path, doctype: str, column: str) -> bool:
     """Remove a mapping override. Returns True if something was removed."""
-    data = load_overrides(path)
-    block = data.get(doctype)
-    if block and column in block.get("mappings", {}):
+    with _locked(path):
+        data = load_overrides(path)
+        block = data.get(doctype)
+        if not (block and column in block.get("mappings", {})):
+            return False
         del block["mappings"][column]
         save_overrides(path, data)
         return True
-    return False
 
 
 def apply_overrides(

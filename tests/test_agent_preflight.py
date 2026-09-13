@@ -213,6 +213,150 @@ def test_iteration_exhaustion_is_not_mistaken_for_a_network_error(agent_mod):
     assert agent_mod._is_llm_error(WorkflowRuntimeError("Max iterations of 20 reached!")) is False
 
 
+# ------------------------------- deterministic-first dispatch (no conflicts)
+CLEAN = {"doctype": "Item", "conflicts": [], "source": "samples/items.csv",
+         "base_url": "http://localhost:8082"}
+
+
+def _run_args(**kw):
+    ns = argparse.Namespace(
+        source="samples/items.csv", analysis=None, doctype=None, defaults=None,
+        base="http://localhost:8082", user="Administrator", password="admin",
+        provider="deepseek", model=None, api_base=None, run=None, quiet=True,
+        always_llm=False, max_rounds=20, max_iterations=50, max_stall_rounds=2,
+        doctor=False)
+    for key, value in kw.items():
+        setattr(ns, key, value)
+    return ns
+
+
+class _T:
+    logs_dir = Path("/tmp")
+    path = Path("/tmp/agent-t.jsonl")
+
+    def log(self, **k):
+        pass
+
+    def close(self):
+        pass
+
+
+def _stub_loop(agent_mod, monkeypatch, captured):
+    """Replace the LLM-loop plumbing so dispatch logic can be tested alone."""
+    monkeypatch.setattr(agent_mod, "build_workflow", lambda llm: object())
+    monkeypatch.setattr(agent_mod.Transcript, "open",
+                        classmethod(lambda cls, dt: _T()))
+    monkeypatch.setattr(agent_mod, "_open_journal", lambda *a, **k: _T())
+    monkeypatch.setattr(agent_mod, "_report_run_end", lambda *a: None)
+    monkeypatch.setattr(agent_mod, "_preflight_llm", lambda a: True)
+
+    async def _fake_rounds(args, wf, transcript, analysis, doctype, source,
+                           pre_import=""):
+        captured["pre_import"] = pre_import
+        captured["rounds"] = True
+        return agent_mod.RunOutcome(converged=True)
+
+    monkeypatch.setattr(agent_mod, "_run_rounds", _fake_rounds)
+
+
+@pytest.mark.parametrize("out,expected", [
+    ("REST upsert: created 29, failed 0", 0),
+    ("REST upsert: created 0, failed 29", 29),
+    ("  customer   created 2 | skipped 0 | failed 1\n  address  created 2 | skipped 0", 1),
+    ("  supplier   created 15 | skipped 0", 0),
+    ('{"doctype": "Item", "failed": 3}', 3),
+    ("Import summary\n  created: 0 | skipped: 0 | failed: 7", 7),
+    ("nothing relevant", 0),
+    # summary truncated away -> fall back to counting the row warnings
+    ("WARNING: row 2: Customer 'A' failed: boom\nWARNING: row 3: Customer 'B' failed: boom", 2),
+])
+def test_import_failure_count_parses_every_output_shape(agent_mod, out, expected):
+    assert agent_mod.import_failure_count(out) == expected
+
+
+def test_no_conflicts_imports_without_any_llm_call(agent_mod, monkeypatch):
+    """The point: a clean re-run must cost zero remote calls."""
+    import asyncio
+    used = []
+    monkeypatch.setattr(agent_mod, "_load_analysis", lambda *a: dict(CLEAN))
+    monkeypatch.setattr(agent_mod, "_erpgen",
+                        lambda cmd, timeout=300: (0, "REST upsert: created 3, failed 0"))
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: used.append(1))
+    assert asyncio.run(agent_mod.run_agent(_run_args())) == 0
+    assert used == [], "must not build an LLM when there is nothing to decide"
+
+
+def test_pre_import_carries_the_run_id_before_the_subcommand(agent_mod, monkeypatch):
+    import asyncio
+    seen = {}
+    monkeypatch.setattr(agent_mod, "_load_analysis", lambda *a: dict(CLEAN))
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: None)
+
+    def _fake_erpgen(cmd, timeout=300):
+        seen["cmd"] = cmd
+        return 0, "REST upsert: created 0, failed 0"
+
+    monkeypatch.setattr(agent_mod, "_erpgen", _fake_erpgen)
+    asyncio.run(agent_mod.run_agent(_run_args(run="r1")))
+    assert seen["cmd"][:2] == ["--run", "r1"], "--run is a global flag (pre-subcommand)"
+    assert seen["cmd"][2] == "import" and "--apply" in seen["cmd"]
+
+
+def test_row_failures_engage_the_agent_with_the_context(agent_mod, monkeypatch):
+    import asyncio
+    captured = {}
+    monkeypatch.setattr(agent_mod, "_load_analysis", lambda *a: dict(CLEAN))
+    monkeypatch.setattr(
+        agent_mod, "_erpgen",
+        lambda cmd, timeout=300: (0, _warnings(range(2, 31), SCHEMA_ERR)))
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: object())
+    _stub_loop(agent_mod, monkeypatch, captured)
+    assert asyncio.run(agent_mod.run_agent(_run_args())) == 0
+    assert captured.get("rounds") is True, "the agent must be engaged"
+    assert "lead_time_days" in captured["pre_import"], \
+        "the failure reason must be handed to the model"
+
+
+def test_always_llm_skips_the_deterministic_pre_import(agent_mod, monkeypatch):
+    import asyncio
+    captured = {}
+    ran = []
+    monkeypatch.setattr(agent_mod, "_load_analysis", lambda *a: dict(CLEAN))
+    monkeypatch.setattr(agent_mod, "_erpgen",
+                        lambda cmd, timeout=300: ran.append(cmd) or (0, ""))
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: object())
+    _stub_loop(agent_mod, monkeypatch, captured)
+    asyncio.run(agent_mod.run_agent(_run_args(always_llm=True)))
+    assert ran == [], "no pre-import when --always-llm"
+    assert captured.get("rounds") is True
+
+
+def test_conflicts_still_go_straight_to_the_agent(agent_mod, monkeypatch):
+    import asyncio
+    captured = {}
+    busy = {"doctype": "Customer", "source": "s.csv", "base_url": "u",
+            "conflicts": [{"severity": "error", "kind": "required_missing",
+                           "field": "customer_type"}]}
+    monkeypatch.setattr(agent_mod, "_load_analysis", lambda *a: dict(busy))
+    monkeypatch.setattr(agent_mod, "_erpgen",
+                        lambda cmd, timeout=300: pytest.fail("must not pre-import"))
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: object())
+    _stub_loop(agent_mod, monkeypatch, captured)
+    asyncio.run(agent_mod.run_agent(_run_args()))
+    assert captured.get("rounds") is True
+    assert captured["pre_import"] == ""
+
+
+def test_round_message_includes_the_pre_import_failures(agent_mod):
+    msg = agent_mod._round_message(1, "Customer", "s.csv", dict(CLEAN),
+                                   pre_import="x29  Unknown column")
+    assert "already run" in msg and "Unknown column" in msg
+
+
+def test_round_message_omits_the_note_when_nothing_failed(agent_mod):
+    assert "already run" not in agent_mod._round_message(1, "Item", "s.csv", dict(CLEAN))
+
+
 # ------------------------------------------- live progress on stdout
 @pytest.fixture
 def live(agent_mod):

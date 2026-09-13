@@ -223,3 +223,69 @@ def test_migration_journal_accepts_an_explicit_run_id(tmp_path):
     assert j.run_id == "explicit"
     j.close()
     assert parse_journal(j.path)["run_start"]["run_id"] == "explicit"
+
+
+# ---------------------------------------------------- link effects (link-merge)
+class _LinkClient:
+    """Minimal client for the remove_record_link inverse."""
+
+    def __init__(self, links):
+        self.doc = {"name": "C1", "links": list(links)}
+        self.updates: list = []
+
+    def get(self, doctype, name):
+        return dict(self.doc)
+
+    def update(self, doctype, name, doc):
+        self.updates.append(doc)
+        self.doc.update(doc)
+        return self.doc
+
+
+def test_remove_record_link_drops_only_that_link():
+    from erpgen.journal import apply_inverse
+
+    client = _LinkClient([
+        {"link_doctype": "Customer", "link_name": "Acme"},
+        {"link_doctype": "Supplier", "link_name": "Acme"},
+    ])
+    ok, err = apply_inverse(client, {
+        "op": "remove_record_link", "doctype": "Contact", "name": "C1",
+        "link_doctype": "Supplier", "link_name": "Acme"})
+    assert (ok, err) == (True, "")
+    assert client.doc["links"] == [{"link_doctype": "Customer", "link_name": "Acme"}]
+
+
+def test_remove_record_link_is_a_noop_when_already_unlinked():
+    """Reverting twice must not write, and must not fail."""
+    from erpgen.journal import apply_inverse
+
+    client = _LinkClient([{"link_doctype": "Customer", "link_name": "Acme"}])
+    ok, err = apply_inverse(client, {
+        "op": "remove_record_link", "doctype": "Contact", "name": "C1",
+        "link_doctype": "Supplier", "link_name": "Acme"})
+    assert (ok, err) == (True, "")
+    assert client.updates == [], "nothing to do => no write"
+
+
+def test_describe_inverse_names_the_unlink():
+    from erpgen.journal import describe_inverse
+
+    text = describe_inverse({"op": "remove_record_link", "doctype": "Contact",
+                             "name": "C1", "link_doctype": "Customer",
+                             "link_name": "Acme"})
+    assert "unlink Customer/Acme" in text and "Contact/C1" in text
+
+
+def test_journal_records_a_link_add_with_its_inverse(tmp_path):
+    from erpgen.journal import MigrationJournal
+
+    j = MigrationJournal(tmp_path, doctype="Contact", source="s")
+    j.link_added("Contact", "C1", "Supplier", "Acme")
+    j.close()
+    effect = [e for e in (json.loads(l) for l in j.path.read_text().splitlines())
+              if e.get("event") == "effect"][0]
+    assert effect["kind"] == "record_link_add"
+    assert effect["inverse"] == {"op": "remove_record_link", "doctype": "Contact",
+                                 "name": "C1", "link_doctype": "Supplier",
+                                 "link_name": "Acme"}

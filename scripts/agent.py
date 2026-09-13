@@ -32,6 +32,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -187,6 +188,24 @@ def warning_digest(out: str, cap: int = 5) -> str:
                      "schema/environment problem (e.g. a custom field whose "
                      "database column is missing), not bad source data.")
     return "\n".join(lines)
+
+
+def import_failure_count(out: str) -> int:
+    """Row failures reported by an import run, across its three output shapes."""
+    m = re.search(r"REST upsert: created \d+, failed (\d+)", out)
+    if m:
+        return int(m.group(1))
+    flat = [int(n) for n in re.findall(r"\|\s*failed (\d+)", out)]
+    if flat:
+        return sum(flat)
+    m = re.search(r'"failed":\s*(\d+)', out)      # --bulk result JSON
+    if m:
+        return int(m.group(1))
+    m = re.search(r"failed:\s*(\d+)", out)        # "Import summary" block
+    if m:
+        return int(m.group(1))
+    # last resort: the summary was truncated away, so count the row warnings
+    return sum(1 for line in out.splitlines() if line.strip().startswith("WARNING:"))
 
 
 def t_run_import(source: str, doctype: str = "", apply: bool = False,
@@ -1005,14 +1024,21 @@ def _open_journal(args, doctype: str, source: str, conflicts: list,
     return journal
 
 
-def _round_message(round_no: int, doctype: str, source: str, analysis: dict) -> str:
+def _round_message(round_no: int, doctype: str, source: str, analysis: dict,
+                   pre_import: str = "") -> str:
     """Round 1 gets the whole analysis; later rounds get what is still failing."""
     if round_no == 1:
+        failed_note = (
+            "\n\nA deterministic import was already run and these rows FAILED — "
+            f"diagnose the cause, fix it, then import again:\n{pre_import}"
+            if pre_import else ""
+        )
         return (
             f"Resolve the migration conflicts for doctype '{doctype}' and import the data.\n"
             f"Source file: {source}\n"
             f"Base URL: {analysis.get('base_url', '')}\n\n"
             f"Current analysis:\n{json.dumps(analysis, indent=2, default=str)}"
+            f"{failed_note}"
         )
     return (
         f"Round {round_no}. These error-severity conflicts REMAIN after your last "
@@ -1051,7 +1077,7 @@ def _report_round_error(exc: BaseException, args, round_no: int,
 
 
 async def _run_rounds(args, workflow, transcript: Transcript, analysis: dict,
-                      doctype: str, source: str) -> RunOutcome:
+                      doctype: str, source: str, pre_import: str = "") -> RunOutcome:
     """Loop until no error-severity conflicts remain, or the round cap is hit.
 
     Each round re-reads the analysis artifact rather than trusting the model's
@@ -1074,7 +1100,8 @@ async def _run_rounds(args, workflow, transcript: Transcript, analysis: dict,
         _TRANSCRIPT_CTX.update({"round": round_no, "log_event": transcript.log})
         try:
             outcome.response = await _run_agent_round(
-                workflow, _round_message(round_no, doctype, source, analysis),
+                workflow, _round_message(round_no, doctype, source, analysis,
+                                         pre_import if round_no == 1 else ""),
                 args.max_iterations)
         except Exception as e:  # noqa: BLE001 — classify, don't dump a traceback
             code = _report_round_error(e, args, round_no, transcript)
@@ -1147,10 +1174,6 @@ def _report_run_end(journal, transcript: Transcript) -> None:
 async def run_agent(args) -> int:
     doctype, flat = resolve_doctype(args)
 
-    llm = get_llm(args.provider, args.model, args.api_base)
-    if not _preflight_llm(args):
-        return 2
-
     analysis = _load_analysis(args, doctype, flat)
     if analysis is None:
         return 2
@@ -1162,6 +1185,27 @@ async def run_agent(args) -> int:
 
     doctype = analysis["doctype"]
     source = analysis.get("source") or args.source or "unknown"
+
+    # With no conflicts there is nothing for the model to decide, so run the
+    # import deterministically and only wake the agent if rows actually failed.
+    pre_import = ""
+    if args.source and not _error_conflicts(analysis) and not args.always_llm:
+        cmd = (["--run", args.run] if getattr(args, "run", None) else [])
+        cmd += ["import", args.source, "--apply"]
+        code, out = _erpgen(cmd, timeout=900)
+        failed = import_failure_count(out)
+        print(f"\nNo conflicts — deterministic import (exit {code}): "
+              f"{failed} row(s) failed")
+        if not failed:
+            print(out.strip().splitlines()[-1] if out.strip() else "")
+            return 0
+        pre_import = warning_digest(out) or out[-1500:]
+        print(f"  {failed} row(s) failed — engaging the agent to investigate.")
+
+    llm = get_llm(args.provider, args.model, args.api_base)
+    if not _preflight_llm(args):
+        return 2
+
     workflow = build_workflow(llm)
 
     transcript = Transcript.open(doctype)
@@ -1171,7 +1215,8 @@ async def run_agent(args) -> int:
     journal = _open_journal(args, doctype, source, analysis["conflicts"],
                             transcript.logs_dir, transcript.log)
 
-    outcome = await _run_rounds(args, workflow, transcript, analysis, doctype, source)
+    outcome = await _run_rounds(args, workflow, transcript, analysis, doctype, source,
+                                pre_import)
     if outcome.exit_code == 0:
         transcript.log(event="run_end", max_rounds=args.max_rounds,
                        resolved=outcome.converged,
@@ -1217,6 +1262,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-stall-rounds", type=int, default=2,
                     help="give up after this many consecutive rounds with the "
                          "SAME conflicts unchanged (default: 2; 0 disables)")
+    ap.add_argument("--always-llm", action="store_true",
+                    help="always engage the agent, even when the analysis has no "
+                         "conflicts (default: import deterministically first and "
+                         "only involve the agent if rows fail)")
     ap.add_argument("--quiet", action="store_true",
                     help="suppress the live per-call progress stream on stdout "
                          "(round headers still print; the transcript is "

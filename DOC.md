@@ -259,6 +259,21 @@ DEEPSEEK_API_KEY=dummy .venv/bin/python scripts/agent.py --run mock-01 \
     --provider deepseek --api-base http://127.0.0.1:8765/v1 --max-rounds 1
 ```
 
+### Deterministic first, LLM only when needed
+
+With **no error-severity conflicts** there is nothing for the model to decide, so
+the agent imports directly and only involves the LLM if rows actually failed:
+
+```
+Starting agent for Item — 0 conflicts
+
+No conflicts — deterministic import (exit 0): 0 row(s) failed
+```
+
+A clean re-run therefore costs **zero** remote calls (and needs no API key). When
+rows do fail, the failure digest is handed to the agent so it starts from the
+evidence instead of rediscovering it. `--always-llm` restores the old behaviour.
+
 ### Following a run
 
 The agent streams each LLM call and tool invocation, so a slow round is not a

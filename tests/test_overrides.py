@@ -85,6 +85,74 @@ def test_default_overrides_path_is_relative():
     assert not DEFAULT_OVERRIDES.startswith("/")
 
 
+# ------------------------------------------------- concurrency (parallel tool calls)
+def test_save_overrides_gives_each_writer_its_own_temp_file(tmp_path, monkeypatch):
+    """Seen in the wild: two `set_mapping` calls in one LLM turn share a temp
+    path, so one rename takes it away (ENOENT) or both interleave into it and
+    publish invalid JSON — which then blocks the whole migration."""
+    import os as _os
+    import threading
+
+    p = tmp_path / "ov.json"
+    at_publish = threading.Barrier(2, timeout=5)
+    srcs, errors = [], []
+    real_replace = _os.replace
+
+    def _replace(src, dst):
+        srcs.append(str(src))
+        at_publish.wait()          # both writers must be at the publish step
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(_os, "replace", _replace)
+
+    def writer(col):
+        try:
+            save_overrides(p, {"Item": {"mappings": {col: col}}})
+        except Exception as e:  # noqa: BLE001 — surfaced through `errors`
+            errors.append(e)
+
+    threads = [threading.Thread(target=writer, args=(c,)) for c in ("A", "B")]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+
+    assert len(set(srcs)) == 2, f"writers shared a temp file: {srcs}"
+    assert not errors, f"a concurrent save failed: {errors}"
+    assert load_overrides(p)["Item"]["mappings"] in ({"A": "A"}, {"B": "B"})
+
+
+def test_concurrent_set_mapping_keeps_both_decisions(tmp_path, monkeypatch):
+    """load -> modify -> save must not interleave, or the second writer
+    publishes a snapshot taken before the first decision landed. That is how
+    the agent silently lost an override it had already recorded."""
+    import threading
+    import time
+
+    import erpgen.overrides as ov
+
+    p = tmp_path / "ov.json"
+    real_load = ov.load_overrides
+
+    def slow_load(path):
+        data = real_load(path)
+        time.sleep(0.2)            # widen the window both writers must be inside
+        return data
+
+    monkeypatch.setattr(ov, "load_overrides", slow_load)
+    start = threading.Barrier(2, timeout=5)
+
+    def writer(col, target):
+        start.wait()
+        ov.set_mapping(p, "Item", col, target)
+
+    threads = [threading.Thread(target=writer, args=("Group", "item_group")),
+               threading.Thread(target=writer, args=("Rate", "standard_rate"))]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+
+    assert load_overrides(p)["Item"]["mappings"] == {"Group": "item_group",
+                                                     "Rate": "standard_rate"}
+
+
 # ------------------------------------------------------------- set / unset
 def test_set_mapping_creates_a_full_block(tmp_path):
     p = tmp_path / "ov.json"

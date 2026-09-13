@@ -304,7 +304,7 @@ def build_payloads(
 
 def _ensure_doc_link(client: ERPNextClient, doctype: str, name: str,
                      link_doctype: str, link_name: str,
-                     apply: bool) -> tuple[str, str]:
+                     apply: bool, journal=None) -> tuple[str, str]:
     """Append a Dynamic Link row to an existing Contact/Address if missing.
 
     Returns (status, message):
@@ -330,6 +330,8 @@ def _ensure_doc_link(client: ERPNextClient, doctype: str, name: str,
             client.update(doctype, name, {"links": links})
         except Exception as e:
             return "failed", str(e)
+        if journal:
+            journal.link_added(doctype, name, link_doctype, link_name)
     return "linked", ""
 
 
@@ -344,6 +346,7 @@ def _link_or_create(
     apply: bool,
     warn,
     row_no: int,
+    journal=None,
 ) -> tuple[str, str]:
     """Dedup one Contact/Address by natural key, link-merging on duplicates.
 
@@ -362,12 +365,14 @@ def _link_or_create(
             status = "skipped" if lkey in seen else "linked"
             seen.add(lkey)
             return status, ""
-        return _ensure_doc_link(client, doctype, existing, *lkey, apply)
+        return _ensure_doc_link(client, doctype, existing, *lkey, apply, journal)
 
     try:
         if apply:
             created = client.insert(doctype, payload)
             index[natural_key] = str(created.get("name") or natural_key)
+            if journal:
+                journal.record_created(doctype, index[natural_key])
         else:
             index[natural_key] = None
         seen_links.setdefault(natural_key, set()).add(lkey)
@@ -415,7 +420,7 @@ def _seed_flat_index(client: ERPNextClient, party: str, name_field: str) -> _Fla
 
 def _upsert_party(client: ERPNextClient, party: str, spec: dict, payload: dict,
                   defaults: dict, index: _FlatIndex, apply: bool, logger,
-                  warn, row_no: int) -> tuple[str, str]:
+                  warn, row_no: int, journal=None) -> tuple[str, str]:
     """Create the party if it is new. Returns `(status, document_name)`.
 
     A `failed` status means the caller must skip this row's contact/address —
@@ -442,6 +447,8 @@ def _upsert_party(client: ERPNextClient, party: str, spec: dict, payload: dict,
             docname = (str(client.insert(party, record).get("name") or name)
                        if apply else name)
             index.party_by_name[name] = docname
+            if apply and journal:
+                journal.record_created(party, docname)
             status, message = "created", ""
         except Exception as e:  # noqa: BLE001 — a bad row must not abort the run
             warn(f"row {row_no}: {party} '{name}' failed: {e}")
@@ -464,6 +471,7 @@ def import_flat_parties(
     apply: bool = False,
     logger: Optional[RunLogger] = None,
     flat_mappings: Optional[dict[str, tuple[str, str]]] = None,
+    journal=None,
 ) -> dict:
     """Import a flat party sheet (party + inline contact/address), deduped per doctype.
 
@@ -492,7 +500,7 @@ def import_flat_parties(
     payloads = build_payloads(source, party, flat_mappings, type_map)
     for row_no, payload in enumerate(payloads, start=2):
         status, docname = _upsert_party(client, party, spec, payload[key], defaults or {},
-                                        index, apply, logger, warn, row_no)
+                                        index, apply, logger, warn, row_no, journal)
         counts[key][status] += 1
         if status == "failed":
             continue  # no contact/address for a party that does not exist
@@ -504,7 +512,8 @@ def import_flat_parties(
         if email:
             status, message = _link_or_create(
                 client, "Contact", contact, email, link,
-                index.contact_by_email, index.contact_links, apply, warn, row_no)
+                index.contact_by_email, index.contact_links, apply, warn, row_no,
+                journal)
             counts["contact"][status] += 1
             if logger:
                 logger.log(event="row", row=row_no, doctype="Contact", key=email,
@@ -514,7 +523,7 @@ def import_flat_parties(
         addr_key = f"{address.get('address_title')}|{address.get('address_type')}".strip()
         status, message = _link_or_create(
             client, "Address", address, addr_key, link,
-            index.addr_by_key, index.address_links, apply, warn, row_no)
+            index.addr_by_key, index.address_links, apply, warn, row_no, journal)
         counts["address"][status] += 1
         if logger:
             logger.log(event="row", row=row_no, doctype="Address",
@@ -533,11 +542,12 @@ def run_flat_parties_import(
     apply: bool = False,
     logger: Optional[RunLogger] = None,
     flat_mappings: Optional[dict[str, tuple[str, str]]] = None,
+    journal=None,
 ) -> dict:
     spec = spec_for(party)
     counts = import_flat_parties(
         client, source, party=party, defaults=defaults, apply=apply, logger=logger,
-        flat_mappings=flat_mappings,
+        flat_mappings=flat_mappings, journal=journal,
     )
     print(f"{spec['flow']} import ({'APPLY' if apply else 'dry run'}):")
     for label, c in counts.items():

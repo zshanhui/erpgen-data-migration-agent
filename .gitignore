@@ -7,3 +7,4 @@ docs/
 .env.local
 analysis/
 erpgen-web-services/
+mapping-overrides.json.lock

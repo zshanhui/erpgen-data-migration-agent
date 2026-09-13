@@ -63,6 +63,15 @@ class MigrationJournal:
                     doctype=doctype, name=custom_field_name, fieldname=fieldname,
                     label=label or fieldname)
 
+    def link_added(self, doctype: str, name: str, link_doctype: str,
+                   link_name: str) -> None:
+        """A Dynamic Link row added to an EXISTING record (e.g. link-merge)."""
+        self.effect("record_link_add",
+                    {"op": "remove_record_link", "doctype": doctype, "name": name,
+                     "link_doctype": link_doctype, "link_name": link_name},
+                    doctype=doctype, name=name, link_doctype=link_doctype,
+                    link_name=link_name)
+
     def override_set(self, doctype: str, column: str, target: Optional[str],
                      previous: Optional[str], overrides_path: str) -> None:
         self.effect("override_set",
@@ -106,6 +115,9 @@ def describe_inverse(inv: dict) -> str:
         prev = inv.get("previous")
         action = f"-> {prev!r}" if prev is not None else "(remove override)"
         return f"restore override {inv.get('doctype')}.{inv.get('column')} {action}"
+    if op == "remove_record_link":
+        return (f"unlink {inv.get('link_doctype')}/{inv.get('link_name')} "
+                f"from {inv.get('doctype')}/{inv.get('name')}")
     return f"unknown inverse op {op!r}"
 
 
@@ -130,6 +142,8 @@ def apply_inverse(client: ERPNextClient, inv: dict, apply: bool = True) -> tuple
             else:
                 set_mapping(path, inv["doctype"], inv["column"], inv["previous"])
             return True, ""
+        if op == "remove_record_link":
+            return _remove_record_link(client, inv)
         return False, f"unknown inverse op {op!r}"
     except Exception as e:  # noqa: BLE001 — collected, never fatal
         msg = str(e)
@@ -140,6 +154,20 @@ def apply_inverse(client: ERPNextClient, inv: dict, apply: bool = True) -> tuple
                 ("DoesNotExistError" in msg or "404" in msg):
             return True, ""
         return False, str(e)
+
+
+def _remove_record_link(client: ERPNextClient, inv: dict) -> tuple[bool, str]:
+    """Drop one Dynamic Link row from a record, keeping the others."""
+    doctype, name = inv["doctype"], inv["name"]
+    want = (inv.get("link_doctype"), inv.get("link_name"))
+    doc = client.get(doctype, name)
+    links = list(doc.get("links") or [])
+    kept = [r for r in links
+            if (r.get("link_doctype"), r.get("link_name")) != want]
+    if len(kept) == len(links):
+        return True, ""          # already unlinked (or never linked)
+    client.update(doctype, name, {"links": kept})
+    return True, ""
 
 
 def already_reverted(data: dict) -> Optional[dict]:

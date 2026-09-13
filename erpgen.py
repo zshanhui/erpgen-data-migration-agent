@@ -290,14 +290,20 @@ def _import_flat_party_sheet(args, source, party: str) -> int:
     defaults = json.loads(args.defaults) if args.defaults else {}
     flat_mappings = load_flat_mappings(args.overrides or DEFAULT_OVERRIDES, flow)
     logger = RunLogger(args.log_dir, tag=flow) if args.apply else None
+    journal = (_effect_sink(args, doctype=party, source=args.source, command="import")
+               if args.apply else None)
     if logger:
         logger.run_start(source=args.source, base=args.base, apply=args.apply)
     run_flat_parties_import(
         client, source, party=party, defaults=defaults, apply=args.apply,
-        logger=logger, flat_mappings=flat_mappings,
+        logger=logger, flat_mappings=flat_mappings, journal=journal,
     )
     if logger:
         logger.run_end()
+    if journal:
+        journal.close(status="ok")
+        n = journal.count if hasattr(journal, "count") else getattr(journal, "effects", 0)
+        print(f"Journal: {journal.path}  ({n} revertible effect(s))")
     _report_out_of_contract(args, client, source, party, flat_mappings)
     return 0
 

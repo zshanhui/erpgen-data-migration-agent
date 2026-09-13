@@ -9,5 +9,5 @@ MFG-1002,Precision Idler Pulley,Products,Nos,18.75,Yes,15,Sealed bearing idler p
 PKG-6001,Corrugated Carton 40x30x30,Products,Nos,0.85,Yes,4,Standard shipping carton,SKU-F6001
 FIN-4002,Cutting Fluid 20L,Consumable,Box,35.5,Yes,6,Soluble cutting oil,SKU-D4002
 RAW-2003,Brass Rod 12mm,Raw Material,Kg,9.1,Yes,10,C360 brass rod stock,SKU-B2003
-BOGUS-7001,Experimental Gizmo,Machinery,Nos,99.99,Yes,60,Prototype hardware,SKU-X7001
+BOGUS-7001,Experimental Gizmo,Fabrication,Nos,99.99,Yes,60,Prototype hardware,SKU-X7001
 BOGUS-7002,Laser Alignment Kit,Machinery,Set,450,Yes,45,Precision alignment tooling,SKU-X7002
