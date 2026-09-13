@@ -24,6 +24,7 @@ MINIMAL_ARGV = {
     "create-record": ["UOM", "--fields", '{"uom_name": "Dozen"}'],
     "status": [],
     "delete": ["--doctype", "Item", "--names", "A"],
+    "agent": ["--source", "samples/items.csv"],
 }
 
 EXPECTED_COMMANDS = set(MINIMAL_ARGV)
@@ -114,6 +115,33 @@ def test_help_mentions_every_command(cli, capsys):
     out = capsys.readouterr().out
     for command in EXPECTED_COMMANDS:
         assert command in out
+
+
+# --------------------------------------------------------- the agent entrypoint
+def test_agent_subcommand_dispatches_to_the_in_package_agent(cli, monkeypatch):
+    """`erpgen agent` is the one entrypoint; the old standalone script is gone."""
+    import erpgen.agent
+
+    seen = []
+    monkeypatch.setattr(erpgen.agent, "run", lambda args: seen.append(args) or 7)
+    args = parse(cli, ["--run", "acme-01", "agent", "--source", "samples/items.csv"])
+    assert args.fn(args) == 7
+    assert seen[0].source == "samples/items.csv"
+    assert seen[0].run == "acme-01"
+
+
+def test_the_standalone_agent_script_no_longer_exists(cli):
+    from pathlib import Path
+    assert not (Path(cli.__file__).parent / "scripts" / "agent.py").exists()
+
+
+def test_agent_doctor_runs_through_the_cli_without_an_llm(cli, monkeypatch, capsys):
+    from pathlib import Path
+    monkeypatch.chdir(Path(cli.__file__).parent)
+    monkeypatch.setattr("sys.argv", ["erpgen.py", "agent", "--doctor",
+                                     "--source", "samples/items.csv"])
+    assert cli.main() == 0
+    assert "doctype=Item" in capsys.readouterr().out
 
 
 # ------------------------------------------------------------ pure helpers

@@ -54,11 +54,11 @@ for sheet in "${SHEETS[@]}"; do
       exit 1
     fi
   else
-    if ! "$PY" scripts/agent.py --source "samples/$sheet" \
+    if ! "$PY" erpgen.py --run "$RUN_ID" agent --source "samples/$sheet" \
          --provider "$PROVIDER" --max-iterations "$MAX_ITERATIONS" \
-         --max-rounds "$MAX_ROUNDS" --run "$RUN_ID"; then
+         --max-rounds "$MAX_ROUNDS"; then
       echo "!! agent failed for $sheet — re-run just this sheet with:" >&2
-      echo "     $PY scripts/agent.py --source samples/$sheet --run $RUN_ID" >&2
+      echo "     $PY erpgen.py --run $RUN_ID agent --source samples/$sheet" >&2
       exit 1
     fi
   fi

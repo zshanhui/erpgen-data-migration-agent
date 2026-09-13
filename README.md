@@ -40,7 +40,7 @@ python3 erpgen.py map samples/items.csv --doctype Item       # see conflicts fir
 
 # or the full agent loop on the conflict-rich e2e file
 export DEEPSEEK_API_KEY=<your-key>
-.venv/bin/python scripts/agent.py --doctype Item \
+.venv/bin/python erpgen.py agent --doctype Item \
     --source samples/items_e2e.csv --provider deepseek
 ```
 
@@ -91,7 +91,7 @@ First payload (REST upsert path):
 full agentic migrations run for single customers worksheet
 
 ```
-MacBook-Pro data-migration % .venv/bin/python scripts/agent.py --source samples/customers.csv --run contacts-run
+MacBook-Pro data-migration % .venv/bin/python erpgen.py --run contacts-run agent --source samples/customers.csv
 LLM preflight: https://api.deepseek.com reachable (HTTP 404 at the root — normal for many API hosts)
 Starting agent for Customer — 2 conflicts
   [warning] fetch_from             Email

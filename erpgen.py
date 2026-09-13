@@ -54,6 +54,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from erpgen.agent import add_agent_flags  # noqa: E402
 from erpgen.analysis import build_analysis, save_analysis  # noqa: E402
 from erpgen.client import ERPNextClient  # noqa: E402
 from erpgen.context import (  # noqa: E402
@@ -753,6 +754,13 @@ def cmd_describe_doctype(args) -> int:
     return 0
 
 
+def cmd_agent(args) -> int:
+    """Dispatch `erpgen agent` to the in-package agent."""
+    from erpgen.agent import run  # noqa: PLC0415 — keeps CLI startup cheap
+
+    return run(args)
+
+
 def cmd_delete(args) -> int:
     client = _client(args)
     for name in [n.strip() for n in args.names.split(",") if n.strip()]:
@@ -1053,6 +1061,14 @@ def _add_lifecycle_parsers(sub) -> None:
     p_del.add_argument("--doctype", required=True)
     p_del.add_argument("--names", required=True, help="comma-separated names")
     p_del.set_defaults(fn=cmd_delete)
+
+    p_ag = sub.add_parser(
+        "agent",
+        help="LLM agent: resolve mapping conflicts, then import (imports "
+             "deterministically first when there is nothing to decide)",
+    )
+    add_agent_flags(p_ag)
+    p_ag.set_defaults(fn=cmd_agent)
 
 
 def build_parser() -> argparse.ArgumentParser:

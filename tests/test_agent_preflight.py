@@ -1077,3 +1077,52 @@ def test_is_llm_error_detects_the_real_sdk_module(agent_mod):
     exc = openai.APIConnectionError(request=httpx.Request("POST", BASE))
     assert agent_mod._is_llm_error(exc) is True
     assert "Network/transport failure" in _describe(agent_mod, exc)
+
+
+# ------------------------------- the agent's import joins its own run context
+def test_run_import_propagates_the_run_id_as_a_global_flag(agent_mod, monkeypatch):
+    """Without --run the import journals separately and revert misses its rows."""
+    seen = {}
+
+    def _fake(cmd, timeout=300):
+        seen["cmd"] = cmd
+        return 0, "ok"
+
+    monkeypatch.setattr(agent_mod, "_erpgen", _fake)
+    agent_mod._TRANSCRIPT_CTX.clear()
+    agent_mod._TRANSCRIPT_CTX["run"] = "r1"
+    agent_mod.t_run_import("samples/x.csv", "Customer", apply=True)
+    cmd = seen["cmd"]
+    assert cmd[:2] == ["--run", "r1"], "--run is global: it must precede 'import'"
+    assert cmd[2] == "import" and "--apply" in cmd
+
+
+def test_run_import_omits_the_flag_without_a_run_id(agent_mod, monkeypatch):
+    seen = {}
+
+    def _fake(cmd, timeout=300):
+        seen["cmd"] = cmd
+        return 0, "ok"
+
+    monkeypatch.setattr(agent_mod, "_erpgen", _fake)
+    agent_mod._TRANSCRIPT_CTX.clear()
+    agent_mod.t_run_import("samples/x.csv", "Customer", apply=True)
+    assert "--run" not in seen["cmd"]
+
+
+def test_round_loop_publishes_the_run_id_for_tools(agent_mod, monkeypatch):
+    """The tool wrapper reads it from _TRANSCRIPT_CTX, so the loop must set it."""
+    import asyncio
+    captured = {}
+
+    async def _fake_round(workflow, msg, max_iterations=0):
+        captured["run"] = agent_mod._TRANSCRIPT_CTX.get("run")
+        return "done"
+
+    monkeypatch.setattr(agent_mod, "_run_agent_round", _fake_round)
+    monkeypatch.setattr(agent_mod, "latest_analysis",
+                        lambda dt: {"base_url": "u", "conflicts": []})
+    asyncio.run(agent_mod._run_rounds(_run_args(run="myrun"), object(), _T(),
+                                      {"base_url": "u", "conflicts": []},
+                                      "Item", "s.csv"))
+    assert captured["run"] == "myrun"

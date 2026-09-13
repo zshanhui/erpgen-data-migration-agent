@@ -11,6 +11,7 @@ and passes with the fix. Files are always restored from an in-memory backup.
 """
 from __future__ import annotations
 
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -23,7 +24,7 @@ CF = "erpgen/customers_full.py"
 TLS = "erpgen/tools.py"
 OVR = "erpgen/overrides.py"
 ANL = "erpgen/analysis.py"
-AGT = "scripts/agent.py"
+AGT = "erpgen/agent.py"
 ANA = "erpgen/analysis.py"
 CFF = "erpgen/conflicts.py"
 
@@ -321,6 +322,20 @@ MUTATIONS = [
               '    if False:  # MUTANT\n        return stalled + 1'),
     ], "tests/test_agent_preflight.py::test_stall_counter_starts_at_zero_then_counts_identical_rounds"),
 
+    # ---- the agent's import must join its own run context ----
+    ("bug: agent's run_import journals separately (revert misses its rows)", [
+        (AGT, '    run_id = _TRANSCRIPT_CTX.get("run")\n'
+              '    if run_id:',
+              '    run_id = None  # MUTANT\n'
+              '    if run_id:'),
+    ], "tests/test_agent_preflight.py::test_run_import_propagates_the_run_id_as_a_global_flag"),
+
+    ("bug: run id not published to the tools", [
+        (AGT, '        _TRANSCRIPT_CTX.update({"round": round_no, "log_event": transcript.log,\n'
+              '                                "run": getattr(args, "run", None)})',
+              '        _TRANSCRIPT_CTX.update({"round": round_no, "log_event": transcript.log})  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_round_loop_publishes_the_run_id_for_tools"),
+
     # ---- revertibility of flat imports + link-merge ----
     ("bug: flat imports journal nothing (not revertible)", [
         (CF, '            if apply and journal:\n'
@@ -489,6 +504,17 @@ MUTATIONS = [
               '        return stalled + 1\n'
               '    return stalled  # MUTANT'),
     ], "tests/test_agent_preflight.py::test_stall_counter_resets_when_conflicts_are_resolved"),
+
+    ("bug: `erpgen agent` no longer dispatches to the in-package agent", [
+        (CLI, '    from erpgen.agent import run  # noqa: PLC0415 — keeps CLI startup cheap\n'
+              '\n'
+              '    return run(args)',
+              '    return 0  # MUTANT'),
+    ], "tests/test_cli_args.py::test_agent_subcommand_dispatches_to_the_in_package_agent"),
+
+    ("bug: `erpgen agent` registered without its own flags", [
+        (CLI, '    add_agent_flags(p_ag)', '    pass  # MUTANT'),
+    ], "tests/test_cli_args.py::test_agent_doctor_runs_through_the_cli_without_an_llm"),
 ]
 
 
@@ -499,9 +525,28 @@ def run_test(node: str) -> int:
     ).returncode
 
 
+def _install_restore_guard(backups: dict) -> None:
+    """Restore mutated sources on SIGTERM/SIGINT.
+
+    `finally` does not run when the process is killed, and a killed run leaves
+    the source tree MUTATED (a real bug silently reintroduced). Observed in
+    practice when the suite grew past an outer command timeout.
+    """
+    def _restore(signum, _frame):
+        for rel, content in backups.items():
+            (ROOT / rel).write_text(content)
+        print(f"\n  restored {len(backups)} mutated file(s) on signal {signum}",
+              file=sys.stderr)
+        raise SystemExit(130)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _restore)
+
+
 def main() -> int:
     backups = {}
     failures = []
+    _install_restore_guard(backups)
     try:
         for label, edits, node in MUTATIONS:
             for rel, old, new in edits:

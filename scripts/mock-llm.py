@@ -2,7 +2,7 @@
 
 Usage:
     python3 scripts/mock-llm.py 8765 &            # serve on 127.0.0.1:8765
-    DEEPSEEK_API_KEY=dummy .venv/bin/python scripts/agent.py \
+    DEEPSEEK_API_KEY=dummy .venv/bin/python erpgen.py agent \
         --run mock-01 --source samples/customers_e2e.csv --doctype Customer \
         --provider deepseek --api-base http://127.0.0.1:8765/v1
 

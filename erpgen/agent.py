@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Agent skeleton — LlamaIndex AgentWorkflow driving the erpgen migration loop.
+"""The LLM agent — LlamaIndex AgentWorkflow driving the erpgen migration loop.
+
+Reached as `erpgen agent ...` (see `add_agent_flags`); there is no separate
+script. `run(args)` takes an already-parsed namespace so the CLI owns argv.
 
 Reads the latest mapping analysis for a doctype, then an LLM agent resolves the
 conflicts using tools (create fields, create missing records, set mapping
@@ -8,23 +11,26 @@ then imports and verifies.
 
 Usage:
   # fresh analysis + agent run
-  python3 scripts/agent.py --doctype Customer --source samples/customers.csv \
+  python3 erpgen.py agent --doctype Customer --source samples/customers.csv \
       --defaults '{"customer_group":"Commercial"}'
 
   # resume from an existing analysis
-  python3 scripts/agent.py --analysis analysis/analysis-customer-<ts>.json
+  python3 erpgen.py agent --analysis analysis/analysis-customer-<ts>.json
 
   # no LLM: build tools, show plan, exit (for wiring/debugging)
-  python3 scripts/agent.py --doctor --doctype Customer --source samples/customers.csv
+  python3 erpgen.py agent --doctor --doctype Customer --source samples/customers.csv
 
   # pick a provider and control the outer convergence loop
-  python3 scripts/agent.py --doctype Customer --source samples/customers.csv \
+  python3 erpgen.py agent --doctype Customer --source samples/customers.csv \
       --provider deepseek --max-rounds 30
 
 LLM provider: --provider openai|deepseek (auto-detected from
 OPENAI_API_KEY / DEEPSEEK_API_KEY). DeepSeek defaults to model
 deepseek-v4-flash on https://api.deepseek.com (--api-base to override).
-Run with the project venv: .venv/bin/python scripts/agent.py ...
+Run with the project venv: .venv/bin/python erpgen.py agent ...
+
+Global flags (--base/--run/--log-dir) live on the CLI's main parser and come
+before the subcommand: `erpgen.py --run acme-01 agent --source ...`.
 """
 from __future__ import annotations
 
@@ -210,7 +216,14 @@ def import_failure_count(out: str) -> int:
 
 def t_run_import(source: str, doctype: str = "", apply: bool = False,
                  defaults: str = "{}") -> str:
-    cmd = ["import", source]
+    cmd: list = []
+    run_id = _TRANSCRIPT_CTX.get("run")
+    if run_id:
+        # --run is a GLOBAL flag, so it must precede the subcommand. Without it
+        # the import journals to its own file, and `revert <run-id>` would leave
+        # every imported row behind (it cannot order across files).
+        cmd += ["--run", str(run_id)]
+    cmd += ["import", source]
     if doctype:
         cmd += ["--doctype", doctype]
     if defaults and defaults != "{}":
@@ -1097,7 +1110,8 @@ async def _run_rounds(args, workflow, transcript: Transcript, analysis: dict,
 
         transcript.log(event="round_start", round=round_no, errors_before=len(errs),
                        conflicts_total=len(analysis["conflicts"]))
-        _TRANSCRIPT_CTX.update({"round": round_no, "log_event": transcript.log})
+        _TRANSCRIPT_CTX.update({"round": round_no, "log_event": transcript.log,
+                                "run": getattr(args, "run", None)})
         try:
             outcome.response = await _run_agent_round(
                 workflow, _round_message(round_no, doctype, source, analysis,
@@ -1234,26 +1248,23 @@ async def run_agent(args) -> int:
 
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """The CLI parser, exposed so tests can assert flag defaults."""
-    ap = argparse.ArgumentParser(prog="agent.py", description=__doc__)
+def add_agent_flags(ap: argparse.ArgumentParser) -> None:
+    """Agent-specific flags, added to the `erpgen agent` subparser.
+
+    Global flags (--base/--user/--password/--log-dir/--run) are added separately
+    by the CLI, so `erpgen agent --run X` and `erpgen --run X agent` both work.
+    """
     # no default: a default would shadow header inference (see resolve_doctype)
     ap.add_argument("--doctype", default=None,
                     help="target doctype (inferred from --source headers if omitted)")
     ap.add_argument("--source", help="source CSV/XLSX to analyze (runs map first)")
     ap.add_argument("--analysis", help="path to an existing analysis JSON")
     ap.add_argument("--defaults", help='JSON defaults for map/import, e.g. \'{"customer_group":"Commercial"}\'')
-    ap.add_argument("--base", default="http://localhost:8082")
-    ap.add_argument("--user", default="Administrator")
-    ap.add_argument("--password", default="admin")
     ap.add_argument("--provider", default="auto",
                     choices=["auto", "openai", "deepseek"])
     ap.add_argument("--model", help="LLM model (provider default if omitted)")
     ap.add_argument("--api-base", help="OpenAI-compatible base URL "
                                        "(DeepSeek default: https://api.deepseek.com)")
-    ap.add_argument("--run", metavar="RUN_ID",
-                    help="join a unified migration run context (logs/run-<id>.jsonl) so "
-                         "mapper requirements, agent fixes and revert all share one log")
     ap.add_argument("--max-iterations", type=int, default=50,
                     help="internal tool-call budget per round (llama-index "
                          "default: 20; raise it for conflict-heavy sheets)")
@@ -1272,11 +1283,21 @@ def build_parser() -> argparse.ArgumentParser:
                          "unaffected)")
     ap.add_argument("--doctor", action="store_true",
                     help="show tools + analysis without calling an LLM")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Standalone parser (tests, and `--help` off the CLI)."""
+    ap = argparse.ArgumentParser(prog="erpgen agent", description=__doc__)
+    add_agent_flags(ap)
+    ap.add_argument("--base", default="http://localhost:8082")
+    ap.add_argument("--user", default="Administrator")
+    ap.add_argument("--password", default="admin")
+    ap.add_argument("--run", metavar="RUN_ID", help="migration run id")
     return ap
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def run(args) -> int:
+    """Entry point for the `erpgen agent` subcommand (argv parsed by the CLI)."""
     _LIVE["enabled"] = not getattr(args, "quiet", False)
 
     if args.doctor:
@@ -1305,7 +1326,3 @@ def main() -> int:
             raise
         print("  Re-run with AGENT_DEBUG=1 for the full traceback.", file=sys.stderr)
         return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
