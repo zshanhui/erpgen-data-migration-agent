@@ -554,13 +554,24 @@ def _fieldtype_for(profile) -> str:
     }.get(profile.inferred_type, "Data")
 
 
-def _distinct_values(source: SourceTable, header: str, cap: int = 50) -> list[str]:
+def _distinct_values(source: SourceTable, header: str, cap: int = 50,
+                     require_column: Optional[str] = None) -> list[str]:
+    """Distinct non-empty values of `header`.
+
+    `require_column` restricts the scan to rows that will actually import (e.g.
+    rows carrying a party name). Without it a junk value sitting in a row that is
+    skipped anyway becomes a phantom link conflict, and the agent would "fix" it
+    by creating nonsense master data.
+    """
     idx = source.column_index(header)
     if idx is None:
         return []
+    req = source.column_index(require_column) if require_column else None
     seen: set[str] = set()
     out: list[str] = []
     for row in source.rows:
+        if req is not None and (req >= len(row) or not str(row[req]).strip()):
+            continue  # row has no party name -> skipped at import
         if idx < len(row):
             v = str(row[idx]).strip()
             if v and v not in seen:
@@ -609,7 +620,7 @@ def _link_value_conflicts(
         fmeta = engine.parent.get(field)
         if not fmeta or not fmeta.is_link or not fmeta.options:
             continue
-        values = _distinct_values(source, header)
+        values = _distinct_values(source, header, require_column=spec["name_column"])
         if not values:
             continue
         existing = existing_cache.get(fmeta.options)

@@ -19,10 +19,27 @@
   "Customer": {
     "mappings": {
       "Group": "customer_group",
-      "Vendor Code": "customer.vendor_code",
-      "Internal Ref": "customer.internal_ref"
+      "Vendor Code": "vendor_code",
+      "Internal Ref": "internal_ref",
+      "ID": "customer_name",
+      "UoM": "uom",
+      "Description": "description"
+    },
+    "defaults": {},
+    "value_maps": {}
+  },
+  "suppliers_full": {
+    "mappings": {
+      "Default Currency": "supplier.default_currency",
+      "Tax ID": "supplier.tax_id",
+      "Website": "supplier.website",
+      "Is Transporter": "supplier.is_transporter",
+      "Payment Terms": "supplier.payment_terms",
+      "Lead Time Days": "supplier.lead_time_days"
     },
     "defaults": {},
     "value_maps": {}
   }
+}
+}
 }

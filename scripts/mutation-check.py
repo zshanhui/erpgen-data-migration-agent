@@ -21,6 +21,7 @@ JRN = "erpgen/journal.py"
 CLI = "erpgen.py"
 CF = "erpgen/customers_full.py"
 TLS = "erpgen/tools.py"
+AGT = "scripts/agent.py"
 
 MUTATIONS = [
     ("bug: effect seq restarts per command", [
@@ -167,6 +168,34 @@ MUTATIONS = [
         (TLS, '            child = child_metas.get(f.options)',
               '            child = None  # MUTANT'),
     ], "tests/test_party_sheets.py::test_describe_doctype_exposes_child_required_fields"),
+
+    ("bug: link check reads values from rows that never import", [
+        (CF, '        values = _distinct_values(source, header, require_column=spec["name_column"])',
+             '        values = _distinct_values(source, header)  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_values_from_rows_that_cannot_import_are_ignored"),
+
+    # ---- LLM endpoint preflight ----
+    ("bug: DNS failure no longer fails fast (endpoint reported reachable)", [
+        (AGT, '        return False, (f"DNS lookup failed for {host}: {type(e).__name__}: {e}\\n"',
+              '        return True, ""  # MUTANT\n'
+              '        return False, (f"DNS lookup failed for {host}: {type(e).__name__}: {e}\\n"'),
+    ], "tests/test_agent_preflight.py::test_dns_failure_is_reported_with_proxy_hints"),
+
+    ("bug: reachable endpoint reported as unreachable (401 loses the key hint)", [
+        (AGT, '        if e.code in (401, 403):',
+              '        if False:  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_reachable_401_means_the_key_is_the_problem"),
+
+    ("bug: transport failures lose their network guidance", [
+        (AGT, '    elif any(k in low for k in ("connection", "connect", "timeout", "ssl",',
+              '    elif False and any(k in low for k in ("connection", "connect", "timeout", "ssl",'),
+    ], "tests/test_agent_preflight.py::test_connection_error_explains_the_sdk_conflates_transport_failures"),
+
+    ("bug: every exception dressed up as an LLM/network problem", [
+        (AGT, '    if type(exc).__module__.split(".")[0] in ("openai", "httpx", "httpcore"):\n'
+              '        return True',
+              '    if True:  # MUTANT\n        return True'),
+    ], "tests/test_agent_preflight.py::test_is_llm_error_rejects_our_own_bugs"),
 ]
 
 

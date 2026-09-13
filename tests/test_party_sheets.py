@@ -771,6 +771,16 @@ def test_resolved_column_is_no_longer_an_unmapped_conflict():
     assert "Payment Terms" not in [c["source"] for c in _kinds(a, "unmapped_column")]
 
 
+def test_values_from_rows_that_cannot_import_are_ignored():
+    """A junk value in a row with no party name is skipped at import — it must not
+    become a phantom conflict the agent would "fix" with junk master data."""
+    nameless = ["", "Company", "Raw Material", "Edge Contact", "edge@x.example", "",
+                "Billing", "1 Edge St", "Edgeville", "", "00000", "EdgeCountry"]
+    a = _analysis(_site(), SUPPLIER_HEADERS, [SHENZHEN_ROW, nameless])
+    assert _kinds(a, "link_value_conflict") == []
+    assert a["conflicts"] == [], "the nameless row is dropped, not a conflict source"
+
+
 def test_link_conflict_clears_once_the_records_exist():
     """Mirrors the agent loop: create the records, re-map, conflict is gone."""
     assert _kinds(_analysis(_site(), PT_HEADERS, [PT_ROW], PT_FLAT),

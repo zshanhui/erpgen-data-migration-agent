@@ -2,7 +2,18 @@
 
 Deterministic and verifiable data migration agent for ERPNext
 
-Full demo test run
+full demo test run
+
+make sure you have erpnext stack running in Docker before runningg erpgen
+
+```
+export DEEPSEEK_API_KEY=...
+cd data-migration
+
+./scripts/run-all-agentic.sh                # LLM resolves conflicts, then imports
+DOCTOR=1 ./scripts/run-all-agentic.sh       # no LLM: build each map + show conflicts
+RUN_ID=myrun ./scripts/run-all-agentic.sh   # name the run so it reverts as one unit
+```
 
 ```
 # customers: 29 rows (20 will be new, nothing pre-exists)

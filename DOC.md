@@ -44,6 +44,93 @@ python3 erpgen.py delete --doctype Customer --names "Acme Steel Works"
 Defaults: `--base http://localhost:8082 --user Administrator --password admin`.
 For `.xlsx` use the venv: `.venv/bin/python erpgen.py ...` (see below).
 
+## Full agentic run — every master worksheet
+
+`scripts/run-all-agentic.sh` drives the LLM loop over all supported master
+sheets in dependency order (parties → the Contact/Address sheets that link to
+them → items). Overlaps are safe: imports are idempotent.
+
+```bash
+export DEEPSEEK_API_KEY=...                 # the agent needs an LLM
+cd data-migration
+
+./scripts/run-all-agentic.sh                # LLM resolves conflicts, then imports
+DOCTOR=1 ./scripts/run-all-agentic.sh       # no LLM: build each map + show conflicts
+RUN_ID=myrun ./scripts/run-all-agentic.sh   # name the run so it reverts as one unit
+```
+
+| # | Worksheet | Flow / doctype |
+|---|---|---|
+| 1 | `customers-smb.csv` | `customers_full` — Customer + Contact + Address |
+| 2 | `customers.csv` | Customer (relational) |
+| 3 | `customers_e2e.csv` | Customer (conflict-rich) |
+| 4 | `customers.xlsx` | Customer (xlsx reader path) |
+| 5 | `suppliers-smb.csv` | `suppliers_full` — Supplier + Contact + Address |
+| 6 | `contacts.csv` | Contact (links to the customers above) |
+| 7 | `addresses.csv` | Address (links to the customers above) |
+| 8 | `items.csv` | Item |
+| 9 | `items_e2e.csv` | Item (conflict-rich) |
+
+Run one sheet at a time the same way:
+
+```bash
+.venv/bin/python scripts/agent.py --source samples/suppliers-smb.csv \
+    --provider deepseek --max-rounds 20 --run myrun
+```
+
+Notes:
+- Run from `data-migration/`, and use `.venv/bin/python` — the agent needs
+  llama-index and `.xlsx` needs openpyxl. `python3` alone will not work.
+- `--run <id>` joins one unified context (`logs/run-<id>.jsonl`) so the mapper's
+  conflicts become the run's requirements and every effect is revertible
+  together. Without it the agent writes a per-doctype journal instead.
+- The agent imports (with `apply`) once error-severity conflicts reach zero —
+  there is no separate `--apply`.
+- Same two commands to inspect/undo the whole run:
+  `python3 erpgen.py status <id>` and `python3 erpgen.py revert <id> --apply`
+  (revert previews unless `--apply`).
+- `sales_orders.csv` is **transactional**, not master data — it needs Customers
+  and Items to exist first.
+
+### Troubleshooting `openai.APIConnectionError: Connection error.`
+
+The OpenAI SDK raises the *same* `APIConnectionError` for DNS failure, TLS
+verification errors, a dead proxy and a refused connection — hence a traceback
+with nothing actionable in it. The agent therefore probes the endpoint before the
+loop, classifies any failure by HTTP status and shows a help block:
+
+```
+LLM call failed — APIConnectionError: Connection error.
+
+  endpoint : https://api.deepseek.com
+  model    : deepseek-v4-flash
+  provider : deepseek
+
+  Network/transport failure — DNS, TLS verification, a dead proxy or a
+  firewall. The SDK reports all of these identically.
+
+  Next steps:
+    env | grep -iE 'proxy'    # a stale HTTPS_PROXY is the usual cause
+    curl -sS -m 5 -o /dev/null -w '%{http_code}\n' https://api.deepseek.com/
+    401 from curl = network works (so the key is the problem);
+    no response at all = blocked by DNS/VPN/firewall.
+    Or pass --api-base <url>, or --provider openai.
+
+  No LLM needed (builds every analysis offline):
+    DOCTOR=1 scripts/run-all-agentic.sh
+```
+
+Classification is by status code first, then by class name, so each failure mode
+gets its own guidance — **401/403** key or scope, **404** wrong model id or
+`--api-base`, **429** rate limit/quota, **400** context length or a rejected tool
+schema, **5xx** provider-side. Our own bugs are deliberately *not* wrapped: only
+genuine SDK/transport errors get the help block, and `AGENT_DEBUG=1` restores the
+full traceback. Ctrl-C reports how to inspect the run instead of dumping a
+traceback.
+
+If the network is genuinely blocked, use the offline path —
+`DOCTOR=1 ./scripts/run-all-agentic.sh` builds every analysis without an LLM.
+
 ## Doctype inference & flat SMB sheets
 
 `map` and `import` **infer the doctype** when `--doctype` is omitted

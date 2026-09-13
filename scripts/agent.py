@@ -320,6 +320,125 @@ def _deepseek_llm(model: str, api_base: str):
     )
 
 
+def llm_preflight(api_base: str, api_key: str, *, timeout: int = 10,
+                  resolve=None, open_url=None) -> tuple[bool, str]:
+    """Probe the LLM endpoint so a network problem is reported clearly.
+
+    The OpenAI SDK wraps *every* transport failure — DNS, TLS verification,
+    a dead proxy, connection refused — in a bare `APIConnectionError` with no
+    hint about which. This resolves the host, does a real request, and reports
+    the HTTP status: 401/403 means the endpoint is reachable, so the problem is
+    the key rather than the network.
+
+    `resolve`/`open_url` are injection seams so this can be unit-tested offline.
+    """
+    import socket
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlparse
+
+    resolve = resolve or socket.getaddrinfo
+    open_url = open_url or urllib.request.urlopen
+
+    url = api_base if "://" in api_base else f"https://{api_base}"
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    proxies = {k: v for k, v in os.environ.items()
+               if k.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")}
+
+    try:
+        infos = resolve(host, port, proto=socket.IPPROTO_TCP)
+        ips = sorted({i[4][0] for i in infos})
+    except Exception as e:  # noqa: BLE001 — DNS failure is the whole point
+        return False, (f"DNS lookup failed for {host}: {type(e).__name__}: {e}\n"
+                       f"  proxies in env: {proxies or 'none'}")
+
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+        with open_url(req, timeout=timeout) as resp:
+            return True, f"{url} reachable (HTTP {resp.status})"
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return True, (f"{url} reachable (HTTP {e.code}) — network is fine, "
+                          "check the API key")
+        return True, f"{url} reachable (HTTP {e.code}) — check --api-base"
+    except Exception as e:  # noqa: BLE001
+        return False, (f"cannot reach {url}: {type(e).__name__}: {e}\n"
+                       f"  resolved {host} -> {', '.join(ips)}\n"
+                       f"  proxies in env: {proxies or 'none'}")
+
+
+def describe_llm_error(exc: BaseException, api_base: str, model: str = "",
+                       provider: str = "") -> str:
+    """Turn any LLM failure into an actionable help block.
+
+    Classifies by HTTP status first, then by class name, because the OpenAI SDK
+    raises the *same* `APIConnectionError` for DNS failure, TLS verification
+    errors, a dead proxy and a refused connection. Always prints the endpoint and
+    model actually in use, then concrete next steps.
+    """
+    name = type(exc).__name__
+    status = getattr(exc, "status_code", None)
+    raw = " ".join(str(exc).split())[:300]
+    low = f"{name} {raw}".lower()
+    curl = "curl -sS -m 5 -o /dev/null -w '%{http_code}\\n' " + api_base + "/"
+
+    if status == 401 or "authenticationerror" in low:
+        cause = "The API key is missing, wrong, or revoked (HTTP 401)."
+        steps = ["export DEEPSEEK_API_KEY=... then re-run",
+                 "Or use --provider openai with OPENAI_API_KEY."]
+    elif status == 403 or "permissiondenied" in low:
+        cause = "The key is valid but not allowed to use this model (HTTP 403)."
+        steps = ["Check the key's project/scope, or change --model."]
+    elif status == 404 or "notfounderror" in low:
+        cause = "Endpoint or model not found (HTTP 404)."
+        steps = [f"Model in use: {model or '(provider default)'} — check the exact id.",
+                 "For DeepSeek use: --api-base https://api.deepseek.com"]
+    elif status == 429 or "ratelimit" in low:
+        cause = "Rate limited or out of quota (HTTP 429)."
+        steps = ["Retry shortly; lower --max-rounds; check the account balance."]
+    elif status == 400 or "badrequesterror" in low:
+        cause = ("The request was rejected (HTTP 400) — usually context length, "
+                 "or a tool schema the model refuses.")
+        steps = ["Try one smaller sheet, or a model with a larger context window."]
+    elif isinstance(status, int) and 500 <= status < 600:
+        cause = f"The provider failed server-side (HTTP {status})."
+        steps = ["Retry; if it persists, try --provider openai."]
+    elif any(k in low for k in ("connection", "connect", "timeout", "ssl",
+                                "proxy", "unreachable", "getaddrinfo")):
+        cause = ("Network/transport failure — DNS, TLS verification, a dead proxy "
+                 "or a firewall. The SDK reports all of these identically.")
+        steps = ["env | grep -iE 'proxy'    # a stale HTTPS_PROXY is the usual cause",
+                 curl,
+                 "401 from curl = network works (so the key is the problem);",
+                 "no response at all = blocked by DNS/VPN/firewall.",
+                 "Or pass --api-base <url>, or --provider openai."]
+    else:
+        cause = "Unexpected LLM failure."
+        steps = ["Re-run with AGENT_DEBUG=1 to see the full traceback."]
+
+    out = [f"LLM call failed — {name}: {raw}", "",
+           f"  endpoint : {api_base}",
+           f"  model    : {model or '(provider default)'}"]
+    if provider:
+        out.append(f"  provider : {provider}")
+    out += ["", f"  {cause}", "", "  Next steps:"]
+    out += [f"    {s}" for s in steps]
+    out += ["", "  No LLM needed (builds every analysis offline):",
+            "    DOCTOR=1 scripts/run-all-agentic.sh"]
+    return "\n".join(out)
+
+
+def _is_llm_error(exc: BaseException) -> bool:
+    """True for OpenAI/httpx API failures, as opposed to a bug in our own code."""
+    if type(exc).__module__.split(".")[0] in ("openai", "httpx", "httpcore"):
+        return True
+    name = type(exc).__name__.lower()
+    return any(k in name for k in ("apierror", "connection", "timeout", "ratelimit",
+                                   "authentication", "permissiondenied", "notfound"))
+
+
 def get_llm(provider: str, model: str, api_base: str = ""):
     from llama_index.llms.openai import OpenAI
 
@@ -443,6 +562,20 @@ async def run_agent(args) -> int:
 
     llm = get_llm(args.provider, args.model, args.api_base)
 
+    # fail fast with a useful message instead of a transport traceback mid-loop
+    if args.provider != "openai":
+        base = args.api_base or "https://api.deepseek.com"
+        key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+        ok, detail = llm_preflight(base, key)
+        if not ok:
+            # the probe knows *why*; the shared help block knows the next steps
+            print(f"ERROR: LLM endpoint unreachable — {detail}", file=sys.stderr)
+            print(describe_llm_error(ConnectionError(detail), base,
+                                     args.model or "", args.provider),
+                  file=sys.stderr)
+            return 2
+        print(f"LLM preflight: {detail}")
+
     # ensure we have an analysis to work from
     if args.analysis:
         a = json.loads(Path(args.analysis).read_text(encoding="utf-8"))
@@ -541,7 +674,17 @@ async def run_agent(args) -> int:
         log_event(event="round_start", round=round_no, errors_before=len(errs),
                   conflicts_total=len(a["conflicts"]))
         _TRANSCRIPT_CTX.update({"round": round_no, "log_event": log_event})
-        final_response = await _run_agent_round(workflow, user_msg)
+        try:
+            final_response = await _run_agent_round(workflow, user_msg)
+        except Exception as e:  # noqa: BLE001 — classify, don't dump a traceback
+            if not _is_llm_error(e):
+                raise
+            base = args.api_base or "https://api.deepseek.com"
+            print("\n" + describe_llm_error(e, base, args.model or "", args.provider),
+                  file=sys.stderr)
+            log_event(event="llm_error", round=round_no, error=f"{type(e).__name__}: {e}")
+            fh.close()
+            return 2
 
         # programmatic verification: re-read the newest analysis artifact
         fresh = latest_analysis(doctype)
@@ -619,7 +762,26 @@ def main() -> int:
 
     global CLIENT
     CLIENT = ERPNextClient(args.base, username=args.user, password=args.password)
-    return asyncio.run(run_agent(args))
+
+    base = args.api_base or "https://api.deepseek.com"
+    try:
+        return asyncio.run(run_agent(args))
+    except KeyboardInterrupt:
+        print("\nInterrupted. Nothing was left half-imported: every write is "
+              "idempotent and journaled — inspect with "
+              f"'python3 erpgen.py status {args.run or '<run-id>'}'.",
+              file=sys.stderr)
+        return 130
+    except Exception as e:  # noqa: BLE001 — last-resort friendly failure
+        if _is_llm_error(e):
+            print("\n" + describe_llm_error(e, base, args.model or "", args.provider),
+                  file=sys.stderr)
+            return 2
+        print(f"\nERROR: agent failed — {type(e).__name__}: {e}", file=sys.stderr)
+        if os.environ.get("AGENT_DEBUG"):
+            raise
+        print("  Re-run with AGENT_DEBUG=1 for the full traceback.", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
