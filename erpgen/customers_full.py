@@ -592,14 +592,17 @@ def _link_value_conflicts(
         if engine is None:
             continue
         fmeta = engine.parent.get(field)
-        if not fmeta or not fmeta.is_link or not fmeta.options:
+        # links_to_doctype, NOT is_link+options — a Dynamic Link's `options` is a
+        # sibling FIELD name, not a doctype (same trap as analysis.py)
+        linked = fmeta.links_to_doctype if fmeta else None
+        if not linked:
             continue
         values = distinct_values(source, header,
                                  require_column=spec["name_column"])
-        missing = missing_link_values(client, values, fmeta.options, existing_cache)
+        missing = missing_link_values(client, values, linked, existing_cache)
         if not missing:
             continue
-        g = grouped.setdefault((header, fmeta.options), {"targets": [], "missing": []})
+        g = grouped.setdefault((header, linked), {"targets": [], "missing": []})
         qual = f"{kind}.{field}"
         if qual not in g["targets"]:
             g["targets"].append(qual)

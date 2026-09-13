@@ -138,6 +138,28 @@ If the network is genuinely blocked, use the offline path —
 
 ### Other failure modes
 
+**The agent stalls.** If the *same* error conflicts survive round after round
+unchanged, more rounds cannot help — so the loop stops early (exit code 4) and
+names them:
+
+```
+=== AGENT STALLED — the same 1 error conflict(s) survived 2 round(s) unchanged ===
+    [error] link_value_conflict: Link Name (Links) -> link_doctype
+  The agent is not making progress, so more rounds will not help.
+```
+
+Tune with `--max-stall-rounds` (default 2 consecutive unchanged rounds; `0`
+disables it). The check keys on each conflict's **identity**, not the count, so a
+flat count made of *different* conflicts still counts as progress.
+
+**A `link_value_conflict` whose `doctype` looks like a field name.** That means a
+**Dynamic Link** was validated as if it named a fixed doctype. `link_name` in a
+`links` child table is a Dynamic Link: its `options` is a sibling *field*
+(`link_doctype`), not a doctype, so its values can only be resolved per row at
+import time. Such fields are skipped, and a linked doctype that cannot be queried
+is treated as *unverifiable* rather than as "everything is missing" — the failure
+mode where the agent is told to create records in a doctype that does not exist.
+
 **The agent exhausted its step budget** (`WorkflowRuntimeError: Max iterations of
 20 reached!`). llama-index caps the agent's internal tool calls per round, and a
 sheet with many conflicts can use them up while still making progress. Raise the
@@ -419,6 +441,72 @@ Tools the agent can call: `latest_analysis`, `run_map`, `run_import`,
 
 Note: `create_field`/`create_record` were extracted into `erpgen/tools.py`
 (reused by the `createfield` CLI command) so the agent calls real shared code.
+
+### Live progress on stdout
+
+The agent streams what it is doing as it happens, so you can follow a run
+instead of watching a blank screen (a round can take minutes and make dozens of
+remote calls):
+
+```
+=== Round 1/20 — 4 error conflict(s), 11 total ===
+    [error] link_value_conflict: Group
+  · llm #1 → 40 msg(s)
+  · llm #1 ← 2,431ms · 12,345 tok · wants describe_doctype
+      “Group values don't match any Item Group; let me check what exists.”
+    ToolUse:describe_doctype doctype=Item Group
+      ToolResult:describe_doctype ✓ {"doctype": "Item Group", "id_field": ...
+  · llm #2 → 44 msg(s)
+  · llm #2 ← 25,497ms · 46,269 tok · wants run_import
+      “Every row failed with the same error — that looks like a schema problem.”
+    ToolUse:run_import source=samples/customers.csv, apply=True
+      ToolResult:run_import ✓ REST upsert: created 0, failed 29
+--- Round 1: 0 error(s) remain
+```
+
+Every tool invocation carries a `ToolUse:<name>` marker and its outcome a
+matching `ToolResult:<name>`, so the run is greppable without parsing prose:
+
+```bash
+python3 scripts/agent.py --source samples/items.csv | grep ToolUse:
+python3 scripts/agent.py --source samples/items.csv | tee run.log | grep 'ToolResult:.*✗'
+```
+
+Every line is also written to the transcript, so nothing is lost. `--quiet`
+suppresses the per-call stream (round headers still print); the transcript is
+unaffected. `_live()` output is length-capped and one-line per event, so it stays
+readable in a terminal and usable from CI logs.
+
+### Transcript — every remote LLM call is logged
+
+Each run writes `logs/agent-<doctype>-<ts>.jsonl`, one JSON object per line. Every
+call to the remote model service is recorded, not just the rounds:
+
+| event | when | fields |
+|---|---|---|
+| `llm_request` | before each remote call | `round`, `call_no`, `method`, `model`, `messages` |
+| `llm_response` | after it returns | `duration_ms`, `prompt_tokens`, `completion_tokens`, `total_tokens`, `streamed` |
+| `llm_failure` | on any error | `duration_ms`, `error` |
+| `tool_call` / `tool_result` | each agent tool invocation | `name`, `kwargs`, `result_tail` |
+| `round_start` / `round_end` | each convergence round | `errors_before`, `errors_after`, `stalled` |
+| `run_start` / `run_end` | the whole run | `resolved`, `llm_calls` |
+| `stalled` / `llm_error` / `iteration_exhausted` | bail-outs | reason |
+
+```bash
+grep -c llm_request logs/agent-suppliers_full-*.jsonl   # how many remote calls
+grep llm_failure  logs/agent-suppliers_full-*.jsonl     # any failed calls
+```
+
+The run prints the total at the end (`N remote LLM call(s) logged`). **Prompt
+content is never logged** — only message counts and token usage — so migration
+data does not leak into the transcript.
+
+Why instrument the LLM rather than use llama-index callbacks: llama-index does
+not emit `CBEventType.LLM` events for `OpenAILike` (the `@llm_chat_callback()`
+decorator is only applied in `custom.py` and `structured_llm.py`), so a callback
+handler would silently record nothing. Instead the two entry points
+`FunctionAgent` funnels through — `achat_with_tools` → `achat` and
+`astream_chat_with_tools` → `astream_chat` — are wrapped.
 
 ## Creating fields programmatically
 

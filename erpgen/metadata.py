@@ -33,6 +33,27 @@ class FieldMeta:
         return self.fieldtype in ("Link", "Dynamic Link")
 
     @property
+    def is_dynamic_link(self) -> bool:
+        """A Dynamic Link's target doctype is a *sibling field's* value.
+
+        `Contact.links.link_name` has `options == "link_doctype"` — a fieldname,
+        not a doctype — so its values cannot be validated against the site.
+        """
+        return self.fieldtype == "Dynamic Link"
+
+    @property
+    def links_to_doctype(self) -> Optional[str]:
+        """The doctype this field links to, or None when unknowable statically.
+
+        Always prefer this over `is_link` + `options`: for a Dynamic Link,
+        `options` is a field reference, and querying it as a doctype silently
+        "loses" every row's value and invents an unresolvable conflict.
+        """
+        if self.fieldtype != "Link":
+            return None
+        return self.options or None
+
+    @property
     def is_fetch_field(self) -> bool:
         return bool(self.fetch_from)
 

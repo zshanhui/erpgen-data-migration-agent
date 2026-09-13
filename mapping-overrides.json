@@ -22,7 +22,6 @@
       "Vendor Code": "vendor_code",
       "Internal Ref": "internal_ref",
       "ID": "customer_name",
-      "UoM": "uom",
       "Description": "description"
     },
     "defaults": {},

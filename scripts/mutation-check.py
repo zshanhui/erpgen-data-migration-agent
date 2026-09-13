@@ -22,7 +22,10 @@ CLI = "erpgen.py"
 CF = "erpgen/customers_full.py"
 TLS = "erpgen/tools.py"
 OVR = "erpgen/overrides.py"
+ANL = "erpgen/analysis.py"
 AGT = "scripts/agent.py"
+ANA = "erpgen/analysis.py"
+CFF = "erpgen/conflicts.py"
 
 MUTATIONS = [
     ("bug: effect seq restarts per command", [
@@ -161,8 +164,8 @@ MUTATIONS = [
     ], "tests/test_party_sheets.py::test_contract_link_columns_are_validated"),
 
     ("bug: one column reports per target instead of per linked doctype", [
-        (CF, '        g = grouped.setdefault((header, fmeta.options), {"targets": [], "missing": []})',
-             '        g = grouped.setdefault((header, f"{fmeta.options}|{kind}.{field}"), {"targets": [], "missing": []})  # MUTANT'),
+        (CF, '        g = grouped.setdefault((header, linked), {"targets": [], "missing": []})',
+             '        g = grouped.setdefault((header, f"{linked}|{kind}.{field}"), {"targets": [], "missing": []})  # MUTANT'),
     ], "tests/test_party_sheets.py::test_mirrored_and_address_targets_share_one_conflict"),
 
     ("bug: child-table required fields hidden from the agent", [
@@ -175,6 +178,22 @@ MUTATIONS = [
              '                                 require_column=spec["name_column"])',
              '        values = distinct_values(source, header)  # MUTANT'),
     ], "tests/test_party_sheets.py::test_values_from_rows_that_cannot_import_are_ignored"),
+
+    # ---- analysis retention ----
+    ("bug: retention keeps the OLDEST analyses and deletes the newest", [
+        (ANL, 'sorted(entries, key=lambda e: e[0], reverse=True)[keep:]',
+              'sorted(entries, key=lambda e: e[0], reverse=False)[keep:]  # MUTANT'),
+    ], "tests/test_analysis_retention.py::test_keeps_the_newest_not_the_oldest"),
+
+    ("bug: retention caps globally instead of per doctype", [
+        (ANL, '            by_doctype.setdefault(m.group("slug"), []).append((m.group("stamp"), path))',
+              '            by_doctype.setdefault("_all", []).append((m.group("stamp"), path))  # MUTANT'),
+    ], "tests/test_analysis_retention.py::test_cap_is_per_doctype_not_global"),
+
+    ("bug: retention off-by-one (drops below the cap)", [
+        (ANL, 'sorted(entries, key=lambda e: e[0], reverse=True)[keep:]',
+              'sorted(entries, key=lambda e: e[0], reverse=True)[keep - 1:]  # MUTANT'),
+    ], "tests/test_analysis_retention.py::test_save_analysis_prunes_automatically"),
 
     # ---- the decomposed run loop ----
     ("bug: every conflict treated as blocking (not just error severity)", [
@@ -257,6 +276,150 @@ MUTATIONS = [
         (OVR, '            f"  at line {e.lineno}, column {e.colno}\\n"',
               '            ""  # MUTANT'),
     ], "tests/test_overrides.py::test_load_overrides_error_names_the_line_and_how_to_recover"),
+
+    # ---- Dynamic Link used as a doctype name (the contacts.csv deadlock) ----
+    # NOTE: this targets the "never queries it" test, not the "no conflict" test.
+    # With the unverifiable-lookup fix also in place, a bogus doctype name no
+    # longer *produces* a conflict (the query fails => skipped), so only the
+    # "did we ask a nonsense question?" assertion still detects the regression.
+    ("bug: Dynamic Link options used as a doctype name again", [
+        (ANA, '        linked = t.meta.links_to_doctype',
+              '        linked = t.meta.options if t.meta.is_link else None  # MUTANT'),
+    ], "tests/test_dynamic_links.py::test_the_dynamic_link_is_never_queried_as_a_doctype"),
+
+    ("bug: unqueryable linked doctype reported as all-missing", [
+        (CFF, '    except UnverifiableLink:\n        return None',
+              '    except UnverifiableLink:\n        return list(values)  # MUTANT'),
+    ], "tests/test_dynamic_links.py::test_unqueryable_linked_doctype_is_unverifiable_not_all_missing"),
+
+    ("bug: a failed lookup silently degrades to 'nothing exists'", [
+        (CFF, "    except Exception as e:\n"
+              "        if cache is not None:\n"
+              "            cache[doctype] = None      # remember the failure, don't re-query\n"
+              '        raise UnverifiableLink(f"{doctype}: {e}") from e',
+              '    except Exception:\n'
+              '        names = set()  # MUTANT'),
+    ], "tests/test_dynamic_links.py::test_existing_values_raises_when_the_doctype_is_unknown"),
+
+    # ---- agent escape hatch ----
+    ("bug: stall counter never advances (agent burns every round)", [
+        (AGT, '    if prev_fingerprint is not None and fingerprint and fingerprint == prev_fingerprint:\n'
+              '        return stalled + 1',
+              '    if False:  # MUTANT\n        return stalled + 1'),
+    ], "tests/test_agent_preflight.py::test_stall_counter_starts_at_zero_then_counts_identical_rounds"),
+
+    # ---- live progress stream (so the user need not guess) ----
+    ("bug: --quiet does not silence the live stream", [
+        (AGT, 'def _live(message: str) -> None:\n'
+              '    if _LIVE["enabled"]:',
+              'def _live(message: str) -> None:\n'
+              '    if True:  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_live_is_silent_when_disabled"),
+
+    ("bug: LLM calls are not announced live", [
+        (AGT, '            _log_llm_event(event="llm_response", method="achat",\n'
+              '                           duration_ms=_elapsed_ms(started),\n'
+              '                           **llm_usage(response))\n'
+              '            _live_llm_response(response, started)',
+              '            _log_llm_event(event="llm_response", method="achat",\n'
+              '                           duration_ms=_elapsed_ms(started),\n'
+              '                           **llm_usage(response))  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_llm_call_is_announced_live"),
+
+    ("bug: tool calls lose their ToolUse marker", [
+        (AGT, '        _live(f"{_LIVE[\'indent\']}  ToolUse:{name} {_brief_args(args, kwargs)}")',
+              '        pass  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_tool_calls_carry_a_ToolUse_marker"),
+
+    ("bug: a raising tool is not shown live", [
+        (AGT, '            _live(f"{_LIVE[\'indent\']}    ToolResult:{name} ✗ "\n'
+              '                  f"{type(e).__name__}: {_brief(e, 90)}")',
+              '            pass  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_failing_tool_calls_carry_a_ToolResult_marker"),
+
+    ("bug: the model's thinking is hidden", [
+        (AGT, '    thought = _thinking(response)\n'
+              '    if thought:\n'
+              '        _live(f"{_LIVE[\'indent\']}    “{thought}”")',
+              '    pass  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_live_shows_what_the_model_wants_to_do"),
+
+    ("bug: live output loses the requested tool names", [
+        (AGT, '    calls = getattr(response, "tool_calls", None)\n'
+              '    if not calls:\n'
+              '        calls = getattr(getattr(response, "message", None), "tool_calls", None)',
+              '    calls = None  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_live_shows_what_the_model_wants_to_do"),
+
+    # ---- import failure digest (why the agent flailed on customers.csv) ----
+    ("bug: failure reasons truncated away from the agent", [
+        (AGT, '    return f"import exit {code}:\\n{out[-2000:]}{warning_digest(out)}"',
+              '    return f"import exit {code}:\\n{out[-2000:]}"  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_run_import_result_includes_the_digest"),
+
+    ("bug: warnings grouped by row instead of by cause", [
+        (AGT, '        key = " ".join((body if sep else msg).split())[:220]',
+              '        key = msg[:220]  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_warning_digest_groups_identical_causes"),
+
+    ("bug: a shared root cause no longer flagged", [
+        (AGT, '    if len(ranked) == 1 and total > 1:',
+              '    if False:  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_warning_digest_flags_a_single_shared_cause"),
+
+    # ---- remote LLM call logging ----
+    ("bug: LLM requests are not logged", [
+        (AGT, '            _log_llm_event(event="llm_request", method="achat",\n'
+              '                           model=str(getattr(self, "model", "") or ""),\n'
+              '                           messages=len(messages))',
+              '            pass  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_every_llm_call_is_logged"),
+
+    ("bug: failed LLM calls are not logged", [
+        (AGT, '                _log_llm_event(event="llm_failure", method="achat",\n'
+              '                               duration_ms=_elapsed_ms(started),\n'
+              '                               error=f"{type(e).__name__}: {e}")',
+              '                pass  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_llm_failures_are_logged_and_still_raised"),
+
+    ("bug: streaming failure at call time is not logged", [
+        (AGT, '                # fails before a generator exists — still a remote call attempt\n'
+              '                _log_llm_event(event="llm_failure", method="astream_chat",\n'
+              '                               duration_ms=_elapsed_ms(started),\n'
+              '                               error=f"{type(e).__name__}: {e}")',
+              '                pass  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_streaming_failure_is_logged"),
+
+    ("bug: prompt content leaks into the transcript", [
+        (AGT, '            _log_llm_event(event="llm_request", method="achat",\n'
+              '                           model=str(getattr(self, "model", "") or ""),\n'
+              '                           messages=len(messages))',
+              '            _log_llm_event(event="llm_request", method="achat",\n'
+              '                           model=str(getattr(self, "model", "") or ""),\n'
+              '                           messages=str(messages))  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_prompt_content_is_not_logged"),
+
+    ("bug: token usage no longer recorded", [
+        (AGT, '            _log_llm_event(event="llm_response", method="achat",\n'
+              '                           duration_ms=_elapsed_ms(started),\n'
+              '                           **llm_usage(response))',
+              '            _log_llm_event(event="llm_response", method="achat",\n'
+              '                           duration_ms=_elapsed_ms(started))  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_llm_response_records_duration_and_tokens"),
+
+    ("bug: escape hatch never fires (loop grinds to --max-rounds)", [
+        (AGT, '        if args.max_stall_rounds and stalled >= args.max_stall_rounds:',
+              '        if False:  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_escape_hatch_fires_when_conflicts_never_change"),
+
+    ("bug: stall counter never resets (false stall after real progress)", [
+        (AGT, '    if prev_fingerprint is not None and fingerprint and fingerprint == prev_fingerprint:\n'
+              '        return stalled + 1\n'
+              '    return 0',
+              '    if prev_fingerprint is not None and fingerprint and fingerprint == prev_fingerprint:\n'
+              '        return stalled + 1\n'
+              '    return stalled  # MUTANT'),
+    ], "tests/test_agent_preflight.py::test_stall_counter_resets_when_conflicts_are_resolved"),
 ]
 
 

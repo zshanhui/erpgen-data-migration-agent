@@ -58,29 +58,49 @@ def fieldtype_for(profile) -> str:
     }.get(profile.inferred_type, "Data")
 
 
+class UnverifiableLink(Exception):
+    """The linked doctype could not be queried, so values cannot be judged."""
+
+
 def existing_values(client: ERPNextClient, doctype: str,
                     cache: Optional[dict] = None) -> set[str]:
     """Record names of `doctype`, memoised in `cache` (one query per doctype).
 
-    A lookup failure degrades to "nothing exists", which is the safe direction:
-    we then report the values as missing rather than silently accepting them.
+    Raises `UnverifiableLink` when the lookup itself fails. "I could not check"
+    is NOT "nothing exists": degrading to an empty set makes *every* value look
+    missing, producing a confident but unsatisfiable conflict — an agent then
+    tries to create records in a doctype that does not exist.
     """
     if cache is not None and doctype in cache:
-        return cache[doctype]
+        cached = cache[doctype]
+        if cached is None:
+            raise UnverifiableLink(doctype)
+        return cached
     try:
         names = {str(r.get("name"))
                  for r in client.list(doctype, fields=["name"], limit=0)}
-    except Exception:
-        names = set()
+    except Exception as e:
+        if cache is not None:
+            cache[doctype] = None      # remember the failure, don't re-query
+        raise UnverifiableLink(f"{doctype}: {e}") from e
     if cache is not None:
         cache[doctype] = names
     return names
 
 
 def missing_link_values(client: ERPNextClient, values: list[str],
-                        linked_doctype: str, cache: Optional[dict] = None) -> list[str]:
-    """Which of `values` are absent from `linked_doctype`."""
-    have = existing_values(client, linked_doctype, cache)
+                        linked_doctype: str,
+                        cache: Optional[dict] = None) -> Optional[list[str]]:
+    """Which of `values` are absent from `linked_doctype`.
+
+    Returns `None` when the linked doctype could not be queried at all — callers
+    must treat that as "unverifiable" and stay silent, never as "all missing".
+    A genuinely bad link value still fails loudly at import time.
+    """
+    try:
+        have = existing_values(client, linked_doctype, cache)
+    except UnverifiableLink:
+        return None
     return [v for v in values if v not in have]
 
 

@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -150,6 +151,44 @@ def t_run_map(source: str, doctype: str = "", defaults: str = "{}") -> str:
     return f"map exit {code}. Fresh analysis:\n{_j(fresh)}"
 
 
+def warning_digest(out: str, cap: int = 5) -> str:
+    """Group the per-row `WARNING:` lines so the *reason* survives truncation.
+
+    Only the tail of an import is returned to the model, but with many failing
+    rows the per-row warnings — which carry the actual error — sit at the front
+    and get cut off. The agent then knows "29 failed" without knowing why, and
+    burns rounds guessing at it.
+    """
+    counts: dict[str, int] = {}
+    first_seen: dict[str, str] = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("WARNING:"):
+            continue
+        msg = " ".join(line[len("WARNING:"):].split())
+        # "row 2: Customer 'Acme' failed: <reason>" — group on <reason>, not the
+        # row-specific prefix, or every row looks like a distinct problem
+        head, sep, body = msg.partition(" failed: ")
+        key = " ".join((body if sep else msg).split())[:220]
+        counts[key] = counts.get(key, 0) + 1
+        first_seen.setdefault(key, head)
+    if not counts:
+        return ""
+    total = sum(counts.values())
+    lines = [f"\n{total} row warning(s), grouped by cause (most common first):"]
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    for msg, n in ranked[:cap]:
+        where = f"   [first: {first_seen[msg]}]" if first_seen.get(msg) else ""
+        lines.append(f"  x{n}  {msg}{where}")
+    if len(ranked) > cap:
+        lines.append(f"  ... +{len(ranked) - cap} more distinct warning(s)")
+    if len(ranked) == 1 and total > 1:
+        lines.append("  -> every failing row shares ONE reason: suspect a "
+                     "schema/environment problem (e.g. a custom field whose "
+                     "database column is missing), not bad source data.")
+    return "\n".join(lines)
+
+
 def t_run_import(source: str, doctype: str = "", apply: bool = False,
                  defaults: str = "{}") -> str:
     cmd = ["import", source]
@@ -160,7 +199,7 @@ def t_run_import(source: str, doctype: str = "", apply: bool = False,
     if apply:
         cmd.append("--apply")
     code, out = _erpgen(cmd, timeout=900)
-    return f"import exit {code}:\n{out[-2000:]}"
+    return f"import exit {code}:\n{out[-2000:]}{warning_digest(out)}"
 
 
 def t_create_field(doctype: str, label: str, fieldtype: str = "Data") -> str:
@@ -303,6 +342,204 @@ Rules:
 
 
 # ---------------------------------------------------------------- llm
+# Live progress, streamed to stdout. A single round can take minutes and make
+# dozens of remote calls; without this the CLI user watches a blank screen and
+# has to guess whether it is working. `--quiet` silences it.
+_LIVE: dict = {"enabled": True, "indent": "  "}
+
+
+def _live(message: str) -> None:
+    if _LIVE["enabled"]:
+        print(message, flush=True)
+
+
+def _brief(value: Any, limit: int = 100) -> str:
+    """One-line, length-capped rendering for live output."""
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _brief_args(args, kwargs) -> str:
+    if kwargs:
+        parts = [f"{k}={_brief(v, 45)}" for k, v in kwargs.items()]
+    else:
+        parts = [_brief(a, 45) for a in args]
+    return ", ".join(parts)
+
+
+def _thinking(response) -> str:
+    """The model's own words for this step — its visible reasoning."""
+    msg = getattr(response, "message", None)
+    return _brief(getattr(msg, "content", "") or "", 170)
+
+
+def _requested_tools(response) -> list:
+    """Names of the tools the model asked for in this response.
+
+    llama-index exposes these on the response, which delegates to the message;
+    fall back to the message directly for response shapes that only set it there.
+    """
+    calls = getattr(response, "tool_calls", None)
+    if not calls:
+        calls = getattr(getattr(response, "message", None), "tool_calls", None)
+    names: list = []
+    for call in (calls or []):
+        name = getattr(call, "tool_name", None)
+        if not name:
+            tool = getattr(call, "tool", None)
+            name = (getattr(getattr(tool, "metadata", None), "name", None)
+                    or getattr(tool, "name", None))
+        if name:
+            names.append(str(name))
+    return names
+
+
+def _live_llm_request(messages) -> None:
+    if _LIVE["enabled"]:
+        _live(f"{_LIVE['indent']}· llm #{_TRANSCRIPT_CTX.get('llm_calls', 0)} → "
+              f"{len(messages)} msg(s)")
+
+
+def _live_llm_response(response, started: float) -> None:
+    """Show what one remote call cost, and what it decided to do next."""
+    if not _LIVE["enabled"]:
+        return
+    bits = [f"{_elapsed_ms(started)}ms"]
+    usage = llm_usage(response)
+    if usage.get("total_tokens") is not None:
+        bits.append(f"{usage['total_tokens']:,} tok")
+    wanted = _requested_tools(response)
+    if wanted:
+        bits.append("wants " + ", ".join(wanted))
+    _live(f"{_LIVE['indent']}· llm #{_TRANSCRIPT_CTX.get('llm_calls', 0)} ← "
+          + " · ".join(bits))
+    thought = _thinking(response)
+    if thought:
+        _live(f"{_LIVE['indent']}    “{thought}”")
+
+
+def _log_llm_event(event: str, **fields) -> None:
+    """Record an LLM transport event on the active transcript (if any).
+
+    Also counts requests, so the run can report how many remote calls it cost.
+    """
+    if event == "llm_request":
+        _TRANSCRIPT_CTX["llm_calls"] = _TRANSCRIPT_CTX.get("llm_calls", 0) + 1
+        fields.setdefault("call_no", _TRANSCRIPT_CTX["llm_calls"])
+    log = _TRANSCRIPT_CTX.get("log_event")
+    if log:
+        log(event=event, round=_TRANSCRIPT_CTX.get("round"), **fields)
+
+
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
+def llm_usage(response) -> dict:
+    """Token usage from a ChatResponse, when the provider reports it.
+
+    Deliberately tolerant: `raw` may be an OpenAI object, a plain dict, or
+    absent entirely, and a missing usage block must never break a run.
+    """
+    raw = getattr(response, "raw", None)
+    usage = getattr(raw, "usage", None)
+    if usage is None and isinstance(raw, dict):
+        usage = raw.get("usage")
+    if usage is None:
+        return {}
+
+    def _get(key):
+        if isinstance(usage, dict):
+            return usage.get(key)
+        return getattr(usage, key, None)
+
+    out = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = _get(key)
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def instrumented_llm(base_cls):
+    """Wrap an LLM class so every remote call lands in the run transcript.
+
+    llama-index does NOT emit callback events for `OpenAILike` (the
+    `@llm_chat_callback()` decorator is only applied in `custom.py` and
+    `structured_llm.py`), so this instruments the two entry points
+    `FunctionAgent` actually funnels through: `achat_with_tools` -> `achat`,
+    and `astream_chat_with_tools` -> `astream_chat`.
+
+    Emits `llm_request` / `llm_response` / `llm_failure` with the round, elapsed
+    time and token usage. Message *content* is never logged — only counts.
+    """
+
+    class _Instrumented(base_cls):
+        async def achat(self, *args, **kwargs):
+            messages = kwargs.get("messages") or (args[0] if args else None) or []
+            started = time.monotonic()
+            _log_llm_event(event="llm_request", method="achat",
+                           model=str(getattr(self, "model", "") or ""),
+                           messages=len(messages))
+            _live_llm_request(messages)
+            try:
+                response = await super().achat(*args, **kwargs)
+            except BaseException as e:
+                _log_llm_event(event="llm_failure", method="achat",
+                               duration_ms=_elapsed_ms(started),
+                               error=f"{type(e).__name__}: {e}")
+                _live(f"{_LIVE['indent']}· llm failed after "
+                      f"{_elapsed_ms(started)}ms: {type(e).__name__}")
+                raise
+            _log_llm_event(event="llm_response", method="achat",
+                           duration_ms=_elapsed_ms(started),
+                           **llm_usage(response))
+            _live_llm_response(response, started)
+            return response
+
+        async def astream_chat(self, *args, **kwargs):
+            messages = kwargs.get("messages") or (args[0] if args else None) or []
+            started = time.monotonic()
+            _log_llm_event(event="llm_request", method="astream_chat",
+                           model=str(getattr(self, "model", "") or ""),
+                           messages=len(messages))
+            _live_llm_request(messages)
+            try:
+                inner = await super().astream_chat(*args, **kwargs)
+            except BaseException as e:
+                # fails before a generator exists — still a remote call attempt
+                _log_llm_event(event="llm_failure", method="astream_chat",
+                               duration_ms=_elapsed_ms(started),
+                               error=f"{type(e).__name__}: {e}")
+                _live(f"{_LIVE['indent']}· llm failed after "
+                      f"{_elapsed_ms(started)}ms: {type(e).__name__}")
+                raise
+
+            async def _logged():
+                last = None
+                try:
+                    async for chunk in inner:
+                        last = chunk
+                        yield chunk
+                except BaseException as e:
+                    _log_llm_event(event="llm_failure", method="astream_chat",
+                                   duration_ms=_elapsed_ms(started),
+                                   error=f"{type(e).__name__}: {e}")
+                    _live(f"{_LIVE['indent']}· llm stream failed after "
+                          f"{_elapsed_ms(started)}ms: {type(e).__name__}")
+                    raise
+                # a streaming call is only complete once fully drained
+                _log_llm_event(event="llm_response", method="astream_chat",
+                               duration_ms=_elapsed_ms(started),
+                               streamed=True, **llm_usage(last))
+                _live_llm_response(last, started)
+
+            return _logged()
+
+    _Instrumented.__name__ = f"Instrumented{base_cls.__name__}"
+    return _Instrumented
+
+
 def _deepseek_llm(model: str, api_base: str):
     """OpenAI-compatible client for DeepSeek.
 
@@ -313,7 +550,7 @@ def _deepseek_llm(model: str, api_base: str):
     """
     from llama_index.llms.openai_like import OpenAILike
 
-    return OpenAILike(
+    return instrumented_llm(OpenAILike)(
         model=model or "deepseek-v4-flash",
         api_key=os.environ.get("DEEPSEEK_API_KEY"),
         api_base=api_base or "https://api.deepseek.com",
@@ -455,11 +692,16 @@ def _is_llm_error(exc: BaseException) -> bool:
                                    "authentication", "permissiondenied", "notfound"))
 
 
-def get_llm(provider: str, model: str, api_base: str = ""):
+def _openai_llm(model: str):
+    """OpenAI LLM, instrumented so its calls are logged like DeepSeek's."""
     from llama_index.llms.openai import OpenAI
 
+    return instrumented_llm(OpenAI)(model=model or "gpt-4o-mini")
+
+
+def get_llm(provider: str, model: str, api_base: str = ""):
     if provider == "openai":
-        return OpenAI(model=model or "gpt-4o-mini")
+        return _openai_llm(model)
     if provider == "deepseek":
         if not os.environ.get("DEEPSEEK_API_KEY"):
             raise SystemExit(
@@ -468,7 +710,7 @@ def get_llm(provider: str, model: str, api_base: str = ""):
             )
         return _deepseek_llm(model, api_base)
     if os.environ.get("OPENAI_API_KEY"):
-        return OpenAI(model=model or "gpt-4o-mini")
+        return _openai_llm(model)
     if os.environ.get("DEEPSEEK_API_KEY"):
         return _deepseek_llm(model, api_base)
     raise SystemExit(
@@ -490,14 +732,29 @@ def _wrap_tool(fn, name):
         ctx = _TRANSCRIPT_CTX
         log = ctx.get("log_event")
         rnd = ctx.get("round")
+        call_args = kwargs if kwargs else args
         if log:
             log(event="tool_call", round=rnd, name=name,
-                kwargs=_safe(kwargs if kwargs else args))
-        result = fn(*args, **kwargs)
+                kwargs=_safe(call_args))
+        # greppable marker: `grep ToolUse:` lists every tool the agent ran
+        _live(f"{_LIVE['indent']}  ToolUse:{name} {_brief_args(args, kwargs)}")
+        try:
+            result = fn(*args, **kwargs)
+        except BaseException as e:
+            # a raising tool must be visible immediately, not just in the log
+            if log:
+                log(event="tool_result", round=rnd, tool=name,
+                    args=_safe(call_args), result_tail=f"raised {type(e).__name__}: {e}")
+            _live(f"{_LIVE['indent']}    ToolResult:{name} ✗ "
+                  f"{type(e).__name__}: {_brief(e, 90)}")
+            raise
         if log:
             log(event="tool_result", round=rnd, tool=name,
-                args=_safe(kwargs if kwargs else args),
+                args=_safe(call_args),
                 result_tail=_text(result)[-600:])
+        text = _text(result)
+        first = next((ln for ln in text.splitlines() if ln.strip()), "")
+        _live(f"{_LIVE['indent']}    ToolResult:{name} ✓ {_brief(first, 100)}")
         return result
 
     return wrapped
@@ -669,6 +926,59 @@ def _error_conflicts(analysis: dict) -> list:
     return [c for c in analysis["conflicts"] if c["severity"] == "error"]
 
 
+def _stall_fingerprint(errs: list) -> frozenset:
+    """Identity of the outstanding error conflicts, for stall detection.
+
+    Keyed on each conflict's own identity rather than the count: a count can stay
+    flat while entirely different conflicts come and go, which is progress.
+    """
+    return frozenset(
+        (c.get("kind"), c.get("source"), c.get("target") or c.get("field"),
+         c.get("doctype"))
+        for c in errs
+    )
+
+
+def _advance_stall(fingerprint: frozenset, prev_fingerprint: Optional[frozenset],
+                   stalled: int) -> int:
+    """Consecutive rounds whose outstanding error conflicts are unchanged.
+
+    Resets to 0 the moment anything changes — a different conflict, or one fewer
+    — because that is progress even if the count merely stayed level.
+    """
+    if prev_fingerprint is not None and fingerprint and fingerprint == prev_fingerprint:
+        return stalled + 1
+    return 0
+
+
+def _describe_conflict(c: dict) -> str:
+    where = c.get("source") or c.get("field") or "?"
+    tail = f" -> {c['doctype']}" if c.get("doctype") else (
+        f" -> {c['target']}" if c.get("target") else "")
+    return f"{c.get('kind')}: {where}{tail}"
+
+
+def _report_stall(errs: list, rounds: int, transcript_path, args) -> None:
+    """Explain a stall, because 'still failing' alone gives the user nothing."""
+    print(f"\n=== AGENT STALLED — the same {len(errs)} error conflict(s) survived "
+          f"{rounds} round(s) unchanged ===", file=sys.stderr)
+    for c in errs:
+        print(f"    [error] {_describe_conflict(c)}", file=sys.stderr)
+    print("\n  The agent is not making progress, so more rounds will not help.\n"
+          "  Usual causes — a conflict the available tools cannot satisfy:\n"
+          "    * the conflict names a doctype that does not exist, or names a\n"
+          "      FIELD where a doctype is expected\n"
+          "    * the target field is read-only / computed and cannot be written\n"
+          "    * the value has to be created somewhere the agent cannot reach\n"
+          f"\n  Failing tool calls: {transcript_path}"
+          "\n\n  Next steps:"
+          "\n    --max-stall-rounds 0      disable this check and run to --max-rounds"
+          f"\n    --max-rounds {args.max_rounds * 2}        allow more rounds anyway"
+          "\n    or resolve it by hand (set-mapping / createfield / create-record)"
+          "\n    and re-run the same command — it resumes from the analysis.",
+          file=sys.stderr)
+
+
 def _open_journal(args, doctype: str, source: str, conflicts: list,
                   logs_dir: Path, log_event):
     """Join the unified run context when --run is given, else a per-run journal.
@@ -749,6 +1059,8 @@ async def _run_rounds(args, workflow, transcript: Transcript, analysis: dict,
     """
     outcome = RunOutcome()
     prev_error_count: Optional[int] = None
+    prev_fingerprint: Optional[frozenset] = None
+    stalled = 0
 
     for round_no in range(1, args.max_rounds + 1):
         errs = _error_conflicts(analysis)
@@ -776,12 +1088,20 @@ async def _run_rounds(args, workflow, transcript: Transcript, analysis: dict,
         if fresh is not None:
             analysis = fresh
         after_errs = _error_conflicts(analysis)
+
+        # stall detection: same conflicts, unchanged, round after round
+        fingerprint = _stall_fingerprint(after_errs)
+        stalled = _advance_stall(fingerprint, prev_fingerprint, stalled)
+        prev_fingerprint = fingerprint
+
         note = ("  [no decrease vs previous round]"
                 if prev_error_count is not None and len(after_errs) >= prev_error_count
                 else "")
+        if stalled:
+            note += f"  [stalled {stalled}]"
         print(f"--- Round {round_no}: {len(after_errs)} error(s) remain{note}")
         transcript.log(event="round_end", round=round_no, errors_before=len(errs),
-                       errors_after=len(after_errs),
+                       errors_after=len(after_errs), stalled=stalled,
                        conflicts_total=len(analysis["conflicts"]),
                        response=outcome.response[-2000:])
 
@@ -790,6 +1110,15 @@ async def _run_rounds(args, workflow, transcript: Transcript, analysis: dict,
             print(outcome.response)
             outcome.converged = True
             return outcome
+
+        # escape hatch: stop burning rounds on a conflict that cannot be resolved
+        if args.max_stall_rounds and stalled >= args.max_stall_rounds:
+            transcript.log(event="stalled", round=round_no, stalled_rounds=stalled,
+                           conflicts=[_describe_conflict(c) for c in after_errs])
+            _report_stall(after_errs, stalled, transcript.path, args)
+            outcome.exit_code = 4
+            return outcome
+
         prev_error_count = len(after_errs)
 
     print(f"\nReached max rounds ({args.max_rounds}) with unresolved error conflicts.")
@@ -810,7 +1139,9 @@ def _report_run_end(journal, transcript: Transcript) -> None:
         journal.close()
         print(f"\nJournal: {journal.path}  ({journal.count} revertible effect(s))")
         print(f"  revert with: python3 erpgen.py revert {journal.path}")
-    print(f"\nAgent transcript (thinking + tool calls + responses): {transcript.path}")
+    calls = _TRANSCRIPT_CTX.get("llm_calls", 0)
+    print(f"\nAgent transcript (LLM calls + tool calls + responses): {transcript.path}")
+    print(f"  {calls} remote LLM call(s) logged — grep 'llm_request' / 'llm_failure'")
 
 
 async def run_agent(args) -> int:
@@ -843,7 +1174,8 @@ async def run_agent(args) -> int:
     outcome = await _run_rounds(args, workflow, transcript, analysis, doctype, source)
     if outcome.exit_code == 0:
         transcript.log(event="run_end", max_rounds=args.max_rounds,
-                       resolved=outcome.converged)
+                       resolved=outcome.converged,
+                       llm_calls=_TRANSCRIPT_CTX.get("llm_calls", 0))
     transcript.close()
 
     from erpgen import tools as erpgen_tools  # noqa: PLC0415
@@ -882,6 +1214,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "default: 20; raise it for conflict-heavy sheets)")
     ap.add_argument("--max-rounds", type=int, default=20,
                     help="outer convergence loop cap (default: 20)")
+    ap.add_argument("--max-stall-rounds", type=int, default=2,
+                    help="give up after this many consecutive rounds with the "
+                         "SAME conflicts unchanged (default: 2; 0 disables)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="suppress the live per-call progress stream on stdout "
+                         "(round headers still print; the transcript is "
+                         "unaffected)")
     ap.add_argument("--doctor", action="store_true",
                     help="show tools + analysis without calling an LLM")
     return ap
@@ -889,6 +1228,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    _LIVE["enabled"] = not getattr(args, "quiet", False)
 
     if args.doctor:
         # doctor only inspects files + tools — no ERPNext connection needed

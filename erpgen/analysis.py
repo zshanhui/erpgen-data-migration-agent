@@ -87,12 +87,17 @@ def build_analysis(
                 "suggested_action": "write the value on the source doc (the linked doctype named in fetch_from).",
             })
 
-        if t.meta.is_link and t.meta.options:
+        # links_to_doctype, NOT is_link+options: a Dynamic Link keeps a sibling
+        # FIELD name in `options` (Contact.links.link_name -> "link_doctype"), so
+        # treating it as a doctype reports every value as missing — an
+        # unresolvable conflict the agent loops on forever.
+        linked = t.meta.links_to_doctype
+        if linked:
             missing = missing_link_values(client, distinct_values(source, m.source),
-                                          t.meta.options, existing_cache)
+                                          linked, existing_cache)
             if missing:
                 conflicts.append(link_value_conflict(
-                    m.source, [m.target], t.meta.options, missing))
+                    m.source, [m.target], linked, missing))
 
     covered = set(plan.mapped_fields()) | set(plan.defaults.keys())
     for f in engine.parent.mandatory_fields():
@@ -140,4 +145,45 @@ def save_analysis(analysis: dict, analysis_dir: str | Path) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
     path = d / f"analysis-{analysis['doctype'].lower().replace(' ', '-')}-{stamp}.json"
     path.write_text(json.dumps(analysis, indent=2, default=str), encoding="utf-8")
+    prune_analyses(d)
     return path
+
+
+#: Analysis artifacts kept PER DOCTYPE (newest first). Every `map`/`import`
+#: writes a new one, so an agent run with several rounds leaves a trail; this
+#: bounds it without ever removing the artifact a run is reading.
+KEEP_PER_DOCTYPE = 10
+
+#: analysis-<doctype-slug>-<YYYYMMDD>-<HHMMSSffffff>.json
+_ANALYSIS_NAME = re.compile(r"^analysis-(?P<slug>.+)-(?P<stamp>\d{8}-\d{12,})\.json$")
+
+
+def prune_analyses(analysis_dir: str | Path,
+                   keep: int = KEEP_PER_DOCTYPE) -> list[Path]:
+    """Delete all but the `keep` newest analysis files, per doctype.
+
+    Grouped by doctype, never globally: the agent's convergence loop re-reads
+    the newest artifact for its doctype after every round, so pruning must not
+    be able to take that file away. Files that don't match the expected name
+    are left alone — we never delete something we can't classify.
+    """
+    by_doctype: dict[str, list[tuple[str, Path]]] = {}
+    for path in Path(analysis_dir).glob("analysis-*.json"):
+        m = _ANALYSIS_NAME.match(path.name)
+        if m:
+            by_doctype.setdefault(m.group("slug"), []).append((m.group("stamp"), path))
+
+    removed: list[Path] = []
+    for entries in by_doctype.values():
+        if len(entries) <= keep:
+            continue
+        # newest first; sort on the stamp alone, since the fixed-width
+        # YYYYMMDD-HHMMSSffffff makes lexical order chronological (and Paths
+        # are not orderable, so a stamp tie must not fall through to them).
+        for _stamp, path in sorted(entries, key=lambda e: e[0], reverse=True)[keep:]:
+            try:
+                path.unlink()
+                removed.append(path)
+            except OSError:
+                pass  # losing a prune is not worth failing an import over
+    return removed

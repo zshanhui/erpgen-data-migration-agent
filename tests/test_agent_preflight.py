@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import sys
 import urllib.error
 from pathlib import Path
@@ -210,6 +211,618 @@ def test_iteration_exhaustion_ignores_unrelated_errors(agent_mod):
 def test_iteration_exhaustion_is_not_mistaken_for_a_network_error(agent_mod):
     """It must not be swallowed by the LLM help block."""
     assert agent_mod._is_llm_error(WorkflowRuntimeError("Max iterations of 20 reached!")) is False
+
+
+# ------------------------------------------- live progress on stdout
+@pytest.fixture
+def live(agent_mod):
+    """Ensure live output is on, and restore it afterwards."""
+    agent_mod._LIVE["enabled"] = True
+    yield agent_mod._LIVE
+    agent_mod._LIVE["enabled"] = True
+
+
+def test_live_prints_to_stdout_when_enabled(agent_mod, live, capsys):
+    agent_mod._live("hello")
+    assert "hello" in capsys.readouterr().out
+
+
+def test_live_is_silent_when_disabled(agent_mod, live, capsys):
+    live["enabled"] = False
+    agent_mod._live("hello")
+    assert capsys.readouterr().out == ""
+
+
+def test_live_is_silent_when_disabled_for_llm_calls(agent_mod, live, capsys):
+    """--quiet must silence the per-call stream too, not just _live()."""
+    import asyncio
+    live["enabled"] = False
+    agent_mod._TRANSCRIPT_CTX.clear()
+    agent_mod._TRANSCRIPT_CTX.update({"round": 1, "log_event": lambda **e: None})
+    asyncio.run(agent_mod.instrumented_llm(_FakeLLM)().achat(messages=["a"]))
+    assert "llm #" not in capsys.readouterr().out
+
+
+def test_brief_truncates_long_values(agent_mod):
+    assert agent_mod._brief("x" * 500, 20).endswith("…")
+    assert len(agent_mod._brief("x" * 500, 20)) == 20
+    assert agent_mod._brief("short") == "short"
+
+
+def test_brief_collapses_newlines(agent_mod):
+    assert agent_mod._brief("a\nb\tc") == "a b c"
+
+
+def test_brief_args_renders_kwargs(agent_mod):
+    out = agent_mod._brief_args((), {"source": "samples/x.csv", "apply": True})
+    assert "source=samples/x.csv" in out and "apply=True" in out
+
+
+def test_brief_args_renders_positional(agent_mod):
+    assert agent_mod._brief_args(("a", "b"), {}) == "a, b"
+
+
+def test_thinking_reads_the_assistant_text(agent_mod):
+    class _Msg:
+        content = "I should check the schema first."
+
+    class _Resp:
+        message = _Msg()
+
+    assert "check the schema" in agent_mod._thinking(_Resp())
+
+
+def test_thinking_handles_a_response_without_content(agent_mod):
+    assert agent_mod._thinking(object()) == ""
+
+
+def test_requested_tools_reads_tool_name(agent_mod):
+    class _Call:
+        tool_name = "run_import"
+
+    class _Resp:
+        tool_calls = [_Call()]
+
+    assert agent_mod._requested_tools(_Resp()) == ["run_import"]
+
+
+def test_requested_tools_reads_nested_tool_metadata(agent_mod):
+    class _Meta:
+        name = "create_field"
+
+    class _Tool:
+        metadata = _Meta()
+
+    class _Call:
+        tool = _Tool()
+
+    class _Resp:
+        tool_calls = [_Call()]
+
+    assert agent_mod._requested_tools(_Resp()) == ["create_field"]
+
+
+def test_requested_tools_falls_back_to_the_message(agent_mod):
+    """Some response shapes only carry tool calls on the message."""
+    class _Call:
+        tool_name = "set_mapping"
+
+    class _Msg:
+        tool_calls = [_Call()]
+
+    class _Resp:
+        message = _Msg()
+
+    assert agent_mod._requested_tools(_Resp()) == ["set_mapping"]
+
+
+def test_requested_tools_is_empty_without_calls(agent_mod):
+    assert agent_mod._requested_tools(object()) == []
+
+
+def test_llm_call_is_announced_live(agent_mod, live, capsys):
+    """The user must see the remote call start and finish, with its cost."""
+    import asyncio
+    agent_mod._TRANSCRIPT_CTX.clear()
+    agent_mod._TRANSCRIPT_CTX.update({"round": 1, "log_event": lambda **e: None})
+    asyncio.run(agent_mod.instrumented_llm(_FakeLLM)().achat(messages=["a", "b"]))
+    out = capsys.readouterr().out
+    assert "llm #1 → 2 msg(s)" in out
+    assert "llm #1 ←" in out
+    assert "120 tok" in out, "token usage must be visible live"
+
+
+def test_live_shows_what_the_model_wants_to_do(agent_mod, live, capsys):
+    import asyncio
+
+    class _Call:
+        tool_name = "run_import"
+
+    class _Msg:
+        content = "The import failed for every row."
+        tool_calls = [_Call()]
+
+    class _Resp:
+        raw = _Raw()
+        message = _Msg()
+
+    class _LLM:
+        model = "m"
+
+        async def achat(self, *a, **k):
+            return _Resp()
+
+    agent_mod._TRANSCRIPT_CTX.clear()
+    agent_mod._TRANSCRIPT_CTX.update({"round": 1, "log_event": lambda **e: None})
+    asyncio.run(agent_mod.instrumented_llm(_LLM)().achat(messages=["a"]))
+    out = capsys.readouterr().out
+    assert "wants run_import" in out
+    assert "The import failed for every row." in out, "thinking must be shown"
+
+
+def test_tool_calls_carry_a_ToolUse_marker(agent_mod, live, capsys):
+    """`ToolUse:<name>` is the greppable marker for every tool invocation."""
+    def run_map(source, doctype=""):
+        return "map exit 0"
+
+    agent_mod._TRANSCRIPT_CTX.clear()
+    agent_mod._wrap_tool(run_map, "run_map")(source="samples/x.csv", doctype="Customer")
+    out = capsys.readouterr().out
+    assert "ToolUse:run_map" in out
+    assert "source=samples/x.csv" in out
+    assert "ToolResult:run_map ✓ map exit 0" in out
+
+
+def test_every_tool_use_is_marked_so_grep_finds_it(agent_mod, live, capsys):
+    agent_mod._TRANSCRIPT_CTX.clear()
+    for name in ("run_map", "get_record", "list_records"):
+        agent_mod._wrap_tool(lambda **k: "ok", name)()
+    out = capsys.readouterr().out
+    marked = [ln for ln in out.splitlines() if "ToolUse:" in ln]
+    assert len(marked) == 3
+    assert [ln.split("ToolUse:")[1].split()[0] for ln in marked] == [
+        "run_map", "get_record", "list_records"]
+
+
+def test_failing_tool_calls_carry_a_ToolResult_marker(agent_mod, live, capsys):
+    def boom(*a, **k):
+        raise ValueError("nope")
+
+    agent_mod._TRANSCRIPT_CTX.clear()
+    with pytest.raises(ValueError):
+        agent_mod._wrap_tool(boom, "boom")()
+    out = capsys.readouterr().out
+    assert "ToolUse:boom" in out
+    assert "ToolResult:boom ✗ ValueError: nope" in out, \
+        "a raising tool must be visible immediately"
+
+
+def test_quiet_flag_wires_through(agent_mod):
+    assert agent_mod.build_parser().parse_args([]).quiet is False
+    args = agent_mod.build_parser().parse_args(["--quiet"])
+    assert args.quiet is True
+
+
+# ------------------------------------------- import failure digest
+def _warnings(rows, err):
+    return "\n".join(f"WARNING: row {r}: Customer 'C{r}' failed: {err}" for r in rows)
+
+
+SCHEMA_ERR = ('HTTP 500 POST /api/resource/Customer: MySQLdb.OperationalError: '
+              '(1054, "Unknown column \'lead_time_days\' in \'INSERT INTO\'")')
+
+
+def test_warning_digest_is_empty_without_warnings(agent_mod):
+    assert agent_mod.warning_digest("REST upsert: created 5, failed 0") == ""
+
+
+def test_warning_digest_groups_identical_causes(agent_mod):
+    """Without this the agent knows '29 failed' but not why, and guesses."""
+    out = _warnings(range(2, 31), SCHEMA_ERR)
+    digest = agent_mod.warning_digest(out)
+    assert "x29" in digest, "the same cause across rows must collapse to one entry"
+    assert "Unknown column 'lead_time_days'" in digest
+
+
+def test_warning_digest_flags_a_single_shared_cause(agent_mod):
+    digest = agent_mod.warning_digest(_warnings(range(2, 31), SCHEMA_ERR))
+    assert "shares ONE reason" in digest
+    assert "schema/environment" in digest
+
+
+def test_warning_digest_does_not_flag_a_single_row(agent_mod):
+    """One row failing is data, not a schema problem."""
+    assert "shares ONE reason" not in agent_mod.warning_digest(
+        _warnings([2], SCHEMA_ERR))
+
+
+def test_warning_digest_ranks_by_frequency(agent_mod):
+    out = "\n".join([
+        _warnings([2], "boom A"),
+        _warnings([3, 4, 5], "boom B"),
+    ])
+    digest = agent_mod.warning_digest(out)
+    assert digest.index("boom B") < digest.index("boom A"), "most common cause first"
+    assert "x3" in digest
+
+
+def test_warning_digest_caps_the_listing(agent_mod):
+    out = "\n".join(_warnings([i], f"distinct failure {i}") for i in range(2, 10))
+    digest = agent_mod.warning_digest(out, cap=3)
+    assert digest.count("distinct failure") == 3
+    assert "+5 more distinct" in digest
+
+
+def test_warning_digest_ignores_non_warning_lines(agent_mod):
+    out = "\n".join(["Prepared 29 payloads", "REST upsert: created 0, failed 2",
+                     _warnings([2, 3], "real cause")])
+    digest = agent_mod.warning_digest(out)
+    assert "real cause" in digest
+    assert "Prepared" not in digest
+
+
+def test_warning_digest_handles_warnings_without_the_failed_prefix(agent_mod):
+    out = "WARNING: row 30: missing Customer Name (skipped)"
+    digest = agent_mod.warning_digest(out)
+    assert "missing Customer Name" in digest
+
+
+def test_run_import_result_includes_the_digest(agent_mod, monkeypatch):
+    """The tool's return value is what the model actually sees."""
+    captured = {}
+
+    def _fake_erpgen(cmd, timeout=300):
+        captured["cmd"] = cmd
+        # the reason sits at the FRONT, far outside a 2000-char tail
+        return 0, _warnings(range(2, 31), SCHEMA_ERR) + "\nREST upsert: created 0, failed 29"
+
+    monkeypatch.setattr(agent_mod, "_erpgen", _fake_erpgen)
+    result = agent_mod.t_run_import("samples/customers.csv", "Customer", apply=True)
+    assert "Unknown column 'lead_time_days'" in result, \
+        "the failure reason must survive into the tool result"
+    assert "shares ONE reason" in result
+
+
+# ------------------------------------------------- LLM call logging
+class _Usage:
+    prompt_tokens = 100
+    completion_tokens = 20
+    total_tokens = 120
+
+
+class _Raw:
+    usage = _Usage()
+
+
+class _ChatResponse:
+    raw = _Raw()
+
+
+class _FakeLLM:
+    """Stands in for OpenAILike: only the two funnel methods exist."""
+
+    model = "deepseek-v4-flash"
+
+    def __init__(self, fail=False):
+        self.fail = fail
+
+    async def achat(self, *args, **kwargs):
+        if self.fail:
+            raise RuntimeError("upstream 500")
+        return _ChatResponse()
+
+    async def astream_chat(self, *args, **kwargs):
+        if self.fail:
+            raise RuntimeError("upstream 500")
+
+        async def _gen():
+            yield _ChatResponse()
+            yield _ChatResponse()
+        return _gen()
+
+
+def _capture(agent_mod, monkeypatch, round_no=1):
+    events: list = []
+    agent_mod._TRANSCRIPT_CTX.clear()
+    agent_mod._TRANSCRIPT_CTX.update(
+        {"round": round_no, "log_event": lambda **e: events.append(e)})
+    return events
+
+
+def _names(events):
+    return [e["event"] for e in events]
+
+
+def test_every_llm_call_is_logged(agent_mod, monkeypatch):
+    """The user-visible contract: one remote call => one logged request."""
+    import asyncio
+    events = _capture(agent_mod, monkeypatch)
+    llm = agent_mod.instrumented_llm(_FakeLLM)()
+    asyncio.run(llm.achat(messages=["a", "b"]))
+    assert _names(events) == ["llm_request", "llm_response"]
+
+
+def test_llm_request_records_round_method_model_and_size(agent_mod, monkeypatch):
+    import asyncio
+    events = _capture(agent_mod, monkeypatch, round_no=4)
+    asyncio.run(agent_mod.instrumented_llm(_FakeLLM)().achat(messages=["a", "b"]))
+    req = events[0]
+    assert req["round"] == 4
+    assert req["method"] == "achat"
+    assert req["model"] == "deepseek-v4-flash"
+    assert req["messages"] == 2
+
+
+def test_llm_response_records_duration_and_tokens(agent_mod, monkeypatch):
+    import asyncio
+    events = _capture(agent_mod, monkeypatch)
+    asyncio.run(agent_mod.instrumented_llm(_FakeLLM)().achat(messages=["a"]))
+    resp = events[1]
+    assert resp["duration_ms"] >= 0
+    assert resp["total_tokens"] == 120
+    assert resp["prompt_tokens"] == 100
+
+
+def test_llm_failures_are_logged_and_still_raised(agent_mod, monkeypatch):
+    """A failed call must be visible in the log, not just surface as a traceback."""
+    import asyncio
+    events = _capture(agent_mod, monkeypatch)
+    llm = agent_mod.instrumented_llm(_FakeLLM)(fail=True)
+    with pytest.raises(RuntimeError):
+        asyncio.run(llm.achat(messages=["a"]))
+    assert _names(events) == ["llm_request", "llm_failure"]
+    assert "upstream 500" in events[1]["error"]
+
+
+def test_streaming_call_is_logged_once_fully_drained(agent_mod, monkeypatch):
+    import asyncio
+    events = _capture(agent_mod, monkeypatch)
+
+    async def _drain():
+        gen = await agent_mod.instrumented_llm(_FakeLLM)().astream_chat(messages=["a"])
+        async for _chunk in gen:
+            pass
+
+    asyncio.run(_drain())
+    assert _names(events) == ["llm_request", "llm_response"]
+    assert events[1]["streamed"] is True
+
+
+def test_streaming_failure_is_logged(agent_mod, monkeypatch):
+    import asyncio
+    events = _capture(agent_mod, monkeypatch)
+
+    async def _drain():
+        gen = await agent_mod.instrumented_llm(_FakeLLM)(fail=True).astream_chat(
+            messages=["a"])
+        async for _chunk in gen:
+            pass
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_drain())
+    assert _names(events) == ["llm_request", "llm_failure"]
+
+
+def test_llm_calls_are_numbered_and_counted(agent_mod, monkeypatch):
+    import asyncio
+    events = _capture(agent_mod, monkeypatch)
+    llm = agent_mod.instrumented_llm(_FakeLLM)()
+    for _ in range(3):
+        asyncio.run(llm.achat(messages=["a"]))
+    assert [e["call_no"] for e in events if e["event"] == "llm_request"] == [1, 2, 3]
+    assert agent_mod._TRANSCRIPT_CTX["llm_calls"] == 3
+
+
+def test_logging_never_breaks_a_run_with_no_transcript(agent_mod):
+    """Outside a run there is no transcript; logging must be a no-op."""
+    import asyncio
+    agent_mod._TRANSCRIPT_CTX.clear()
+    asyncio.run(agent_mod.instrumented_llm(_FakeLLM)().achat(messages=["a"]))
+
+
+def test_prompt_content_is_not_logged(agent_mod, monkeypatch):
+    """Migration data must not leak into the transcript."""
+    import asyncio
+    events = _capture(agent_mod, monkeypatch)
+    secret = "SECRET-CUSTOMER-NAME"
+    asyncio.run(agent_mod.instrumented_llm(_FakeLLM)().achat(messages=[secret]))
+    assert secret not in json.dumps(events)
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (_Raw(), {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}),
+    (type("R", (), {"usage": None})(), {}),
+    (None, {}),
+    ({"usage": {"total_tokens": 5}}, {"total_tokens": 5}),
+])
+def test_llm_usage_is_tolerant(agent_mod, raw, expected):
+    class _Resp:
+        pass
+
+    r = _Resp()
+    r.raw = raw
+    assert agent_mod.llm_usage(r) == expected
+
+
+def test_llm_usage_handles_a_response_without_raw(agent_mod):
+    assert agent_mod.llm_usage(object()) == {}
+
+
+# ------------------------------------------------------ stall escape hatch
+STUCK = [{"kind": "link_value_conflict", "source": "Link Name (Links)",
+          "target": "links.link_name", "doctype": "link_doctype",
+          "severity": "error"}]
+OTHER = [{"kind": "required_missing", "field": "customer_name",
+          "severity": "error"}]
+
+
+def test_fingerprint_is_stable_for_the_same_conflicts(agent_mod):
+    assert (agent_mod._stall_fingerprint(STUCK)
+            == agent_mod._stall_fingerprint(list(STUCK)))
+
+
+def test_fingerprint_changes_when_the_conflicts_change(agent_mod):
+    """A flat count is not enough — different conflicts are still progress."""
+    assert agent_mod._stall_fingerprint(STUCK) != agent_mod._stall_fingerprint(OTHER)
+
+
+def test_stall_counter_starts_at_zero_then_counts_identical_rounds(agent_mod):
+    advance = agent_mod._advance_stall
+    fp = agent_mod._stall_fingerprint(STUCK)
+    stalled = advance(fp, None, 0)          # round 1: nothing to compare against
+    assert stalled == 0
+    stalled = advance(fp, fp, stalled)      # round 2: unchanged
+    assert stalled == 1
+    stalled = advance(fp, fp, stalled)      # round 3: unchanged again
+    assert stalled == 2
+
+
+def test_stall_counter_resets_when_anything_changes(agent_mod):
+    fp = agent_mod._stall_fingerprint(STUCK)
+    other = agent_mod._stall_fingerprint(OTHER)
+    assert agent_mod._advance_stall(other, fp, 2) == 0, "a different conflict is progress"
+
+
+def test_stall_counter_resets_when_conflicts_are_resolved(agent_mod):
+    fp = agent_mod._stall_fingerprint(STUCK)
+    assert agent_mod._advance_stall(frozenset(), fp, 2) == 0, "empty means converged"
+
+
+def test_escape_hatch_defaults_to_two_rounds(agent_mod):
+    assert agent_mod.build_parser().parse_args([]).max_stall_rounds == 2
+
+
+def test_escape_hatch_can_be_disabled(agent_mod):
+    args = agent_mod.build_parser().parse_args(["--max-stall-rounds", "0"])
+    assert args.max_stall_rounds == 0
+
+
+STUCK_ANALYSIS = {
+    "base_url": "http://localhost:8082",
+    "conflicts": [{"kind": "link_value_conflict", "source": "Link Name (Links)",
+                   "target": "links.link_name", "doctype": "link_doctype",
+                   "severity": "error"}],
+}
+
+
+class _Workflow:
+    async def run(self, **kw):
+        class _R:
+            response = "I tried to fix it."
+        return _R()
+
+
+class _Recorder:
+    """Stand-in for Transcript that keeps the events instead of writing them."""
+
+    def __init__(self):
+        self.path = "/tmp/agent-test.jsonl"
+        self.events: list = []
+
+    def log(self, **entry):
+        self.events.append(entry)
+
+
+class _LoopArgs:
+    max_rounds = 20
+    max_stall_rounds = 2
+    max_iterations = 50
+    api_base = "http://localhost:8082"
+    model = ""
+    provider = "deepseek"
+    run = None
+
+
+def _drive_loop(agent_mod, monkeypatch, args, analysis=None):
+    """Run the real `_run_rounds` with a stubbed LLM and a frozen analysis."""
+    import asyncio
+
+    async def _fake_round(workflow, msg, max_iterations=0):
+        return "I tried to fix it."
+
+    monkeypatch.setattr(agent_mod, "_run_agent_round", _fake_round)
+    monkeypatch.setattr(agent_mod, "latest_analysis",
+                        lambda doctype: dict(analysis or STUCK_ANALYSIS))
+    recorder = _Recorder()
+    outcome = asyncio.run(agent_mod._run_rounds(
+        args, _Workflow(), recorder, dict(analysis or STUCK_ANALYSIS),
+        "Contact", "samples/contacts.csv"))
+    return outcome, recorder
+
+
+def test_escape_hatch_fires_when_conflicts_never_change(agent_mod, monkeypatch):
+    """The whole point: stop burning rounds instead of grinding to --max-rounds."""
+    outcome, recorder = _drive_loop(agent_mod, monkeypatch, _LoopArgs())
+    assert outcome.exit_code == 4, "must bail with the 'stalled' exit code"
+    assert outcome.converged is False
+    assert any(e.get("event") == "stalled" for e in recorder.events), \
+        "the stall must be recorded in the transcript"
+
+
+def test_escape_hatch_reports_the_stuck_conflicts(agent_mod, monkeypatch, capsys):
+    _drive_loop(agent_mod, monkeypatch, _LoopArgs())
+    err = capsys.readouterr().err
+    assert "STALLED" in err
+    assert "link_doctype" in err, "the suspect doctype must be named"
+
+
+def test_escape_hatch_waits_for_the_configured_number_of_rounds(agent_mod, monkeypatch):
+    """Default 2 => it should give up during round 3, not round 1."""
+    calls = {"n": 0}
+
+    async def _fake_round(workflow, msg, max_iterations=0):
+        return "tried"
+
+    def _fresh(doctype):
+        calls["n"] += 1
+        return dict(STUCK_ANALYSIS)
+
+    monkeypatch.setattr(agent_mod, "_run_agent_round", _fake_round)
+    monkeypatch.setattr(agent_mod, "latest_analysis", _fresh)
+    import asyncio
+    outcome = asyncio.run(agent_mod._run_rounds(
+        _LoopArgs(), _Workflow(), _Recorder(), dict(STUCK_ANALYSIS),
+        "Contact", "samples/contacts.csv"))
+    assert outcome.exit_code == 4
+    assert calls["n"] == 3, "round 1 sets the baseline; 2 & 3 are the stall"
+
+
+def test_escape_hatch_disabled_runs_to_the_round_cap(agent_mod, monkeypatch):
+    class _NoHatch(_LoopArgs):
+        max_rounds = 3
+        max_stall_rounds = 0
+
+    outcome, recorder = _drive_loop(agent_mod, monkeypatch, _NoHatch())
+    assert outcome.exit_code == 0, "0 disables the check"
+    assert not any(e.get("event") == "stalled" for e in recorder.events)
+
+
+def test_loop_converges_when_conflicts_clear(agent_mod, monkeypatch):
+    """Sanity check on the same harness: no conflicts => converged, no stall."""
+    clean = {"base_url": "http://localhost:8082", "conflicts": []}
+    outcome, _ = _drive_loop(agent_mod, monkeypatch, _LoopArgs(), analysis=clean)
+    assert outcome.converged is True
+    assert outcome.exit_code == 0
+
+
+def test_conflict_description_names_the_suspect_doctype(agent_mod):
+    """The stall report must point at 'link_doctype' — that is the giveaway."""
+    line = agent_mod._describe_conflict(STUCK[0])
+    assert "link_value_conflict" in line
+    assert "Link Name (Links)" in line
+    assert "link_doctype" in line
+
+
+def test_stall_report_mentions_how_to_escape(agent_mod, capsys):
+    class _Args:
+        max_rounds = 20
+
+    agent_mod._report_stall(STUCK, 2, "/tmp/agent-x.jsonl", _Args())
+    err = capsys.readouterr().err
+    assert "STALLED" in err
+    assert "link_doctype" in err
+    assert "--max-stall-rounds 0" in err, "must say how to disable the check"
+    assert "/tmp/agent-x.jsonl" in err, "must point at the transcript"
 
 
 # ------------------------------------------------- describe_llm_error
