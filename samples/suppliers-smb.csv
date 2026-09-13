@@ -1,0 +1,16 @@
+Supplier Name,Supplier Type,Supplier Group,Contact Name,Email,Phone,Address Type,Address Line 1,City,State,Postal Code,Country,Tax ID,Website,Default Currency,Is Transporter,Lead Time Days,Payment Terms
+Acme Steel Works,Company,Raw Material,Alicia Henderson,alicia@acmesteel.example,+1 555 2100,Billing,100 Foundry Way,Cleveland,Ohio,44101,United States,US-99-88-7777,https://acmesteel.example,USD,No,14,Net 30
+Midwest Raw Materials Co,Company,Raw Material,Dennis Kaur,dennis@midwestraw.example,+1 555 5101,Billing,410 Ore Dock Rd,Duluth,Minnesota,55802,United States,US-12-34-5678,,USD,No,21,Net 45
+Delta Tooling Supply,Company,Hardware,Priscilla Vance,priscilla@deltatooling.example,+1 555 5102,Billing,77 Carbide Ct,Dayton,Ohio,45402,United States,,https://deltatooling.example,USD,No,10,Net 30
+Northwind Packaging,Company,Distributor,Andre Sokolov,andre@northwindpack.example,+1 555 5103,Billing,220 Carton Ave,Green Bay,Wisconsin,54301,United States,,,USD,No,,Net 30
+Everline Freight Services,Company,Services,Beatrice Lund,beatrice@everlinefreight.example,+1 555 5104,Office,15 Haulage Way,Indianapolis,Indiana,46204,United States,,,USD,Yes,5,Net 30
+Pinnacle Industrial Coatings,Company,Raw Material,Curtis Mbeki,curtis@pinnaclecoat.example,+1 555 5105,Billing,808 Resin Rd,Baton Rouge,Louisiana,70802,United States,,,USD,No,28,Net 45
+Redwood Lumber Supply,Company,Raw Material,Yolanda Reyes,yolanda@redwoodlumber.example,+1 555 5106,Billing,64 Sawmill Rd,Eureka,California,95501,United States,,,USD,No,30,Net 30
+Summit Abrasives,Individual,Hardware,Gregory Pan,gregory@summitabrasives.example,,Billing,19 Grindstone Ln,Worcester,Massachusetts,01608,United States,,,USD,No,,
+Thornbury Electrical Wholesale,Company,Electrical,Helena Bright,helena@thornburyelec.example,+44 20 555 5107,Billing,3 Kilowatt Way,Manchester,,M1 3AB,United Kingdom,,,GBP,No,35,Net 30
+Shenzhen Precision Castings Ltd,Company,Raw Material,Wei Zhang,wei.zhang@shenzhencast.example,+86 755 5550 1234,Billing,Block 7 Bao'an Industrial Park,Shenzhen,Guangdong,518101,China,91440300MA5EX1A2B3,https://shenzhencast.example,CNY,No,45,Letter of Credit
+Ningbo Fastener Manufacturing Co,Company,Hardware,Li Chen,li.chen@ningbofastener.example,+86 574 5550 5678,Billing,88 Jiangdong North Road,Ningbo,Zhejiang,315040,China,91330200MA2GH4C5D6,,CNY,No,38,Letter of Credit
+Straits Electronics Pte Ltd,Company,Electrical,Marcus Tan,marcus.tan@straitselec.example,+65 6555 0188,Billing,21 Jalan Kilang,Singapore,,159410,Singapore,201812345M,https://straitselec.example,SGD,No,21,Net 30
+Lion City Instruments Pte Ltd,Company,Distributor,Priya Menon,priya.menon@lioncityinst.example,+65 6555 0244,Billing,8 Bukit Batok Street 23,Singapore,,659528,Singapore,201934567N,,SGD,No,18,Net 30
+Penang Rubber Products Sdn Bhd,Company,Raw Material,Aisyah Rahman,aisyah@penangrubber.example,+60 4 555 0199,Billing,Plot 12 Bayan Lepas Industrial Park,Bayan Lepas,Penang,11900,Malaysia,199801012345,https://penangrubber.example,MYR,No,30,Net 45
+Johor Metalworks Sdn Bhd,Company,Hardware,Hafiz Ismail,hafiz@johormetal.example,+60 7 555 0311,Billing,5 Jalan Perindustrian,Johor Bahru,Johor,81100,Malaysia,200501023456,,MYR,No,25,Net 30

@@ -11,7 +11,10 @@
   },
   "Item": {
     "mappings": {
-      "UoM": "stock_uom"
+      "UoM": "stock_uom",
+      "SKU Ref": "sku_ref",
+      "Rate": "standard_rate",
+      "Group": "item_group"
     },
     "defaults": {},
     "value_maps": {}

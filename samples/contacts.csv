@@ -1,0 +1,4 @@
+ID,First Name,Last Name,Email ID (Email IDs),Is Primary (Email IDs),Number (Contact Numbers),Is Primary Phone (Contact Numbers),Link Document Type (Links),Link Name (Links)
+Alicia Henderson,Alicia,Henderson,alicia@acmesteel.example,1,+1 555 2100,1,Customer,Acme Steel Works
+Ben Okafor,Ben,Okafor,ben@bluedot.example,1,+1 555 2101,1,Customer,Bluedot Logistics
+Carla Ng,Carla,Ng,carla@maplegrove.example,1,,,Customer,Maple Grove Organics

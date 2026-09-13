@@ -1,0 +1,7 @@
+Item Code,Item Name,Group,UoM,Rate,Is Stock Item,Notes
+E2E-1001,Heavy Toggle Clamp,Tooling,Dozen,12.5,Yes,agent items e2e row A
+E2E-1002,Spring Plunger Kit,Tooling,Nos,8.9,Yes,agent items e2e row B
+E2E-1003,Film Roll Backing,Packaging,Roll,1.2,Yes,agent items e2e row C
+E2E-1004,Export Crate Kit,Packaging,Set,45,Yes,agent items e2e row D
+E2E-1005,Spare Seal Kit,Consumable,Box,15,Yes,agent items e2e row E
+E2E-1006,Calibration Weight Set,Products,Nos,250,No,agent items e2e row F

@@ -5,6 +5,5 @@ docs/
 .env
 .DS_Store
 .env.local
-samples/
 analysis/
 erpgen-web-services/

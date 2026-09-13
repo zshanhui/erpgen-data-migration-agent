@@ -1,0 +1,13 @@
+Item Code,Item Name,Group,UoM,Rate,Is Stock Item,Lead Time (days),Description,SKU Ref
+MFG-1001,Heavy Duty Bearing Housing,Products,Nos,45.5,Yes,21,Precision machined housing assembly,SKU-A1001
+RAW-2001,Steel Plate 10mm,Raw Material,Kg,1.8,Yes,7,Hot-rolled carbon steel plate,SKU-B2001
+RAW-2002,Aluminium Bar 25mm,Raw Material,Kg,4.2,Yes,14,6061 aluminium round bar,SKU-B2002
+SUB-3001,Drive Shaft Assembly,Sub Assemblies,Nos,120,Yes,30,Machined drive shaft with keyway,SKU-C3001
+FIN-4001,Industrial Grease 5kg,Consumable,Box,28,Yes,5,High-temp lithium grease,SKU-D4001
+SVC-5001,Field Calibration Service,Services,Set,250,No,3,On-site machine calibration,SKU-E5001
+MFG-1002,Precision Idler Pulley,Products,Nos,18.75,Yes,15,Sealed bearing idler pulley,SKU-A1002
+PKG-6001,Corrugated Carton 40x30x30,Products,Nos,0.85,Yes,4,Standard shipping carton,SKU-F6001
+FIN-4002,Cutting Fluid 20L,Consumable,Box,35.5,Yes,6,Soluble cutting oil,SKU-D4002
+RAW-2003,Brass Rod 12mm,Raw Material,Kg,9.1,Yes,10,C360 brass rod stock,SKU-B2003
+BOGUS-7001,Experimental Gizmo,Machinery,Nos,99.99,Yes,60,Prototype hardware,SKU-X7001
+BOGUS-7002,Laser Alignment Kit,Machinery,Set,450,Yes,45,Precision alignment tooling,SKU-X7002

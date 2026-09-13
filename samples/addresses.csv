@@ -1,0 +1,5 @@
+ID,Address Title,Address Type,Address Line 1,City/Town,State/Province,Country,Postal Code,Preferred Billing Address,Preferred Shipping Address,Link Document Type (Links),Link Name (Links)
+Acme Steel Works-Billing,Acme Billing,Billing,100 Foundry Way,Cleveland,Ohio,United States,44101,1,0,Customer,Acme Steel Works
+Acme Steel Works-Shipping,Acme Shipping,Shipping,200 Dockside Ave,Cleveland,Ohio,United States,44102,0,1,Customer,Acme Steel Works
+Bluedot Logistics-HQ,Bluedot HQ,Office,45 Harbor Rd,Seattle,Washington,United States,98101,1,0,Customer,Bluedot Logistics
+Maple Grove Organics-Billing,Maple Grove Billing,Billing,7 Orchard Ln,Sacramento,California,United States,95814,1,0,Customer,Maple Grove Organics

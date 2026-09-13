@@ -1,0 +1,7 @@
+Customer Name,Customer Type,Group,Territory,Vendor Code,Notes,Internal Ref
+Nimbus Forge Co,Company,Wholesale,All Territories,VC-9001,agent e2e test customer,NF-001
+Quarryline Metals,Company,Commercial,United States,VC-9002,agent e2e test customer,QM-002
+Summit Rail Parts,Company,Retail Chain,All Territories,VC-9003,regional rail supplier,SR-003
+Bluewater Exports,Company,Commercial,Canada,VC-9004,exports to north america,BW-004
+Red Cedar Trading,Company,Export Only,All Territories,VC-9005,international reseller,RC-005
+Laurel Grove Hardware,Individual,Commercial,United States,VC-9006,,LG-006

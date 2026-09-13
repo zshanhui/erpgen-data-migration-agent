@@ -2,6 +2,21 @@
 
 Deterministic and verifiable data migration agent for ERPNext
 
+## Work in progress
+
+every should be considered work in progress and there might be breaking changes from minute to minute
+
+things being worked on:
+
+- building the core mapping engine using both deterministic heuristics and LLMs for cases where it requires judgement
+- creating a common interface for `DataSource`, the only one currently supported is CSV/Excel files, but an important import source would be from other legacy erps
+- creating a shared interface for adding additional LLM and inferance providers like ZAI, Deepinfra, Kimi
+- creating a way for the agent to simulate what the full migration will look like first before the real run
+- creating the concept of a migration project, with all artifacts tied to the project
+- language support for Chinese data mappings and LLM logs
+
+## Demo run
+
 full demo test run
 
 make sure you have erpnext stack running in Docker before runningg erpgen
