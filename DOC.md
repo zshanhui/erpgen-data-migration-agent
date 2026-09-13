@@ -4,25 +4,25 @@ Converts CSV/XLSX into ERPNext, using the **live site's DocType metadata** as th
 ground truth for mapping. A deterministic CLI, plus an LLM agent that resolves
 whatever the mapping cannot decide on its own.
 
-## Quick start
+## Agent runs
 
-Connection defaults: `--base http://localhost:8082 --user Administrator --password admin`.
+The agent reads the mapping analysis, resolves what scoring cannot decide, then
+imports — calling the same CLI underneath. Point it at one sheet:
 
 ```bash
-python3 erpgen.py map samples/customers.csv               # plan + analysis only
-python3 erpgen.py import samples/customers.csv            # dry run: payloads + predicted dedup
-python3 erpgen.py import samples/customers.csv --apply    # idempotent import
+export DEEPSEEK_API_KEY=...
+.venv/bin/python erpgen.py --run myrun agent --source samples/suppliers-smb.csv --provider deepseek
+.venv/bin/python erpgen.py --run myrun agent --source samples/items.csv --provider deepseek   # any other sheet
 ```
 
-- **Idempotent.** Only new records are created; existing ones are skipped, so
-  re-running the same source is a safe no-op.
-- **Gated.** `--apply` refuses to run while error-severity conflicts remain
-  (exit 2). Resolve them, or pass `--bypass-conflicts` to import anyway.
-- **`--doctype` is optional** — inferred from the headers (see
-  [Doctype inference](#doctype-inference)).
-- Use `.venv/bin/python` for `.xlsx` sources and for the agent.
+Global flags (`--base`, `--log-dir`, `--run`) live on the CLI itself, so they come
+**before** the subcommand.
 
-## Full agentic run — every master worksheet
+The doctype is **inferred per sheet**. Check the `Starting agent for <doctype>`
+line matches the sheet (`items.csv` → `Item`); a mismatch means every column is
+being analysed against the wrong doctype.
+
+### Every master worksheet
 
 `scripts/run-all-agentic.sh` drives the LLM loop over all supported sheets in
 dependency order (parties → the Contact/Address sheets that link to them → items).
@@ -46,15 +46,69 @@ RUN_ID=myrun ./scripts/run-all-agentic.sh  # name the run so it reverts as one u
 | 8 | `items.csv` | Item |
 | 9 | `items_e2e.csv` | Item (conflict-rich) |
 
-Any single sheet, same mechanism:
+### Deterministic first, LLM only when needed
 
-```bash
-.venv/bin/python scripts/agent.py --source samples/suppliers-smb.csv --run myrun
+With **no error-severity conflicts** there is nothing for the model to decide, so
+the agent imports directly and only involves the LLM if rows actually failed:
+
+```
+Starting agent for Item — 0 conflicts
+
+No conflicts — deterministic import (exit 0): 0 row(s) failed
 ```
 
-The doctype is **inferred per sheet**. Check the `Starting agent for <doctype>`
-line matches the sheet (`items.csv` → `Item`); a mismatch means every column is
-being analysed against the wrong doctype.
+A clean re-run therefore costs **zero** remote calls (and needs no API key). When
+rows do fail, the failure digest is handed to the agent so it starts from the
+evidence instead of rediscovering it. `--always-llm` restores the old behaviour.
+
+### Following a run
+
+The agent streams each LLM call and tool invocation, so a slow round is not a
+blank screen. Tool calls are grep-able:
+
+```bash
+python3 erpgen.py agent --source samples/items.csv | grep ToolUse:
+python3 erpgen.py agent --source samples/items.csv | tee run.log | grep 'ToolResult:.*✗'
+```
+
+`--quiet` suppresses the per-call stream (round headers still print). Everything
+also lands in `logs/agent-<doctype>-<ts>.jsonl` — one JSON object per line
+covering LLM calls (duration, token usage — never prompt content), tool calls and
+rounds:
+
+```bash
+grep -c llm_request logs/agent-suppliers_full-*.jsonl   # how many remote calls
+grep llm_failure  logs/agent-suppliers_full-*.jsonl     # any failed calls
+```
+
+### Testing without a key
+
+`scripts/mock-llm.py` is a small OpenAI-compatible stand-in (streaming included):
+
+```bash
+python3 scripts/mock-llm.py 8765 &
+DEEPSEEK_API_KEY=dummy .venv/bin/python erpgen.py --run mock-01 agent \
+    --source samples/customers_e2e.csv --doctype Customer \
+    --provider deepseek --api-base http://127.0.0.1:8765/v1 --max-rounds 1
+```
+
+## Quick start
+
+Connection defaults: `--base http://localhost:8082 --user Administrator --password admin`.
+
+```bash
+python3 erpgen.py map samples/customers.csv               # plan + analysis only
+python3 erpgen.py import samples/customers.csv            # dry run: payloads + predicted dedup
+python3 erpgen.py import samples/customers.csv --apply    # idempotent import
+```
+
+- **Idempotent.** Only new records are created; existing ones are skipped, so
+  re-running the same source is a safe no-op.
+- **Gated.** `--apply` refuses to run while error-severity conflicts remain
+  (exit 2). Resolve them, or pass `--bypass-conflicts` to import anyway.
+- **`--doctype` is optional** — inferred from the headers (see
+  [Doctype inference](#doctype-inference)).
+- Use `.venv/bin/python` for `.xlsx` sources and for the agent.
 
 ## How mapping works
 
@@ -136,6 +190,7 @@ added to its dedup set, so fixing the source and re-running retries it.
 | `get-record` / `list-records` | read records as JSON |
 | `set-mapping` | record a forced source-column → target-field decision |
 | `create-record` | create a lookup record (Item Group, UOM, …) |
+| `agent` | LLM loop over the analysis: resolve conflicts, then import (`--doctor` skips the LLM) |
 | `status` | show a `--run` context: effects applied, requirements pending |
 | `revert` | undo a journal / run by replaying its recorded inverses |
 | `delete` | delete records by name (cleanup) |
@@ -248,51 +303,6 @@ curl -sS -m 5 -o /dev/null -w '%{http_code}\n' https://api.deepseek.com/
 their own guidance (404 → model id or `--api-base`, 429 → rate limit, 400 →
 context length). No LLM needed at all:
 `DOCTOR=1 ./scripts/run-all-agentic.sh`.
-
-**Testing the agent without a key.** `scripts/mock-llm.py` is a small
-OpenAI-compatible stand-in (streaming included):
-
-```bash
-python3 scripts/mock-llm.py 8765 &
-DEEPSEEK_API_KEY=dummy .venv/bin/python scripts/agent.py --run mock-01 \
-    --source samples/customers_e2e.csv --doctype Customer \
-    --provider deepseek --api-base http://127.0.0.1:8765/v1 --max-rounds 1
-```
-
-### Deterministic first, LLM only when needed
-
-With **no error-severity conflicts** there is nothing for the model to decide, so
-the agent imports directly and only involves the LLM if rows actually failed:
-
-```
-Starting agent for Item — 0 conflicts
-
-No conflicts — deterministic import (exit 0): 0 row(s) failed
-```
-
-A clean re-run therefore costs **zero** remote calls (and needs no API key). When
-rows do fail, the failure digest is handed to the agent so it starts from the
-evidence instead of rediscovering it. `--always-llm` restores the old behaviour.
-
-### Following a run
-
-The agent streams each LLM call and tool invocation, so a slow round is not a
-blank screen. Tool calls are grep-able:
-
-```bash
-python3 scripts/agent.py --source samples/items.csv | grep ToolUse:
-python3 scripts/agent.py --source samples/items.csv | tee run.log | grep 'ToolResult:.*✗'
-```
-
-`--quiet` suppresses the per-call stream (round headers still print). Everything
-also lands in `logs/agent-<doctype>-<ts>.jsonl` — one JSON object per line
-covering LLM calls (duration, token usage — never prompt content), tool calls and
-rounds:
-
-```bash
-grep -c llm_request logs/agent-suppliers_full-*.jsonl   # how many remote calls
-grep llm_failure  logs/agent-suppliers_full-*.jsonl     # any failed calls
-```
 
 ## Tests
 
