@@ -1,0 +1,14 @@
+Customer Name,Customer Type,Group,Territory,Email,Phone,Tax ID,Credit Limit,Notes
+Nimbus Forge Co,Company,Wholesale,All Territories,accounts@nimbus.example,+65 6777 1000,SG-1001,15000,
+Kestrel Engineering,Company,Commercial,All Territories,ap@kestrel.example,+65 6777 2000,SG-1002,8000,
+Granite Bay Landscaping,Company,Commercial,All Territories,info@granitebay.example,+65 6777 3000,SG-1003,5000,
+Granite Bay Landscaping,Company,Commercial,All Territories,info@granitebay.example,+65 6777 3000,SG-1003,5000,
+Harborline Freight,Company,Wholesale,All Territories,ops@harborline.example,+65 6777 4000,SG-1004,12000,
+Harborline Freight,Company,Wholesale,All Territories,ops@harborline.example,+65 6777 4999,SG-1005,12500,phone corrected
+Riverside Packing,Company,Commercial,All Territories,hello@riverside.example,+65 6777 5000,SG-1006,3000,
+riverside packing,Company,Commercial,All Territories,hello@riverside.example,+65 6777 5000,SG-1006,3000,
+,Company,Commercial,All Territories,unknown1@example.com,+65 6777 6000,,1000,name missing
+,Company,Commercial,All Territories,unknown2@example.com,+65 6777 7000,,2000,name missing
+Pine Ridge Cabinetry,Company,Wholesale,All Territories,sales@pineridge.example,+65 6777 8000,SG-1008,4000,
+Pine Ridge Cabinetry ,Company,Wholesale,All Territories,sales@pineridge.example,+65 6777 8000,SG-1008,4000,
+Bluedot Logistics,,Commercial,All Territories,finance@bluedot.example,+65 6777 9000,SG-1009,9000,type missing

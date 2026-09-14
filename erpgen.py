@@ -57,6 +57,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from erpgen.agent import add_agent_flags  # noqa: E402
 from erpgen.analysis import build_analysis, save_analysis  # noqa: E402
 from erpgen.client import ERPNextClient  # noqa: E402
+from erpgen.conflicts import (  # noqa: E402
+    data_quality_conflicts,
+    required_mapped_columns,
+)
 from erpgen.context import (  # noqa: E402
     MigrationContext,
     latest_run,
@@ -144,6 +148,23 @@ def _effect_sink(args, doctype: str = "", source: str = "", command: str = ""):
     )
 
 
+def _check_id_column(args, source) -> bool:
+    """An explicit --id-column must exist in the sheet.
+
+    Returns False (after printing) so callers can exit 2. Without this, an
+    unknown column fell through to inference and the user was told "cannot
+    determine the ID column ... pass --id-column", which misleads precisely
+    because they did pass one.
+    """
+    explicit = getattr(args, "id_column", None)
+    if explicit and source.column_index(explicit) is None:
+        print(f"ERROR: --id-column {explicit!r} is not a column in "
+              f"{args.source}. Available columns: {', '.join(source.headers)}",
+              file=sys.stderr)
+        return False
+    return True
+
+
 def _client(args) -> ERPNextClient:
     return ERPNextClient(
         args.base, username=args.user, password=args.password, timeout=args.timeout
@@ -224,6 +245,9 @@ def _overrides_for(args, doctype: str) -> tuple[Optional[str], dict]:
 
 def cmd_map(args) -> int:
     source = read_source(args.source)
+    # an unknown explicit --id-column is a hard error, before any mapping work
+    if not _check_id_column(args, source):
+        return 2
     party = detect_party_sheet(source)
     if party:
         # flat party sheet: fixed contract + out-of-contract columns for the LLM
@@ -269,7 +293,7 @@ def cmd_map(args) -> int:
     # agent-consumable analysis artifact (plan + profiles + conflicts + actions)
     analysis = build_analysis(
         client, source, plan, engine,
-        id_column=infer_id_column(plan, source, None),
+        id_column=infer_id_column(plan, source, args.id_column),
         base_url=args.base, source_path=args.source,
     )
     apath = save_analysis(analysis, args.analysis_dir)
@@ -467,6 +491,10 @@ def cmd_import(args) -> int:
                   file=sys.stderr)
             return 2
         print(f"Inferred doctype: {args.doctype}")
+
+    # an unknown explicit --id-column is a hard error, before any mapping work
+    if not _check_id_column(args, source):
+        return 2
 
     engine, client, plan, payloads, row_errors = _build_plan(args, source)
 
@@ -729,6 +757,82 @@ def cmd_set_mapping(args) -> int:
     return 0
 
 
+def cmd_clean(args) -> int:
+    """Flag duplicate keys and empty required values, before mapping or import.
+
+    Needs no target doctype for the key checks (duplicates, blank keys); with
+    --doctype it also checks columns that feed required fields, which needs one
+    metadata fetch. Exit 2 when any error-severity flag is found, so it can gate
+    a pipeline.
+    """
+    source = read_source(args.source)
+    if not _check_id_column(args, source):
+        return 2
+
+    if args.doctype:
+        client = _client(args)
+        parent, children = fetch_with_children(client, args.doctype)
+        engine = MappingEngine(parent, children)
+        plan = engine.suggest(source)
+        key_column = infer_id_column(plan, source, args.id_column)
+        key_field = next((m.target for m in plan.mappings
+                          if m.source == key_column and m.target), "") or ""
+        required = required_mapped_columns(engine.parent, plan)
+        compared = [m.source for m in plan.mappings if m.target]
+    else:
+        key_column = args.id_column or _guess_key_column(source)
+        key_field, required, compared = "", [], None
+
+    if key_column is None:
+        print("ERROR: cannot determine the key column. Pass --id-column.",
+              file=sys.stderr)
+        return 2
+
+    conflicts = data_quality_conflicts(
+        source, key_column=key_column, key_field=key_field,
+        required=required, compare_columns=compared,
+    )
+
+    if args.json:
+        print(json.dumps(conflicts, indent=2, default=str))
+    else:
+        how = "explicit" if args.id_column else ("mapped" if args.doctype else "guessed")
+        print(f"Data quality — {args.source}  "
+              f"({source.n_rows} rows, key column {key_column!r}, {how})")
+        if not conflicts:
+            print("  no issues found")
+        for c in conflicts:
+            if c["kind"] == "duplicate_row":
+                print(f"  [{c['severity']:<7}] duplicate_row  {c['source']:<20} "
+                      f"{c['group_count']} duplicated key(s)")
+                for g in c["groups"]:
+                    differs = ("  differs: " + ", ".join(g["differing_fields"])
+                               if g["differing_fields"] else "  identical rows")
+                    flags = "".join([" case" if g["case_variant"] else "",
+                                     " whitespace" if g["whitespace_variant"] else ""])
+                    print(f"      {g['key_value']!r} rows {g['rows']} "
+                          f"({g['count']}x){flags}{differs}")
+            else:
+                roles = ",".join(c["roles"])
+                print(f"  [{c['severity']:<7}] missing_value  {c['source']:<20} "
+                      f"roles {roles} — {c['count']} row(s): {c['rows']}")
+
+    errors = sum(1 for c in conflicts if c["severity"] == "error")
+    if not args.json:
+        print(f"  {len(conflicts)} issue(s): {errors} error, "
+              f"{len(conflicts) - errors} warning")
+    return 2 if errors else 0
+
+
+def _guess_key_column(source) -> Optional[str]:
+    """First column, preferring an obvious ID/Name header. Printed by the caller
+    so the guess is visible rather than silent."""
+    for header in ("ID", "Name"):
+        if source.column_index(header) is not None:
+            return header
+    return source.headers[0] if source.headers else None
+
+
 def cmd_describe_doctype(args) -> int:
     client = _client(args)
     try:
@@ -927,6 +1031,8 @@ def _add_source_parsers(sub) -> None:
     p_map.add_argument("--doctype", help="target doctype (inferred from headers if omitted)")
     p_map.add_argument("--defaults", help='JSON defaults, e.g. \'{"customer_group":"Commercial"}\'')
     p_map.add_argument("--save", help="save plan JSON to this path")
+    p_map.add_argument("--id-column", help="source column carrying the natural key "
+                                           "(an explicit value must exist in the sheet)")
     p_map.add_argument("--overrides", help=f"mapping overrides file "
                                           f"(default: {DEFAULT_OVERRIDES} if present)")
     p_map.add_argument("--analysis-dir", default="analysis",
@@ -1060,6 +1166,19 @@ def _add_lifecycle_parsers(sub) -> None:
     p_rv.add_argument("--force", action="store_true",
                       help="replay a journal that was already fully reverted")
     p_rv.set_defaults(fn=cmd_revert)
+
+    p_cl = sub.add_parser(
+        "clean",
+        help="flag duplicate keys and empty required values before mapping/import "
+             "(exit 2 when any error is found)",
+    )
+    p_cl.add_argument("source")
+    p_cl.add_argument("--doctype", help="also check columns feeding required fields "
+                                       "(one metadata fetch); omit for key checks only")
+    p_cl.add_argument("--id-column", help="source column carrying the natural key "
+                                         "(an explicit value must exist in the sheet)")
+    p_cl.add_argument("--json", action="store_true", help="emit the conflicts as JSON")
+    p_cl.set_defaults(fn=cmd_clean)
 
     p_del = sub.add_parser("delete", help="delete records by name (cleanup)")
     p_del.add_argument("--doctype", required=True)

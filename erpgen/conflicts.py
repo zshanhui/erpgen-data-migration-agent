@@ -237,3 +237,224 @@ def link_group_node(source: str, targets, linked_doctype: str,
             f"it to that leaf with a value_map on '{qualified[0]}'."
         ),
     }
+
+
+# ------------------------------------------------------- data quality checks
+def _text(row: list, idx: int) -> str:
+    """Cell value as text; missing cells and None read as empty."""
+    if idx >= len(row):
+        return ""
+    cell = row[idx]
+    return "" if cell is None else str(cell)
+
+
+def duplicate_key_groups(
+    source: SourceTable,
+    key_column: str,
+    compare_columns: Optional[list[str]] = None,
+    cap: int = MAX_VALUES,
+) -> tuple[list[dict], int]:
+    """Rows that share a key value, grouped by the casefolded, stripped key.
+
+    Returns (groups, group_count). `groups` is capped; `group_count` is the true
+    number of duplicated keys, so a capped report still states the real total.
+    Rows with an empty key are not groups — `data_quality_conflicts` reports those
+    as `missing_value` instead.
+
+    `compare_columns` decides what "identical" means: when omitted (a sheet-only
+    run with no mapping), every other column is compared, which can only ever
+    report *more* differences, never fewer.
+    """
+    idx = source.column_index(key_column)
+    if idx is None:
+        return [], 0
+
+    names = list(compare_columns) if compare_columns is not None else list(source.headers)
+    compare: list[tuple[str, int]] = []
+    for name in names:
+        if name == key_column:
+            continue
+        j = source.column_index(name)
+        if j is not None:
+            compare.append((name, j))
+
+    order: list[str] = []
+    groups: dict[str, dict] = {}
+
+    for i, row in enumerate(source.rows):
+        cell = _text(row, idx)
+        raw = cell.strip()
+        if not raw:
+            continue
+        gkey = raw.casefold()
+        g = groups.get(gkey)
+        if g is None:
+            g = {
+                "key_value": gkey,
+                "values": [],
+                "rows": [],
+                "count": 0,
+                "differing": [],
+                "first": tuple(_text(row, j).strip() for _, j in compare),
+            }
+            groups[gkey] = g
+            order.append(gkey)
+        g["count"] += 1
+        g["rows"].append(i + 2)                 # spreadsheet row: header is row 1
+        if cell not in g["values"]:
+            g["values"].append(cell)          # as read: case/space variants preserved
+        for (name, j), prev in zip(compare, g["first"]):
+            if name not in g["differing"] and _text(row, j).strip() != prev:
+                g["differing"].append(name)
+
+    out: list[dict] = []
+    total = 0
+    for gkey in order:
+        g = groups[gkey]
+        if g["count"] < 2:
+            continue
+        total += 1
+        if len(out) >= cap:
+            continue
+        raw_values = g["values"]
+        out.append({
+            "key_value": gkey,
+            "values": raw_values[:cap],
+            "rows": g["rows"][:cap],
+            "count": g["count"],
+            "identical": not g["differing"],
+            "case_variant": len({v.strip() for v in raw_values}) > 1,
+            "whitespace_variant": any(v != v.strip() for v in raw_values),
+            "differing_fields": g["differing"],
+        })
+    return out, total
+
+
+def duplicate_row_conflict(
+    key_column: str,
+    groups: list[dict],
+    group_count: int,
+    key_field: str = "",
+) -> dict:
+    """One `duplicate_row` conflict for a key column.
+
+    Aggregated per column rather than per duplicated value: requirement identity
+    is `(kind, source, target, doctype, field)`, so per-value conflicts would be
+    deduped away as "already recorded" (see `context._identity_of`).
+    """
+    differing = [g for g in groups if not g["identical"]]
+    affected = sum(g["count"] for g in groups)
+    if differing:
+        detail = (f"{group_count} key value(s) appear on more than one row "
+                  f"({affected} row(s)); {len(differing)} group(s) have differing "
+                  f"values, which ERPNext would import as a second record named "
+                  f"\"<key> - 1\".")
+        action = ("resolve the conflicting cells in one row, drop the duplicate, "
+                  "or point --id-column at a column that is unique per entity.")
+    else:
+        detail = (f"{group_count} key value(s) appear on more than one row "
+                  f"({affected} row(s)); the rows are identical, so the extra "
+                  f"ones are skipped at import.")
+        action = "no action needed unless these are genuinely separate entities."
+    return {
+        "kind": "duplicate_row",
+        "severity": "error" if differing else "warning",
+        "source": key_column,
+        "target": key_field or "",
+        "groups": groups,
+        "group_count": group_count,
+        "detail": detail,
+        "suggested_action": action,
+    }
+
+
+def missing_value_conflict(
+    column: str,
+    target: str,
+    roles: list[str],
+    rows: list[int],
+    count: int,
+    cap: int = MAX_VALUES,
+) -> dict:
+    """One `missing_value` conflict for a column.
+
+    `roles` carries every reason the column matters: `key` (the row has no
+    identity) and/or `required` (ERPNext rejects the row). One conflict per
+    column, never two, because both roles share an identity tuple.
+    """
+    what = "the key column" if "key" in roles else f"required field '{target or column}'"
+    return {
+        "kind": "missing_value",
+        "severity": "error",
+        "source": column,
+        "target": target or "",
+        "roles": list(roles),
+        "rows": rows[:cap],
+        "count": count,
+        "detail": f"{count} row(s) have no value in {what}.",
+        "suggested_action": (
+            "fill the value in the source sheet or record it as a worksheet "
+            "correction; for a required field a constant can also come from "
+            "--defaults, and a blank key row is dropped at import."
+        ),
+    }
+
+
+def required_mapped_columns(parent, plan) -> list[tuple[str, str]]:
+    """(source column, target field) for required fields a column feeds.
+
+    Required fields with no column at all are a different conflict —
+    `required_missing`, raised by `analysis.build_analysis`. A field covered by
+    `plan.defaults` is not flagged: the default fills it.
+    """
+    out: list[tuple[str, str]] = []
+    for f in parent.mandatory_fields():
+        if f.fieldname in plan.defaults or f.is_fetch_field:
+            continue
+        column = next((m.source for m in plan.mappings if m.target == f.fieldname), None)
+        if column:
+            out.append((column, f.fieldname))
+    return out
+
+
+def data_quality_conflicts(
+    source: SourceTable,
+    *,
+    key_column: Optional[str] = None,
+    key_field: str = "",
+    required: Optional[list[tuple[str, str]]] = None,
+    compare_columns: Optional[list[str]] = None,
+    cap: int = MAX_VALUES,
+) -> list[dict]:
+    """The cleaning-stage conflicts for one sheet: one entry per key column and
+    per tracked required column, in a deterministic order.
+
+    Pure: no client, no network, no clock.
+    """
+    conflicts: list[dict] = []
+
+    tracked: dict[str, dict] = {}
+    if key_column:
+        tracked[key_column] = {"target": key_field or "", "roles": ["key"]}
+    for column, target in (required or []):
+        entry = tracked.setdefault(column, {"target": target or "", "roles": []})
+        if "required" not in entry["roles"]:
+            entry["roles"].append("required")
+        if not entry["target"]:
+            entry["target"] = target or ""
+
+    if key_column:
+        groups, total = duplicate_key_groups(source, key_column, compare_columns, cap)
+        if total:
+            conflicts.append(duplicate_row_conflict(key_column, groups, total, key_field))
+
+    for column, entry in tracked.items():
+        idx = source.column_index(column)
+        if idx is None:
+            continue
+        rows = [i + 2 for i, row in enumerate(source.rows) if not _text(row, idx).strip()]
+        if rows:
+            conflicts.append(missing_value_conflict(
+                column, entry["target"], entry["roles"], rows, len(rows), cap))
+
+    return conflicts

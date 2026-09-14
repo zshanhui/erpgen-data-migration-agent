@@ -24,6 +24,7 @@ MINIMAL_ARGV = {
     "create-record": ["UOM", "--fields", '{"uom_name": "Dozen"}'],
     "status": [],
     "delete": ["--doctype", "Item", "--names", "A"],
+    "clean": ["samples/items.csv"],
     "agent": ["--source", "samples/items.csv"],
 }
 

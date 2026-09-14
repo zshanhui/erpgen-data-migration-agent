@@ -576,6 +576,22 @@ MUTATIONS = [
         (CF, '        if (_DT_CANONICAL.get(kind, ""), field) in LEAF_ONLY_LINKS:',
              '        if False:  # MUTANT'),
     ], "tests/test_party_sheets.py::test_a_customer_group_node_is_reported_not_a_missing_record"),
+    # ---- phase 1: cleaning-stage detectors -------------------------------
+    ("bug: duplicate groups not aggregated per key column", [
+        (CFF, '            conflicts.append(duplicate_row_conflict(key_column, groups, total, key_field))',
+              '            for _g in groups:\n'
+              '                conflicts.append(duplicate_row_conflict(key_column, [_g], 1, key_field))'),
+    ], "tests/test_dataclean.py::test_multiple_groups_aggregate_into_one_conflict"),
+
+    ("bug: key grouping is case-sensitive", [
+        (CFF, '        gkey = raw.casefold()', '        gkey = raw  # MUTANT'),
+    ], "tests/test_dataclean.py::test_case_variant_identical_is_a_warning_with_the_flag"),
+
+    ("bug: required-field check ignores plan.defaults", [
+        (CFF, '        if f.fieldname in plan.defaults or f.is_fetch_field:',
+              '        if f.is_fetch_field:  # MUTANT'),
+    ], "tests/test_dataclean.py::test_required_columns_helper_skips_fields_with_no_column_or_a_default"),
+
 ]
 
 
