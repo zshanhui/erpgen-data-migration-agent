@@ -152,3 +152,50 @@ def test_save_analysis_returns_a_named_artifact(tmp_path):
 
 def test_default_keep_is_the_documented_cap():
     assert KEEP_PER_DOCTYPE == 10
+
+
+# --------------------------------------------------------------- lookups
+def test_paths_match_the_doctype_slug_exactly(tmp_path):
+    """A prefix match is wrong: `analysis-customer-*` also matches Customer Group,
+    and the longer slug sorts *after* the timestamp, so the wrong file wins."""
+    from erpgen.analysis import analysis_paths
+
+    _write(tmp_path, "customer", "20260914-100000000001")
+    _write(tmp_path, "customer-group", "20260914-100000000002")
+    _write(tmp_path, "item", "20260914-100000000003")
+
+    paths = analysis_paths("Customer", tmp_path)
+    assert [p.name for p in paths] == ["analysis-customer-20260914-100000000001.json"]
+
+
+def test_paths_of_a_multi_word_doctype(tmp_path):
+    from erpgen.analysis import analysis_paths
+
+    _write(tmp_path, "customer-group", "20260914-100000000001")
+    _write(tmp_path, "customer", "20260914-100000000002")
+    assert [p.name for p in analysis_paths("Customer Group", tmp_path)] == [
+        "analysis-customer-group-20260914-100000000001.json"]
+
+
+def test_paths_ignore_files_that_do_not_match_the_convention(tmp_path):
+    from erpgen.analysis import analysis_paths
+
+    _write(tmp_path, "customer", "20260914-100000000001")
+    (tmp_path / "analysis-customer-notes.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "run-customer-20260914.jsonl").write_text("", encoding="utf-8")
+    assert len(analysis_paths("Customer", tmp_path)) == 1
+
+
+def test_latest_analysis_resolves_the_right_doctype(tmp_path, monkeypatch):
+    from erpgen import agent
+
+    d = tmp_path / "analysis"        # latest_analysis looks in ROOT/"analysis"
+    d.mkdir()
+    _write(d, "customer", "20260914-100000000001")
+    _write(d, "customer-group", "20260914-100000000002")
+    (d / "analysis-customer-20260914-100000000001.json").write_text(
+        '{"doctype": "Customer"}', encoding="utf-8")
+    monkeypatch.setattr(agent, "ROOT", tmp_path)
+
+    assert agent.latest_analysis("Customer")["doctype"] == "Customer"
+    assert agent.latest_analysis("Nothing Here") is None

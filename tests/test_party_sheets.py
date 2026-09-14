@@ -838,12 +838,21 @@ def test_resolved_column_is_no_longer_an_unmapped_conflict():
 
 def test_values_from_rows_that_cannot_import_are_ignored():
     """A junk value in a row with no party name is skipped at import — it must not
-    become a phantom conflict the agent would "fix" with junk master data."""
+    become a phantom conflict the agent would "fix" with junk master data.
+
+    The blank party name itself *is* reported (phase 3): that row cannot import and
+    saying so is the point. What must not appear is a link conflict built from a
+    dropped row's junk values.
+    """
     nameless = ["", "Company", "Raw Material", "Edge Contact", "edge@x.example", "",
                 "Billing", "1 Edge St", "Edgeville", "", "00000", "EdgeCountry"]
     a = _analysis(_site(), SUPPLIER_HEADERS, [SHENZHEN_ROW, nameless])
     assert _kinds(a, "link_value_conflict") == []
-    assert a["conflicts"] == [], "the nameless row is dropped, not a conflict source"
+    assert [c["kind"] for c in a["conflicts"]] == ["missing_value"]
+    (blank_key,) = _kinds(a, "missing_value")
+    assert blank_key["source"] == "Supplier Name"
+    assert blank_key["roles"] == ["key", "required"]    # the row is dropped at import
+    assert blank_key["rows"] == [3]
 
 
 def test_link_conflict_clears_once_the_records_exist():

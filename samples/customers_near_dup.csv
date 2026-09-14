@@ -1,0 +1,13 @@
+Customer Name,Customer Type,Group,Territory,Email,Phone,Tax ID
+Acme Steel Works,Company,Commercial,All Territories,accounts@acme.example,+65 6111 0001,SG-2001
+Acme Steel Work,Company,Commercial,All Territories,ap@acme.example,+65 6111 0002,SG-2002
+Bluedot Logistics,Company,Wholesale,All Territories,ops@bluedot.example,+65 6111 0003,SG-2003
+Bluedot Logisitcs,Company,Wholesale,All Territories,finance@bluedot.example,+65 6111 0004,SG-2004
+Cascade Auto Parts,Company,Commercial,All Territories,sales@cascade.example,+65 6111 0005,SG-2005
+Cascade Auto Parts Pte Ltd,Company,Commercial,All Territories,ar@cascade.example,+65 6111 0006,SG-2006
+Granite Bay Landscaping,Company,Commercial,All Territories,hello@granitebay.example,+65 6111 0007,SG-2007
+Landscaping Granite Bay,Company,Commercial,All Territories,info@granitebay.example,+65 6111 0008,SG-2008
+Pine Ridge Cabinetry,Company,Wholesale,All Territories,orders@pineridge.example,+65 6111 0009,SG-2009
+Northwind Timber Supply,Company,Wholesale,All Territories,orders@pineridge.example,+65 6111 0010,SG-2010
+Delta Plastics,Company,Commercial,All Territories,ap@deltaplastics.example,+65 6111 0011,SG-2011
+Delta Metals,Company,Commercial,All Territories,ap@deltametals.example,+65 6111 0012,SG-2012

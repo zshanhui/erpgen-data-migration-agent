@@ -21,9 +21,11 @@ from pathlib import Path
 from typing import Optional
 
 from .client import ERPNextClient
-from .conflicts import (LEAF_ONLY_LINKS, distinct_values, fieldtype_for,
-                        group_node_values, link_group_node, link_value_conflict,
-                        missing_link_values, suggested_custom_field,
+from .conflicts import (LEAF_ONLY_LINKS, data_quality_conflicts, distinct_values,
+                        fieldtype_for, group_node_values, link_group_node,
+                        link_value_conflict, missing_link_values,
+                        possible_duplicate_pairs, possible_duplicate_row_conflict,
+                        required_mapped_columns, suggested_custom_field,
                         unmapped_column_conflict)
 from .mapper import MappingEngine, MappingPlan
 from .source import SourceTable
@@ -33,6 +35,20 @@ from .tree import without_self_provided
 def _snake(label: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "_", label.strip()).strip("_").lower()
     return re.sub(r"_+", "_", s)
+
+
+def _mapped_field(plan: MappingPlan, column: Optional[str]) -> str:
+    """The target field a source column maps to, or "" when unmapped.
+
+    Employee's `Emp ID` is the shape this covers: a sheet's real key column that
+    the mapper has no field for.
+    """
+    if not column:
+        return ""
+    for m in plan.mappings:
+        if m.source == column and m.target:
+            return m.target
+    return ""
 
 
 def build_analysis(
@@ -114,6 +130,26 @@ def build_analysis(
                     conflicts.append(link_group_node(
                         m.source, [m.target], linked, nodes))
 
+    # ---- cleaning stage: duplicate keys and empty required/key values -------
+    # pure and offline, so it costs nothing beyond the scan
+    conflicts.extend(data_quality_conflicts(
+        source,
+        key_column=id_column,
+        key_field=_mapped_field(plan, id_column),
+        required=required_mapped_columns(engine.parent, plan),
+        compare_columns=[m.source for m in plan.mappings if m.target],
+    ))
+
+    # ---- near duplicates: review-only, never a gate ------------------------
+    if id_column:
+        pairs, pair_count, skipped = possible_duplicate_pairs(
+            source, id_column,
+            compare_columns=[m.source for m in plan.mappings if m.target],
+        )
+        if pair_count:
+            conflicts.append(possible_duplicate_row_conflict(
+                id_column, pairs, pair_count, _mapped_field(plan, id_column), skipped))
+
     covered = set(plan.mapped_fields()) | set(plan.defaults.keys())
     for f in engine.parent.mandatory_fields():
         if f.fieldname not in covered and not f.is_fetch_field:
@@ -136,6 +172,16 @@ def build_analysis(
         "- link_group_node -> the value exists but is a Group node; the field needs "
         "a leaf, so remap the value onto a leaf instead of creating anything.\n"
         "- required_missing -> supply --defaults or map a source column.\n"
+        "- duplicate_row -> resolve the conflicting cells in one row, drop the "
+        "duplicate, or point --id-column at a column that is unique per entity. "
+        "You cannot invent the missing value yourself.\n"
+        "- missing_value -> the cell is empty in the source sheet; record the value "
+        "as a worksheet correction, or use --defaults when a constant is legitimate. "
+        "You cannot invent the value yourself.\n"
+        "- possible_duplicate_row -> review-only (warning): two rows may be the same "
+        "entity spelled two ways. Decide per pair and record it as a worksheet "
+        "correction (merge_rows, or dismiss_conflict when they are genuinely "
+        "separate). Do not block the import on this.\n"
         "Do not import until every 'error'-severity conflict is resolved."
     )
 
@@ -173,6 +219,23 @@ KEEP_PER_DOCTYPE = 10
 
 #: analysis-<doctype-slug>-<YYYYMMDD>-<HHMMSSffffff>.json
 _ANALYSIS_NAME = re.compile(r"^analysis-(?P<slug>.+)-(?P<stamp>\d{8}-\d{12,})\.json$")
+
+
+def analysis_paths(doctype: str, analysis_dir: str | Path = "analysis") -> list[Path]:
+    """Analysis files for **exactly** this doctype, oldest first.
+
+    Matching on the slug prefix is not enough: `analysis-customer-*.json` also
+    matches a Customer Group file, and since the timestamp begins with a digit
+    while the longer slug continues with a letter, the wrong file sorts last —
+    so a prefix match silently returns another doctype's analysis.
+    """
+    slug = doctype.lower().replace(" ", "-")
+    out: list[Path] = []
+    for path in Path(analysis_dir).glob("analysis-*.json"):
+        m = _ANALYSIS_NAME.match(path.name)
+        if m and m.group("slug") == slug:
+            out.append(path)
+    return sorted(out, key=lambda p: p.name)
 
 
 def prune_analyses(analysis_dir: str | Path,

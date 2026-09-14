@@ -59,6 +59,8 @@ from erpgen.analysis import build_analysis, save_analysis  # noqa: E402
 from erpgen.client import ERPNextClient  # noqa: E402
 from erpgen.conflicts import (  # noqa: E402
     data_quality_conflicts,
+    possible_duplicate_pairs,
+    possible_duplicate_row_conflict,
     required_mapped_columns,
 )
 from erpgen.context import (  # noqa: E402
@@ -263,7 +265,9 @@ def cmd_map(args) -> int:
         print(f"  {len(analysis['known_mappings'])} contract columns, "
               f"{len(analysis['extra_columns'])} out-of-contract column(s)")
         for c in analysis["conflicts"]:
-            print(f"  [{c['severity']:<7}] {c['source']:<18} "
+            # the kind is part of the line: two conflicts on one column (a blank
+            # key and a duplicate key) are otherwise indistinguishable
+            print(f"  [{c['severity']:<7}] {c['kind']:<18} {c['source']:<18} "
                   f"-> {c.get('target') or c.get('suggested_action')}")
         return 0
     if not args.doctype:
@@ -315,6 +319,26 @@ def _import_flat_party_sheet(args, source, party: str) -> int:
     flow = flow_for_party(party)
     defaults = json.loads(args.defaults) if args.defaults else {}
     flat_mappings = load_flat_mappings(args.overrides or DEFAULT_OVERRIDES, flow)
+
+    # ---- analysis + fail-before-apply gate ----
+    # The relational path refuses while error-severity conflicts remain; a flat
+    # row feeds THREE doctypes at once, so an unresolved error here can corrupt
+    # all three. Same contract, same escape hatch.
+    analysis = build_party_sheet_analysis(
+        client, source, party, base_url=args.base, source_path=args.source,
+        flat_mappings=flat_mappings)
+    apath = save_analysis(analysis, args.analysis_dir)
+    print(f"Analysis saved to {apath}  ({len(analysis['conflicts'])} conflicts)")
+
+    errs = [c for c in analysis["conflicts"] if c["severity"] == "error"]
+    if args.apply and errs and not args.bypass_conflicts:
+        print(f"\nERROR: {len(errs)} error-severity conflict(s) remain:")
+        for c in errs:
+            print(f"  [{c['kind']}] {c.get('source') or c.get('field')}")
+        print("Resolve them (set-mapping / createfield / create_record) and re-run, "
+              "or pass --bypass-conflicts to import anyway.")
+        return 2
+
     logger = RunLogger(args.log_dir, tag=flow) if args.apply else None
     journal = (_effect_sink(args, doctype=party, source=args.source, command="import")
                if args.apply else None)
@@ -329,7 +353,7 @@ def _import_flat_party_sheet(args, source, party: str) -> int:
     if journal:
         journal.close(status="ok")
         n = journal.count if hasattr(journal, "count") else getattr(journal, "effects", 0)
-        print(f"Journal: {journal.path}  ({n} revertible effect(s))")
+        print(journal.summary())
     _report_out_of_contract(args, client, source, party, flat_mappings)
     return 0
 
@@ -566,7 +590,7 @@ def cmd_import(args) -> int:
               f"{len(journal.pending_requirements())} requirement(s) still pending)")
         print(f"  revert the whole migration: python3 erpgen.py revert {args.run} --apply")
     else:
-        print(f"Journal: {journal.path}  ({journal.count} revertible effect(s))")
+        print(journal.summary())
     return 0
 
 
@@ -706,7 +730,7 @@ def cmd_set_mapping(args) -> int:
                                  command="set-mapping")
             sink.override_set(args.doctype, args.unset, None, prev, path)
             sink.close()
-            print(f"Journal: {sink.path}")
+            print(sink.summary())
         return 0
 
     if not args.column or not args.target:
@@ -753,7 +777,7 @@ def cmd_set_mapping(args) -> int:
     if hasattr(sink, "config_delta"):
         sink.config_delta(path, args.doctype, {"mappings": {args.column: args.target}})
     sink.close()
-    print(f"Journal: {sink.path}")
+    print(sink.summary())
     return 0
 
 
@@ -793,6 +817,13 @@ def cmd_clean(args) -> int:
         required=required, compare_columns=compared,
     )
 
+    # near duplicates: a review list, so warning-only and never gated
+    pairs, pair_count, skipped = possible_duplicate_pairs(
+        source, key_column, compare_columns=compared)
+    if pair_count:
+        conflicts.append(possible_duplicate_row_conflict(
+            key_column, pairs, pair_count, key_field, skipped))
+
     if args.json:
         print(json.dumps(conflicts, indent=2, default=str))
     else:
@@ -812,6 +843,16 @@ def cmd_clean(args) -> int:
                                      " whitespace" if g["whitespace_variant"] else ""])
                     print(f"      {g['key_value']!r} rows {g['rows']} "
                           f"({g['count']}x){flags}{differs}")
+            elif c["kind"] == "possible_duplicate_row":
+                print(f"  [{c['severity']:<7}] possible_dup   {c['source']:<20} "
+                      f"{c['pair_count']} pair(s) to review")
+                for pr in c["pairs"]:
+                    print(f"      row {pr['a']['row']} {pr['a']['value']!r} ~ "
+                          f"row {pr['b']['row']} {pr['b']['value']!r}  "
+                          f"({', '.join(pr['signals'])})")
+                if c.get("signal_a_skipped"):
+                    print("      name similarity skipped: sheet exceeds "
+                          "MAX_PAIRS_ROWS")
             else:
                 roles = ",".join(c["roles"])
                 print(f"  [{c['severity']:<7}] missing_value  {c['source']:<20} "
@@ -981,7 +1022,8 @@ def cmd_revert(args) -> int:
         except FileNotFoundError:
             path = args.log
     if path is None:
-        run = latest_run(args.latest, args.log_dir) if args.latest else None
+        run = (latest_run(args.latest, args.log_dir, require_effects=True)
+               if args.latest else None)
         path = str(run) if run else _resolve_log(args, "journal-")
     data = parse_journal(path)
     if not data["effects"]:

@@ -160,3 +160,50 @@ def test_latest_run_falls_back_when_everything_was_reverted(tmp_path):
     only = _run_file(logs / "run-only.jsonl", "only")
     mark_reverted(only, "only", 1, "ok")
     assert latest_run("Item", logs) == only
+
+
+# ------------------------------------------- preferring logs with something to undo
+def test_latest_run_prefers_the_newest_log_that_has_effects(tmp_path):
+    """`revert` needs work to undo: a log that changed nothing must not shadow an
+    older one that did."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    with_effects = _run_file(logs / "run-older.jsonl", "older", effects=2)
+    empty = write_journal(logs / "journal-item-20260914-000001.jsonl", [],
+                          doctype="Item")           # run_start only
+    _set_mtime(with_effects, time.time() - 500)
+    _set_mtime(empty, time.time())
+
+    # without the flag the newest still wins (that is `status --latest`)
+    assert latest_run("Item", logs) == empty
+    # with it, the empty log is passed over
+    assert latest_run("Item", logs, require_effects=True) == with_effects
+
+
+def test_latest_run_falls_back_to_the_newest_when_nothing_has_effects(tmp_path):
+    """Better a resolvable path than none: the caller can still say what it found,
+    and this keeps legacy empty journals from breaking the lookup."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    older = write_journal(logs / "journal-item-20260914-000001.jsonl", [],
+                          doctype="Item")
+    newer = write_journal(logs / "journal-item-20260914-000002.jsonl", [],
+                          doctype="Item")
+    _set_mtime(older, time.time() - 500)
+    _set_mtime(newer, time.time())
+
+    assert latest_run("Item", logs, require_effects=True) == newer
+
+
+def test_latest_run_with_effects_still_skips_reverted_logs(tmp_path):
+    from erpgen.journal import mark_reverted
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    older = _run_file(logs / "run-older.jsonl", "older", effects=1)
+    newer = _run_file(logs / "run-newer.jsonl", "newer", effects=1)
+    _set_mtime(older, time.time() - 500)
+    _set_mtime(newer, time.time())
+    mark_reverted(newer, "newer", 1, "ok")
+
+    assert latest_run("Item", logs, require_effects=True) == older

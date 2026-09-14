@@ -15,6 +15,7 @@ Journal file: `logs/journal-<doctype>-<timestamp>.jsonl`, one JSON per line:
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -22,6 +23,15 @@ from typing import Optional
 from .client import ERPNextClient
 
 JOURNAL_PREFIX = "journal-"
+
+#: How many journal files to keep on disk. Beyond this the oldest are deleted,
+#: but never one whose effects are still un-reverted: that file IS the undo path
+#: for changes already applied. `run-*.jsonl` contexts are not pruned — they hold
+#: requirements and the audit of a whole `--run` migration.
+KEEP_JOURNALS = 20
+
+#: `journal-<doctype-slug>-<YYYYMMDD>-<HHMMSSffffff>.jsonl`
+_JOURNAL_NAME = re.compile(r"^journal-(?P<slug>.+)-(?P<stamp>\d{8}-\d{12,})\.jsonl$")
 
 
 class MigrationJournal:
@@ -36,14 +46,36 @@ class MigrationJournal:
         self.doctype = doctype
         self.path = d / f"{JOURNAL_PREFIX}{doctype.lower().replace(' ', '-')}-{stamp}.jsonl"
         self.count = 0
-        self._fh = self.path.open("w", encoding="utf-8")
-        self._log(event="run_start", run_id=self.run_id, doctype=doctype,
-                  source=source, base_url=base_url)
+        self._closed = False
+        # the file is not created until there is an effect to record: a run that
+        # changed nothing has nothing to undo, and an empty journal only makes
+        # `--latest` point at a file with nothing in it
+        self._dir = d
+        self._fh = None
+        self.pruned: list[Path] = []
+        self.retention_kept: list[Path] = []
+        self._header = {"event": "run_start", "run_id": self.run_id,
+                        "doctype": doctype, "source": source, "base_url": base_url}
 
-    def _log(self, **entry) -> None:
+    @property
+    def created(self) -> bool:
+        """True once an effect has been written, i.e. the file exists."""
+        return self._fh is not None
+
+    def _write(self, entry: dict) -> None:
         row = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), **entry}
         self._fh.write(json.dumps(row, default=str) + "\n")
         self._fh.flush()
+
+    def _ensure_open(self) -> None:
+        """Create the file on first use, with `run_start` ahead of whatever follows."""
+        if self._fh is None:
+            self._fh = self.path.open("w", encoding="utf-8")
+            self._write(self._header)
+
+    def _log(self, **entry) -> None:
+        self._ensure_open()
+        self._write(entry)
 
     def effect(self, kind: str, inverse: dict, **detail) -> None:
         """Record an applied effect plus the inverse that undoes it."""
@@ -79,9 +111,40 @@ class MigrationJournal:
                      "previous": previous, "path": overrides_path},
                     doctype=doctype, column=column, target=target)
 
-    def close(self) -> None:
-        self._log(event="run_end", run_id=self.run_id, effects=self.count)
+    def close(self, status: str = "ok") -> None:
+        """Close the journal, recording the outcome.
+
+        `status` exists so this matches `MigrationContext.close`: callers hold one
+        or the other (`_effect_sink`) and must not have to branch on which, which
+        is how the flat import ended up calling this with a keyword it did not
+        accept. A journal that recorded no effects leaves no file behind.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._fh is None:
+            return
+        self._write({"event": "run_end", "run_id": self.run_id,
+                     "effects": self.count, "status": status})
         self._fh.close()
+        # retention runs once the file is complete, so it is never a candidate
+        self.pruned, self.retention_kept = prune_journals(self._dir, protect=self.path)
+
+    def summary(self) -> str:
+        """The operator-facing line(s): the undo path, or that there is nothing to undo.
+
+        Retention is appended when it did something, so a capped or blocked prune
+        is visible rather than silent.
+        """
+        if not self.created:
+            return "Nothing to undo: no effects were recorded."
+        line = f"Journal: {self.path}  ({self.count} revertible effect(s))"
+        if self.pruned:
+            line += f"  [pruned {len(self.pruned)} older journal(s)]"
+        if self.retention_kept:
+            line += (f"  [{len(self.retention_kept)} older journal(s) kept: their "
+                     f"effects are not reverted yet]")
+        return line
 
 
 # ---- reading / reverting ------------------------------------------------
@@ -192,6 +255,58 @@ def mark_reverted(path: str | Path, run_id: str, reverted: int, status: str) -> 
         fh.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                              "event": "revert", "run_id": run_id, "reverted": reverted,
                              "status": status}, default=str) + "\n")
+
+
+def _journal_state(path: Path) -> tuple[int, bool]:
+    """(effect count, already reverted) for a journal file."""
+    data = parse_journal(path)
+    return len(data["effects"]), already_reverted(data) is not None
+
+
+def prune_journals(log_dir: str | Path, keep: int = KEEP_JOURNALS,
+                   protect: Optional[Path] = None) -> tuple[list[Path], list[Path]]:
+    """Delete the oldest journal files beyond `keep`, safest first.
+
+    Returns `(deleted, kept_over_cap)`. A file with un-reverted effects is never
+    deleted, so the cap is best-effort: if too many carry live effects, the cap
+    cannot be met and the leftovers are reported instead of silently destroyed.
+    Empty and already-reverted journals are deleted oldest-first, which is what
+    makes the cap hold in normal use.
+
+    `protect` is the journal that is currently open and must never be a candidate.
+    Only `journal-*.jsonl` files are considered.
+    """
+    d = Path(log_dir)
+    guard = Path(protect).resolve() if protect else None
+
+    def creation_key(f: Path) -> tuple[str, float]:
+        """Order by the stamp in the name, not mtime.
+
+        Reverting appends a marker, which touches mtime — ordering by it would let
+        an ancient reverted journal look newest and escape retention.
+        """
+        m = _JOURNAL_NAME.match(f.name)
+        return (m.group("stamp") if m else "", f.stat().st_mtime)
+
+    # the open journal counts towards the cap; it is skipped when deleting, never
+    # removed from the list, or the count would be short by one
+    files = sorted(d.glob(f"{JOURNAL_PREFIX}*.jsonl"), key=creation_key, reverse=True)
+
+    deleted: list[Path] = []
+    kept: list[Path] = []
+    for f in files[keep:]:                       # oldest first within the overflow
+        if guard is not None and f.resolve() == guard:
+            continue
+        effects, reverted = _journal_state(f)
+        if effects and not reverted:
+            kept.append(f)                       # never destroy the undo path
+            continue
+        try:
+            f.unlink()
+        except OSError:
+            continue
+        deleted.append(f)
+    return deleted, sorted(kept)
 
 
 def revert_journal(client: ERPNextClient, path: str | Path,

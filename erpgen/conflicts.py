@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from .cleaning_utils import (compare_key, levenshtein, token_signature,
+                             within_distance)
 from .client import ERPNextClient
 from .source import SourceTable
 
@@ -458,3 +460,191 @@ def data_quality_conflicts(
                 column, entry["target"], entry["roles"], rows, len(rows), cap))
 
     return conflicts
+
+
+# ------------------------------------------------------ possible duplicates
+#: Bounded edit distance for signal A: catches a one- or two-character typo while
+#: still rejecting a genuinely different name.
+NEAR_DUP_K = 2
+
+#: Signal A is all-pairs (`O(rows²)`), measured at ~14 s for 2,000 rows. Above this
+#: it is skipped and signal B — which is `O(rows)` — still runs.
+MAX_PAIRS_ROWS = 2000
+
+#: A shared value is evidence of a duplicate row only when the column is
+#: near-unique in this sheet (`customer_group` is shared legitimately), well
+#: populated (a sparse free-text column like `Notes` is near-unique by nature) and
+#: textual (a credit limit is near-unique and populated, but sharing one means
+#: nothing).
+IDENTIFIER_UNIQUE = 0.9
+IDENTIFIER_POPULATED = 0.5
+MAX_IDENTIFIER_COLUMNS = 5
+
+#: fixed order, so `signals` never depends on discovery order
+SIGNAL_ORDER = ("key_fuzzy", "token_reorder", "shared_identifier")
+
+
+def identifier_columns(source: SourceTable, key_column: Optional[str],
+                       cap: int = MAX_IDENTIFIER_COLUMNS) -> list[str]:
+    """Columns whose shared value suggests two rows are the same entity."""
+    out: list[str] = []
+    for profile in source.profiles:
+        header = profile.header
+        if header == key_column or header in out:
+            continue
+        if profile.inferred_type != "text":
+            continue
+        if profile.unique < IDENTIFIER_UNIQUE or profile.non_empty < IDENTIFIER_POPULATED:
+            continue
+        out.append(header)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def possible_duplicate_pairs(
+    source: SourceTable,
+    key_column: str,
+    *,
+    compare_columns: Optional[list[str]] = None,
+    identifiers: Optional[list[str]] = None,
+    k: int = NEAR_DUP_K,
+    max_pairs_rows: int = MAX_PAIRS_ROWS,
+    cap: int = MAX_VALUES,
+) -> tuple[list[dict], int, bool]:
+    """Row pairs whose keys look like one entity spelled two ways.
+
+    Returns `(pairs, pair_count, signal_a_skipped)`. `pair_count` is the true total
+    while `pairs` is capped, and pairs are ordered by spreadsheet row so the report
+    is stable across runs.
+
+    A pair is reported when **either** route holds:
+
+    * **signal A** — `within_distance(compare_key(a), compare_key(b), k)`, or the
+      two share a token signature (reordered words)
+    * **signal B** — they share an exact value in an `identifier_columns` column
+
+    Signal B is exempt from the fuzzy confirmation on purpose: a shared email under
+    differently spelled names is exactly what signal A cannot see, and it is
+    stronger evidence than a one-character difference.
+
+    Pairs with *equal* keys are excluded — those belong to `duplicate_row`, and
+    reporting them twice would double-count one defect.
+    """
+    if not key_column:
+        return [], 0, False
+    key_idx = source.column_index(key_column)
+    if key_idx is None:
+        return [], 0, False
+
+    # (orig_index, row_no, raw, compare_key, token_signature, dup_key) — the
+    # original index is kept because blank-key rows are filtered out and positions
+    # shift. `dup_key` is `duplicate_row`'s grouping key, NOT the comparison key:
+    # `"Acme Steel"` and `"Acme Steel Pte Ltd"` share a comparison key but are
+    # different groups for `duplicate_row`, so they are a near-duplicate here.
+    rows: list[tuple[int, int, str, str, str, str]] = []
+    for i, row in enumerate(source.rows):
+        raw = _text(row, key_idx).strip()
+        if not raw:
+            continue                       # a blank key is `missing_value`'s job
+        rows.append((i, i + 2, raw, compare_key(raw), token_signature(raw),
+                     raw.casefold()))
+
+    candidates: dict[tuple[int, int], dict] = {}     # insertion-ordered
+
+    def pair(i: int, j: int) -> dict:
+        entry = candidates.get((i, j))
+        if entry is None:
+            entry = {"signals": []}
+            candidates[(i, j)] = entry
+        return entry
+
+    skipped = len(rows) > max_pairs_rows
+    if not skipped:
+        for i in range(len(rows)):
+            for j in range(i + 1, len(rows)):
+                if rows[i][5] == rows[j][5]:
+                    continue                 # same group: `duplicate_row` has it
+                if within_distance(rows[i][3], rows[j][3], k):
+                    pair(i, j)["signals"].append("key_fuzzy")
+                if rows[i][4] == rows[j][4]:
+                    entry = pair(i, j)
+                    if "token_reorder" not in entry["signals"]:
+                        entry["signals"].append("token_reorder")
+
+    columns = identifier_columns(source, key_column) if identifiers is None else identifiers
+    for column in columns:
+        idx = source.column_index(column)
+        if idx is None:
+            continue
+        first_seen: dict[str, int] = {}
+        for pos, (orig, _no, _raw, _key, _sig, dup_key) in enumerate(rows):
+            value = _text(source.rows[orig], idx).strip()
+            if not value:
+                continue                     # a blank is not a shared identifier
+            first = first_seen.get(value)
+            if first is None:
+                first_seen[value] = pos      # pairs are formed against the first
+                continue                     # occurrence, so 3 rows give 2 pairs
+            if rows[first][5] == dup_key:
+                continue                     # same group: `duplicate_row` has it
+            entry = pair(first, pos)
+            if "shared_identifier" not in entry["signals"]:
+                entry["signals"].append("shared_identifier")
+            entry.setdefault("shared_fields", []).append(column)
+
+    compared = [(name, source.column_index(name))
+                for name in (compare_columns if compare_columns is not None
+                             else source.headers)
+                if name != key_column]
+    compared = [(name, idx) for name, idx in compared if idx is not None]
+
+    out: list[dict] = []
+    for (i, j) in sorted(candidates):
+        entry = candidates[(i, j)]
+        out.append({
+            "a": {"row": rows[i][1], "value": rows[i][2]},
+            "b": {"row": rows[j][1], "value": rows[j][2]},
+            "edit_distance": levenshtein(rows[i][3], rows[j][3]),
+            "signals": sorted(set(entry["signals"]), key=SIGNAL_ORDER.index),
+            "shared_fields": sorted(set(entry.get("shared_fields", []))),
+            "differing_fields": [
+                name for name, idx in compared
+                if _text(source.rows[rows[i][0]], idx).strip()
+                != _text(source.rows[rows[j][0]], idx).strip()],
+        })
+
+    return out[:cap], len(candidates), skipped
+
+
+def possible_duplicate_row_conflict(
+    key_column: str,
+    pairs: list[dict],
+    pair_count: int,
+    key_field: str = "",
+    skipped_signal_a: bool = False,
+) -> dict:
+    """One `possible_duplicate_row` conflict for a key column.
+
+    Always `warning`: `"Acme Steel"` in two cities may be two genuine entities, so
+    this is a review list, never a gate. Aggregated per key column like
+    `duplicate_row`, for the same requirement-identity reason.
+    """
+    detail = (f"{pair_count} pair(s) of rows may be one entity spelled two ways.")
+    if skipped_signal_a:
+        detail += (f" Name similarity was skipped: more than {MAX_PAIRS_ROWS} rows "
+                   f"and that comparison is quadratic.")
+    return {
+        "kind": "possible_duplicate_row",
+        "severity": "warning",
+        "source": key_column,
+        "target": key_field or "",
+        "pairs": pairs,
+        "pair_count": pair_count,
+        "signal_a_skipped": bool(skipped_signal_a),
+        "detail": detail,
+        "suggested_action": (
+            "review each pair: merge them, unify the spelling with a value_map, or "
+            "dismiss the conflict if they are genuinely separate entities."
+        ),
+    }

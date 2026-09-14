@@ -29,12 +29,14 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .client import ERPNextClient
-from .conflicts import (LEAF_ONLY_LINKS, distinct_values, fieldtype_for,
-                        group_node_values, link_group_node, link_value_conflict,
-                        missing_link_values, suggested_custom_field,
+from .conflicts import (LEAF_ONLY_LINKS, data_quality_conflicts, distinct_values,
+                        fieldtype_for, group_node_values, link_group_node,
+                        link_value_conflict, missing_link_values,
+                        possible_duplicate_pairs, possible_duplicate_row_conflict,
+                        required_mapped_columns, suggested_custom_field,
                         unmapped_column_conflict)
 from .logger import RunLogger
-from .mapper import MappingEngine, convert_value
+from .mapper import ColumnMapping, MappingEngine, MappingPlan, convert_value
 from .metadata import fetch_with_children
 from .source import SourceTable
 
@@ -778,9 +780,72 @@ def _agent_instructions(party: str, flow: str) -> str:
         "- link_group_node -> the value exists but is a Group node, and this field "
         "needs a leaf (ERPNext rejects a Group node on a party). Remap the value "
         "onto a leaf with a value_map; do not create the group again.\n"
+        "- duplicate_row -> the same party name appears on more than one row. "
+        "Resolve the conflicting cells in one row, drop the duplicate, or point "
+        "--id-column at a column that is unique per entity. The value cannot be "
+        "invented.\n"
+        "- missing_value -> the cell is empty in the source sheet; record the value "
+        "as a worksheet correction, or use --defaults when a constant is "
+        "legitimate. The value cannot be invented.\n"
+        "- possible_duplicate_row -> review-only (warning): two rows may be one "
+        "entity spelled two ways. Decide per pair and record it as a worksheet "
+        "correction; do not block the import on this.\n"
         "After resolving, re-run map to confirm the conflicts are gone, then "
         "import. Do not import until the analysis has zero conflicts."
     )
+
+
+def _contract_plan(doctype: str, mapped: dict[str, str]) -> MappingPlan:
+    """A synthetic MappingPlan for one target doctype of a flat sheet.
+
+    `required_mapped_columns` reads only `plan.mappings` and `plan.defaults`, so a
+    minimal plan lets the flat flow reuse the *same* required-cell check as the
+    relational flow instead of growing a second implementation of it.
+    """
+    plan = MappingPlan(doctype=doctype)
+    plan.mappings = [ColumnMapping(header, field, 1.0, "flat_contract")
+                     for header, field in mapped.items()]
+    return plan
+
+
+def _flat_data_quality(source: SourceTable, party: str, spec: dict,
+                       fmap: dict, flat: dict,
+                       engines: dict) -> list[dict]:
+    """Duplicate keys and empty required values for a flat party sheet.
+
+    A flat row feeds three doctypes at once, so the required-cell check runs per
+    target doctype and the results merge: the key column is the party name, and
+    `Contact`/`Address` contribute their own required fields.
+    """
+    by_doctype: dict[str, dict[str, str]] = {}
+    for header, (kind, field) in {**fmap, **flat}.items():
+        if header in source.headers:
+            by_doctype.setdefault(kind, {})[header] = field
+
+    required: list[tuple[str, str]] = []
+    for kind, mapped in by_doctype.items():
+        engine = engines.get(_DT_CANONICAL.get(kind, kind))
+        if engine is None:
+            continue
+        required.extend(required_mapped_columns(
+            engine.parent, _contract_plan(engine.parent.name, mapped)))
+
+    contract_columns = [h for h in source.headers if h in set(fmap) | set(flat)]
+    conflicts = data_quality_conflicts(
+        source,
+        key_column=spec["name_column"],
+        key_field=spec["name_field"],
+        required=required,
+        compare_columns=contract_columns,
+    )
+
+    # near duplicates are a review list, never a gate
+    pairs, pair_count, skipped = possible_duplicate_pairs(
+        source, spec["name_column"], compare_columns=contract_columns)
+    if pair_count:
+        conflicts.append(possible_duplicate_row_conflict(
+            spec["name_column"], pairs, pair_count, spec["name_field"], skipped))
+    return conflicts
 
 
 def build_party_sheet_analysis(
@@ -823,6 +888,10 @@ def build_party_sheet_analysis(
     # every mapped Link column must point at records that exist, or the import
     # fails row-by-row (e.g. Supplier.payment_terms -> Payment Terms Template)
     conflicts.extend(_link_value_conflicts(client, source, spec, fmap, flat, engines))
+
+    # duplicate party rows and empty required cells, from the same detectors the
+    # relational flow uses (conflicts.py) so the two analysers cannot diverge
+    conflicts.extend(_flat_data_quality(source, party, spec, fmap, flat, engines))
 
     flow = spec["flow"]
     return {

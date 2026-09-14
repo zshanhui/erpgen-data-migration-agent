@@ -1,19 +1,22 @@
-"""Phase 1: the cleaning-stage detectors and the `clean` command.
+"""The cleaning stage: detectors, conflict builders and the `clean` command
+(phase 1), plus the analysis wiring that surfaces them to a human or agent
+(phase 2).
 
-Pure and offline — synthetic `SourceTable`s, no client, no network, no clock.
-The CLI tests run without `--doctype` so they need no ERPNext site.
+Pure and offline — synthetic `SourceTable`s and a `FakeClient`; no network. The
+CLI tests run without `--doctype` so they need no ERPNext site.
 """
 from __future__ import annotations
 
 import json
 
 import pytest
-from conftest import ROOT, make_field, make_meta, make_sheet
+from conftest import (ROOT, FakeClient, make_field, make_meta, make_sheet,
+                      run_isolated)
 
 from erpgen.conflicts import (MAX_VALUES, data_quality_conflicts,
                               duplicate_key_groups, missing_value_conflict,
                               required_mapped_columns)
-from erpgen.mapper import ColumnMapping, MappingPlan
+from erpgen.mapper import ColumnMapping, MappingEngine, MappingPlan
 
 HEADERS = ["Customer Name", "Customer Type", "Phone"]
 
@@ -232,9 +235,11 @@ def test_clean_reports_the_key_column_it_guessed(cli, capsys):
 def test_clean_json_output_is_machine_readable(cli, capsys):
     _run_clean(cli, str(ROOT / "samples/customers_dirty.csv"), "--json")
     conflicts = json.loads(capsys.readouterr().out)
-    kinds = {c["kind"] for c in conflicts}
-    assert kinds == {"duplicate_row", "missing_value"}
-    assert all(c["severity"] == "error" for c in conflicts)
+    severity = {c["kind"]: c["severity"] for c in conflicts}
+    assert set(severity) == {"duplicate_row", "missing_value", "possible_duplicate_row"}
+    assert severity["duplicate_row"] == "error"
+    assert severity["missing_value"] == "error"
+    assert severity["possible_duplicate_row"] == "warning"   # review-only
 
 
 def test_clean_rejects_an_unknown_id_column(cli, capsys):
@@ -264,3 +269,107 @@ def test_map_uses_the_shared_id_column_check(cli):
     assert cli._check_id_column(args, source) is False
     ok = cli.build_parser().parse_args(["map", "x.csv", "--id-column", "Customer Name"])
     assert cli._check_id_column(ok, source) is True
+
+
+# ------------------------------------------------- phase 2: analysis wiring
+def _customer_engine():
+    meta = make_meta("Customer", [
+        make_field("customer_name", "Customer Name", reqd=True),
+        make_field("customer_type", "Customer Type", reqd=True),
+        make_field("phone", "Phone"),
+    ])
+    return MappingEngine(meta)
+
+
+DIRTY_ROWS = [
+    ["Nimbus Forge", "Company", "1111"],
+    ["Granite Bay", "Company", "2222"],
+    ["Granite Bay", "Company", "2222"],          # identical duplicate
+    ["Harborline", "Company", "3333"],
+    ["Harborline", "Company", "9999"],           # differing duplicate
+    ["", "Company", "4444"],                     # blank key (also required)
+    ["Bluedot", "", "5555"],                     # blank required, non-key
+]
+
+
+def test_build_analysis_carries_the_data_quality_conflicts():
+    from erpgen.analysis import build_analysis
+
+    engine = _customer_engine()
+    sheet = make_sheet(["Customer Name", "Customer Type", "Phone"], DIRTY_ROWS)
+    plan = engine.suggest(sheet)
+    analysis = build_analysis(FakeClient(), sheet, plan, engine,
+                              id_column="Customer Name")
+
+    kinds = {c["kind"]: c["severity"] for c in analysis["conflicts"]}
+    assert kinds["duplicate_row"] == "error"
+    assert kinds["missing_value"] == "error"
+
+    dup = next(c for c in analysis["conflicts"] if c["kind"] == "duplicate_row")
+    assert dup["target"] == "customer_name"      # the mapped field, not the column
+    assert dup["group_count"] == 2
+
+    missing = {c["source"]: c["roles"] for c in analysis["conflicts"]
+               if c["kind"] == "missing_value"}
+    assert missing["Customer Name"] == ["key", "required"]
+    assert missing["Customer Type"] == ["required"]
+
+
+def test_build_analysis_instructions_cover_the_new_kinds():
+    from erpgen.analysis import build_analysis
+
+    engine = _customer_engine()
+    sheet = make_sheet(["Customer Name", "Customer Type", "Phone"], DIRTY_ROWS)
+    analysis = build_analysis(FakeClient(), sheet, engine.suggest(sheet), engine,
+                              id_column="Customer Name")
+    text = analysis["agent_instructions"]
+    for kind in ("duplicate_row", "missing_value"):
+        assert f"- {kind} ->" in text
+    assert "cannot invent" in text          # the agent's real constraint
+
+
+def test_build_analysis_without_a_key_column_skips_duplicate_detection():
+    """Inference can fail; the required-cell checks must still run."""
+    from erpgen.analysis import build_analysis
+
+    engine = _customer_engine()
+    sheet = make_sheet(["Customer Name", "Customer Type", "Phone"], DIRTY_ROWS)
+    analysis = build_analysis(FakeClient(), sheet, engine.suggest(sheet), engine,
+                              id_column=None)
+    kinds = {c["kind"] for c in analysis["conflicts"]}
+    assert "duplicate_row" not in kinds
+    assert "missing_value" in kinds
+
+
+def test_clean_conflicts_block_the_import_gate(cli):
+    """The gate filters on severity == 'error', so the new kinds block by kind."""
+    args = cli.build_parser().parse_args(
+        ["import", str(ROOT / "samples/customers_dirty.csv"), "--doctype", "Customer"])
+    assert args.bypass_conflicts is False
+    analysis = {"conflicts": [
+        {"kind": "duplicate_row", "severity": "error", "source": "Customer Name"},
+        {"kind": "missing_value", "severity": "error", "source": "Customer Type"},
+    ]}
+    errs = [c for c in analysis["conflicts"] if c["severity"] == "error"]
+    assert len(errs) == 2                    # what cmd_import refuses on
+
+
+def test_group_order_is_stable_across_processes(tmp_path):
+    """Group keys are strings, and Python randomises string hashing per process, so
+    a report built by iterating a set of keys varies between runs."""
+    csv_path = tmp_path / "dupes.csv"
+    csv_path.write_text(
+        "Customer Name\n" + "\n".join(
+            ["Acme Steel", "Acme Steel", "Beta Works", "Beta Works",
+             "Gamma Trading", "Gamma Trading", "Delta Supplies", "Delta Supplies"])
+        + "\n", encoding="utf-8")
+
+    script = (
+        "import json\n"
+        "from erpgen.source import read_csv\n"
+        "from erpgen.conflicts import duplicate_key_groups\n"
+        f"sheet = read_csv({str(csv_path)!r})\n"
+        "groups, total = duplicate_key_groups(sheet, 'Customer Name')\n"
+        "print(json.dumps([g['key_value'] for g in groups]))\n"
+    )
+    assert len(run_isolated(script)) == 1, "group order changed between processes"

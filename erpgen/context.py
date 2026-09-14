@@ -294,7 +294,8 @@ def load_run(run: str, log_dir: str | Path = "logs") -> dict:
     }
 
 
-def latest_run(doctype: str, log_dir: str | Path = "logs") -> Optional[Path]:
+def latest_run(doctype: str, log_dir: str | Path = "logs",
+               require_effects: bool = False) -> Optional[Path]:
     """Newest undoable migration log for this doctype.
 
     Considers both unified run files (run-<id>.jsonl) and per-command journals
@@ -323,7 +324,20 @@ def latest_run(doctype: str, log_dir: str | Path = "logs") -> Optional[Path]:
         except Exception:  # noqa: BLE001
             return False
 
-    for f in cands:
-        if not reverted(f):
-            return f
-    return cands[0] if cands else None
+    live = [f for f in cands if not reverted(f)]
+    if not live:
+        return cands[0] if cands else None
+
+    if require_effects:
+        # `revert --latest` wants something to undo: a run that changed nothing
+        # (or a context holding only requirements) would otherwise shadow an
+        # older log that does have effects
+        for f in live:
+            try:
+                from .journal import parse_journal  # noqa: PLC0415
+
+                if parse_journal(f)["effects"]:
+                    return f
+            except Exception:  # noqa: BLE001
+                continue
+    return live[0]

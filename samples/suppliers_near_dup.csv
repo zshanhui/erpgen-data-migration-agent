@@ -1,0 +1,13 @@
+Supplier Name,Supplier Type,Supplier Group,Country,Email,Phone,Tax ID
+Precision Castings Ltd,Company,Raw Material,Singapore,sales@precisioncast.example,+65 6222 0001,SG-3001
+Precision Casting Ltd,Company,Raw Material,Singapore,ar@precisioncast.example,+65 6222 0002,SG-3002
+Evergreen Packaging,Company,Hardware,Singapore,orders@evergreenpack.example,+65 6222 0003,SG-3003
+Evergreen Packagings,Company,Hardware,Singapore,ap@evergreenpack.example,+65 6222 0004,SG-3004
+Shenzhen Precision Castings,Company,Raw Material,China,export@szprecision.example,+86 755 5550 0005,CN-3005
+Precision Castings Shenzhen,Company,Raw Material,China,sales@szprecision.example,+86 755 5550 0006,CN-3006
+Ironclad Fasteners,Company,Hardware,Singapore,sales@ironclad.example,+65 6222 0007,SG-3007
+Ironclad Fastner,Company,Hardware,Singapore,ap@ironclad.example,+65 6222 0008,SG-3008
+Northwind Timber,Company,Raw Material,Singapore,purchase@northwindtim.example,+65 6222 0009,SG-3009
+Apex Industrial Supply,Company,Distributor,Singapore,purchase@northwindtim.example,+65 6222 0010,SG-3010
+Delta Metals,Company,Raw Material,Singapore,ap@deltametals.example,+65 6222 0011,SG-3011
+Delta Plastics,Company,Raw Material,Singapore,ap@deltaplastics.example,+65 6222 0012,SG-3012

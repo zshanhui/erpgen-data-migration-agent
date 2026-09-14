@@ -83,6 +83,16 @@ def within_distance(a: str, b: str, limit: int) -> bool:
     return previous[-1] <= limit
 
 
+def token_signature(value: str) -> str:
+    """Order-insensitive comparison key: the same tokens, sorted.
+
+    Catches reordering that a character-level distance misses:
+    `"Acme Steel Works"` and `"Steel Works Acme"` are 14 edits apart but share a
+    signature. Suffix tokens are dropped first, exactly as in `compare_key`.
+    """
+    return " ".join(sorted(compare_key(value).split()))
+
+
 def compare_key(value: str) -> str:
     """Normalise a value for comparison.
 

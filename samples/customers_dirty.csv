@@ -12,3 +12,5 @@ riverside packing,Company,Commercial,All Territories,hello@riverside.example,+65
 Pine Ridge Cabinetry,Company,Wholesale,All Territories,sales@pineridge.example,+65 6777 8000,SG-1008,4000,
 Pine Ridge Cabinetry ,Company,Wholesale,All Territories,sales@pineridge.example,+65 6777 8000,SG-1008,4000,
 Bluedot Logistics,,Commercial,All Territories,finance@bluedot.example,+65 6777 9000,SG-1009,9000,type missing
+Northwind Traders,Company,Commercial,All Territories,ops@northwind.example,+65 6777 9500,SG-1010,7000,
+Northwind Trader,Company,Commercial,All Territories,ops@northwind.example,+65 6777 9500,SG-1010,7000,spelling variant

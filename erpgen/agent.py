@@ -86,9 +86,15 @@ def _erpgen(args: list[str], timeout: int = 300) -> tuple[int, str]:
 
 
 def latest_analysis(doctype: str):
-    d = ROOT / "analysis"
-    pat = f"analysis-{doctype.lower().replace(' ', '-')}-*.json"
-    files = sorted(d.glob(pat))
+    """Newest analysis for exactly this doctype.
+
+    Resolution lives in `analysis.analysis_paths` because the filename slug must
+    be matched exactly: a prefix match returns a longer doctype's analysis
+    (Customer vs Customer Group).
+    """
+    from erpgen.analysis import analysis_paths  # noqa: PLC0415
+
+    files = analysis_paths(doctype, ROOT / "analysis")
     if not files:
         return None
     return json.loads(files[-1].read_text(encoding="utf-8"))
@@ -347,6 +353,16 @@ Conflict kinds and how to fix them:
 - fetch_from: the target field is read-only (populated from another doc); you
   cannot write it directly. Note it and move on.
 - required_missing: pass defaults to run_map/run_import.
+- duplicate_row: the same key appears on more than one row. Resolve the
+  conflicting cells in one row, drop the duplicate, or point --id-column at a
+  column that is unique per entity. You cannot invent a value.
+- missing_value: the cell is empty in the source sheet. Record the value as a
+  worksheet correction, or use defaults when a constant is legitimate. You cannot
+  invent the value.
+- possible_duplicate_row: WARNING only, never blocks. Two rows may be one entity
+  spelled two ways. Review the pairs: merge them, unify the spelling with a
+  value_map, or dismiss the conflict if they are genuinely separate. Do not try to
+  make this kind disappear before importing.
 
 Flat party sheets (doctype='customers_full' or 'suppliers_full'; ONE file with
 a party + Contact + Address): every conflict is an out-of-contract column and is
@@ -1201,7 +1217,7 @@ def _report_run_end(journal, transcript: Transcript) -> None:
         print(f"  revert the whole run: python3 erpgen.py revert {journal.run_id} --apply")
     else:
         journal.close()
-        print(f"\nJournal: {journal.path}  ({journal.count} revertible effect(s))")
+        print(f"\n{journal.summary()}")
         print(f"  revert with: python3 erpgen.py revert {journal.path}")
     calls = _TRANSCRIPT_CTX.get("llm_calls", 0)
     print(f"\nAgent transcript (LLM calls + tool calls + responses): {transcript.path}")

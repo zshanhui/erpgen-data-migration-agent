@@ -21,7 +21,30 @@ if str(ROOT) not in sys.path:
 from erpgen.client import ERPNextError  # noqa: E402
 from erpgen.context import MigrationContext  # noqa: E402
 from erpgen.metadata import DoctypeMeta, FieldMeta  # noqa: E402
-from erpgen.source import ColumnProfile, SourceTable  # noqa: E402
+from erpgen.source import SourceTable  # noqa: E402
+
+
+# ------------------------------------------------- cross-process determinism
+def run_isolated(script: str, seeds: tuple = ("0", "1", "12345")) -> set[str]:
+    """Run `script` in fresh interpreters with different hash seeds.
+
+    Python randomises str/bytes hashing per process, so anything that builds
+    reported order by iterating a set of *strings* varies between runs. Repeating
+    a call inside one process cannot catch that — the seed is fixed for the whole
+    process — so the check has to be cross-process.
+    """
+    import os
+    import subprocess
+    import sys
+
+    outputs = set()
+    for seed in seeds:
+        env = {**os.environ, "PYTHONHASHSEED": seed}
+        proc = subprocess.run([sys.executable, "-c", script], cwd=ROOT, env=env,
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        outputs.add(proc.stdout.strip())
+    return outputs
 
 
 # --------------------------------------------------------------------- CLI
@@ -72,18 +95,15 @@ def make_meta(name: str, fields: list, autoname: str | None = None,
 
 
 def make_sheet(headers: list[str], rows: list[list] | None = None) -> SourceTable:
-    """A SourceTable with profiles, built without touching the filesystem."""
+    """A SourceTable with profiles, built without touching the filesystem.
+
+    Profiles come from the real `build_profiles`, so `unique`, `non_empty` and
+    `inferred_type` reflect the data. Hand-rolling them once meant every column
+    looked 100% unique, which made column-selection logic (e.g. deciding which
+    columns are identifiers) untestable and misleading.
+    """
     rows = rows if rows is not None else [[f"{h}-1"] for h in headers]
-    profiles = []
-    for i, h in enumerate(headers):
-        vals = [str(r[i]) for r in rows if i < len(r) and str(r[i]).strip()]
-        profiles.append(ColumnProfile(
-            header=h,
-            non_empty=1.0 if vals else 0.0,
-            unique=1.0 if vals else 0.0,
-            sample=vals[:5],
-        ))
-    return SourceTable(name="test", headers=list(headers), rows=rows, profiles=profiles)
+    return SourceTable(name="test", headers=list(headers), rows=rows).build_profiles()
 
 
 @pytest.fixture
@@ -109,11 +129,18 @@ class FakeClient:
     recorded so tests can assert order and idempotency.
     """
 
-    def __init__(self, existing: tuple = (), fail_with: dict | None = None):
+    def __init__(self, existing: tuple = (), fail_with: dict | None = None,
+                 records: dict | None = None):
         #: {(doctype, name)} that still exist on the "site"
         self.existing = set(existing)
         self.calls: list[tuple] = []
         self.fail_with = fail_with or {}
+        #: {doctype: [row, ...]} returned by list(); empty means "no records yet"
+        self.records = records or {}
+
+    def list(self, doctype, filters=None, fields=None, limit=0, **kw):
+        self.calls.append(("list", doctype))
+        return list(self.records.get(doctype, []))
 
     def delete(self, doctype: str, name: str) -> None:
         self.calls.append(("delete", doctype, name))

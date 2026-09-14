@@ -7,6 +7,9 @@ stay pure unit tests (no live site).
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
+import time
 
 import pytest
 
@@ -221,8 +224,55 @@ def test_migration_journal_counts_and_closes(tmp_path):
 def test_migration_journal_accepts_an_explicit_run_id(tmp_path):
     j = MigrationJournal(tmp_path, doctype="Item", run_id="explicit")
     assert j.run_id == "explicit"
+    j.record_created("Item", "A")           # an effect is what creates the file
     j.close()
     assert parse_journal(j.path)["run_start"]["run_id"] == "explicit"
+
+
+def test_a_journal_with_no_effects_leaves_no_file(tmp_path):
+    """A run that changed nothing has nothing to undo, and an empty journal only
+    makes `--latest` point at a file with nothing in it."""
+    j = MigrationJournal(tmp_path, doctype="Customer", source="s.csv")
+    j.close()
+
+    assert j.created is False
+    assert j.count == 0
+    assert not j.path.exists()
+    assert list(tmp_path.glob("journal-*.jsonl")) == []
+    assert j.summary() == "Nothing to undo: no effects were recorded."
+
+
+def test_the_file_starts_at_the_first_effect_and_keeps_run_start_first(tmp_path):
+    j = MigrationJournal(tmp_path, doctype="Item", source="s.csv")
+    assert not j.path.exists()
+
+    j.record_created("Item", "A")
+    assert j.created is True and j.path.exists()
+
+    j.record_created("Item", "B")
+    j.close()
+
+    events = [e["event"] for e in parse_journal(j.path)["effects"]]
+    assert events == ["effect", "effect"]
+    lines = [json.loads(l) for l in j.path.read_text(encoding="utf-8").splitlines()]
+    assert [l["event"] for l in lines] == ["run_start", "effect", "effect", "run_end"]
+    assert lines[0]["source"] == "s.csv"        # the header is not lost by deferring
+    assert lines[-1]["effects"] == 2 and lines[-1]["status"] == "ok"
+
+
+def test_summary_reports_the_undo_path_once_there_are_effects(tmp_path):
+    j = MigrationJournal(tmp_path, doctype="Item")
+    j.record_created("Item", "A")
+    j.close()
+    assert j.summary().startswith(f"Journal: {j.path}")
+    assert "(1 revertible effect(s))" in j.summary()
+
+
+def test_closing_a_journal_without_effects_twice_is_safe(tmp_path):
+    j = MigrationJournal(tmp_path, doctype="Item")
+    j.close()
+    j.close()                                   # must not raise, must not create a file
+    assert not j.path.exists()
 
 
 # ---------------------------------------------------- link effects (link-merge)
@@ -289,3 +339,118 @@ def test_journal_records_a_link_add_with_its_inverse(tmp_path):
     assert effect["inverse"] == {"op": "remove_record_link", "doctype": "Contact",
                                  "name": "C1", "link_doctype": "Supplier",
                                  "link_name": "Acme"}
+
+
+def test_journal_close_accepts_a_status_like_the_run_context(tmp_path):
+    """`_effect_sink` returns a journal or a context, so both closes must take the
+    same arguments — the flat import crashed calling close(status=...) on a journal."""
+    j = MigrationJournal(tmp_path, doctype="Customer")
+    j.record_created("Customer", "Acme")
+    j.close(status="ok")
+    assert [e["event"] for e in parse_journal(j.path)["extra"]] == ["run_end"]
+    assert parse_journal(j.path)["extra"][0]["status"] == "ok"
+
+
+# ------------------------------------------------------- retention on disk
+from erpgen.journal import KEEP_JOURNALS, prune_journals
+
+
+def _seed(dirpath, index, effects=1, doctype="Item"):
+    """A journal named the way the tool names them: the stamp carries creation order.
+
+    Ordering must not depend on mtime, because reverting a journal appends a marker
+    and therefore touches it.
+    """
+    p = Path(dirpath) / f"journal-{doctype.lower()}-20260101-{index:012d}.jsonl"
+    lines = [json.dumps({"event": "run_start", "run_id": "x", "doctype": doctype})]
+    lines += [json.dumps({"event": "effect", "kind": "record_create",
+                          "inverse": {"op": "delete_record", "doctype": doctype,
+                                      "name": f"X{i}"}}) for i in range(effects)]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+def test_prune_keeps_the_newest_and_deletes_older_empties(tmp_path):
+    files = [_seed(tmp_path, i, effects=0) for i in range(25)]
+
+    deleted, kept = prune_journals(tmp_path, keep=KEEP_JOURNALS)
+
+    assert len(deleted) == 5 and kept == []
+    assert not any(f.exists() for f in files[:5])          # the oldest five went
+    assert all(f.exists() for f in files[5:])              # newest 20 kept
+
+
+def test_prune_never_deletes_a_journal_with_un_reverted_effects(tmp_path):
+    """That file IS the undo path for changes already applied."""
+    live = [_seed(tmp_path, i, effects=1) for i in range(3)]        # oldest three
+    rest = [_seed(tmp_path, i, effects=0) for i in range(3, 25)]
+
+    deleted, kept = prune_journals(tmp_path, keep=KEEP_JOURNALS)
+
+    assert all(f.exists() for f in live), "an un-reverted journal was destroyed"
+    assert kept == sorted(live), "the leftovers must be reported, not hidden"
+    assert len(deleted) == 2                                # only the safe overflow went
+    assert len(list(tmp_path.glob("journal-*.jsonl"))) == 23
+
+
+def test_prune_orders_by_the_stamp_not_mtime(tmp_path):
+    """Reverting appends a marker, which touches mtime. Ordering by mtime would let
+    an old reverted journal look newest and escape retention."""
+    old = _seed(tmp_path, 0, effects=2)
+    newer = _seed(tmp_path, 1, effects=0)
+    mark_reverted(old, "x", 2, "ok")            # appends → mtime becomes "now"
+    assert old.stat().st_mtime > newer.stat().st_mtime
+
+    deleted, kept = prune_journals(tmp_path, keep=1)
+
+    assert deleted == [old], "the reverted journal must still be seen as the oldest"
+    assert kept == [] and newer.exists()
+
+
+def test_prune_ignores_run_contexts(tmp_path):
+    """`run-*.jsonl` holds requirements and a whole --run audit; not ours to prune."""
+    ctx = tmp_path / "run-migration-01.jsonl"
+    ctx.write_text('{"event": "run_start"}\n', encoding="utf-8")
+    _seed(tmp_path, 1, effects=0)
+
+    deleted, _kept = prune_journals(tmp_path, keep=1)
+
+    assert ctx.exists() and deleted == []
+
+
+def test_prune_never_deletes_the_open_journal(tmp_path):
+    open_one = _seed(tmp_path, 0, effects=0)                # oldest: it is in overflow
+    newest = _seed(tmp_path, 1, effects=0)
+
+    deleted, _kept = prune_journals(tmp_path, keep=1, protect=open_one)
+
+    assert open_one.exists() and deleted == [] and newest.exists()
+
+
+def test_closing_a_journal_prunes_and_says_so(tmp_path):
+    for i in range(KEEP_JOURNALS):
+        _seed(tmp_path, i, effects=0)
+
+    j = MigrationJournal(tmp_path, doctype="Item")          # stamp is "now" → newest
+    j.record_created("Item", "A")
+    j.close()
+
+    assert len(list(tmp_path.glob("journal-*.jsonl"))) == KEEP_JOURNALS
+    assert len(j.pruned) == 1                               # 21 files, cap 20
+    assert j.retention_kept == []
+    assert "[pruned 1 older journal(s)]" in j.summary()
+    assert j.path.exists()
+
+
+def test_summary_reports_when_the_cap_cannot_be_met(tmp_path):
+    for i in range(3):                                      # oldest three stay live
+        _seed(tmp_path, i, effects=1)
+    for i in range(3, KEEP_JOURNALS):
+        _seed(tmp_path, i, effects=0)
+
+    j = MigrationJournal(tmp_path, doctype="Item")
+    j.record_created("Item", "A")
+    j.close()
+
+    assert len(j.retention_kept) == 1                       # one live file in overflow
+    assert "kept: their effects are not reverted yet" in j.summary()

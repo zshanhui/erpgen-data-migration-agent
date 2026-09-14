@@ -592,6 +592,73 @@ MUTATIONS = [
               '        if f.is_fetch_field:  # MUTANT'),
     ], "tests/test_dataclean.py::test_required_columns_helper_skips_fields_with_no_column_or_a_default"),
 
+    ("bug: analysis lookup matches a longer doctype slug", [
+        (ANL, '        if m and m.group("slug") == slug:', '        if m and slug in m.group("slug"):  # MUTANT'),
+    ], "tests/test_analysis_retention.py::test_paths_match_the_doctype_slug_exactly"),
+
+    # ---- phase 3: flat party-sheet analyser wiring ------------------------
+    ("bug: flat party sheets skip the cleaning detectors", [
+        (CF, '    conflicts.extend(_flat_data_quality(source, party, spec, fmap, flat, engines))',
+             '    pass  # MUTANT'),
+    ], "tests/test_party_data_quality.py::test_both_analysers_report_the_same_defect_identically"),
+
+    ("bug: flat required-cell check ignores the non-party doctypes", [
+        (CF, '    for kind, mapped in by_doctype.items():',
+             '    for kind, mapped in list(by_doctype.items())[:1]:  # MUTANT'),
+    ], "tests/test_party_data_quality.py::test_blank_required_cells_are_checked_per_target_doctype"),
+
+    ("bug: flat import skips the conflict gate", [
+        (CLI, '    if args.apply and errs and not args.bypass_conflicts:',
+              '    if False:  # MUTANT'),
+    ], "tests/test_party_data_quality.py::test_flat_import_refuses_while_error_conflicts_remain"),
+
+    # ---- phase 4: near duplicates ----------------------------------------
+    ("bug: near-duplicate distance threshold loosened", [
+        (CFF, 'NEAR_DUP_K = 2', 'NEAR_DUP_K = 5  # MUTANT'),
+    ], "tests/test_near_duplicates.py::test_distance_three_is_rejected"),
+
+    ("bug: identifier filter ignores uniqueness", [
+        (CFF, '        if profile.unique < IDENTIFIER_UNIQUE or profile.non_empty < IDENTIFIER_POPULATED:',
+              '        if False:  # MUTANT'),
+    ], "tests/test_near_duplicates.py::test_low_uniqueness_columns_are_not_identifiers"),
+
+    ("bug: exact-duplicate group order from a set of string keys", [
+        (CFF, '    for gkey in order:', '    for gkey in set(groups):  # MUTANT'),
+    ], "tests/test_dataclean.py::test_group_order_is_stable_across_processes"),
+
+    ("bug: near-duplicate pairs double-report exact duplicates", [
+        (CFF, '                if rows[i][5] == rows[j][5]:',
+              '                if False:  # MUTANT'),
+    ], "tests/test_near_duplicates.py::test_pairs_with_equal_keys_are_left_to_duplicate_row"),
+
+    # ---- lazy journal + revert log selection ------------------------------
+    # the real behaviour change was in the constructor, not in the lazy guard:
+    # `_ensure_open` is only reachable from `effect()`, so mutating it is
+    # equivalent when there are no effects
+    ("bug: journal file created eagerly, even with no effects", [
+        (JRN, '        self._fh = None\n',
+              '        self._fh = self.path.open("w", encoding="utf-8")  # MUTANT\n'),
+    ], "tests/test_journal.py::test_a_journal_with_no_effects_leaves_no_file"),
+
+    ("bug: revert ignores logs with nothing to undo", [
+        (CTX, '    if require_effects:', '    if False:  # MUTANT'),
+    ], "tests/test_run_selection.py::test_latest_run_prefers_the_newest_log_that_has_effects"),
+
+    ("bug: journal retention deletes an un-reverted journal", [
+        (JRN, '        if effects and not reverted:\n            kept.append(f)                       # never destroy the undo path\n            continue',
+              '        if False:  # MUTANT\n            kept.append(f)\n            continue'),
+    ], "tests/test_journal.py::test_prune_never_deletes_a_journal_with_un_reverted_effects"),
+
+    ("bug: journal retention order falls back to mtime", [
+        (JRN, '        return (m.group("stamp") if m else "", f.stat().st_mtime)',
+              '        return ("", f.stat().st_mtime)  # MUTANT'),
+    ], "tests/test_journal.py::test_prune_orders_by_the_stamp_not_mtime"),
+
+    ("bug: journal retention prunes run contexts too", [
+        (JRN, '    files = sorted(d.glob(f"{JOURNAL_PREFIX}*.jsonl"), key=creation_key, reverse=True)',
+              '    files = sorted(d.glob("*.jsonl"), key=creation_key, reverse=True)  # MUTANT'),
+    ], "tests/test_journal.py::test_prune_ignores_run_contexts"),
+
 ]
 
 
