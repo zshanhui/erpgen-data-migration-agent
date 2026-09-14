@@ -24,9 +24,10 @@ Usage:
   python3 erpgen.py agent --doctype Customer --source samples/customers.csv \
       --provider deepseek --max-rounds 30
 
-LLM provider: --provider openai|deepseek (auto-detected from
-OPENAI_API_KEY / DEEPSEEK_API_KEY). DeepSeek defaults to model
+LLM provider: --provider openai|deepseek|deepinfra (auto-detected from
+OPENAI_API_KEY / DEEPSEEK_API_KEY / DEEPINFRA_API_KEY). DeepSeek defaults to model
 deepseek-v4-flash on https://api.deepseek.com (--api-base to override).
+DeepInfra defaults to model zai-org/GLM-5.3.
 Run with the project venv: .venv/bin/python erpgen.py agent ...
 
 Global flags (--base/--run/--log-dir) live on the CLI's main parser and come
@@ -591,6 +592,19 @@ def _deepseek_llm(model: str, api_base: str):
     )
 
 
+def _deepinfra_llm(model: str, api_base: str):
+    """OpenAI-compatible client for DeepInfra (GLM and friends)."""
+    from llama_index.llms.openai_like import OpenAILike
+
+    return instrumented_llm(OpenAILike)(
+        model=model or "zai-org/GLM-5.3",
+        api_key=os.environ.get("DEEPINFRA_API_KEY"),
+        api_base=api_base or "https://api.deepinfra.com/v1/openai",
+        is_chat_model=True,
+        is_function_calling_model=True,
+    )
+
+
 def llm_preflight(api_base: str, api_key: str, *, timeout: int = 10,
                   resolve=None, open_url=None) -> tuple[bool, str]:
     """Probe the LLM endpoint so a network problem is reported clearly.
@@ -741,13 +755,22 @@ def get_llm(provider: str, model: str, api_base: str = ""):
                 "(or pass --provider openai)"
             )
         return _deepseek_llm(model, api_base)
+    if provider == "deepinfra":
+        if not os.environ.get("DEEPINFRA_API_KEY"):
+            raise SystemExit(
+                "DEEPINFRA_API_KEY is not set. export DEEPINFRA_API_KEY=... "
+                "(or pass --provider openai)"
+            )
+        return _deepinfra_llm(model, api_base)
     if os.environ.get("OPENAI_API_KEY"):
         return _openai_llm(model)
     if os.environ.get("DEEPSEEK_API_KEY"):
         return _deepseek_llm(model, api_base)
+    if os.environ.get("DEEPINFRA_API_KEY"):
+        return _deepinfra_llm(model, api_base)
     raise SystemExit(
-        "No LLM provider configured. Set OPENAI_API_KEY or DEEPSEEK_API_KEY "
-        "and choose --provider openai|deepseek."
+        "No LLM provider configured. Set OPENAI_API_KEY, DEEPSEEK_API_KEY "
+        "or DEEPINFRA_API_KEY and choose --provider openai|deepseek|deepinfra."
     )
 
 
@@ -1261,7 +1284,7 @@ def add_agent_flags(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--analysis", help="path to an existing analysis JSON")
     ap.add_argument("--defaults", help='JSON defaults for map/import, e.g. \'{"customer_group":"Commercial"}\'')
     ap.add_argument("--provider", default="auto",
-                    choices=["auto", "openai", "deepseek"])
+                    choices=["auto", "openai", "deepseek", "deepinfra"])
     ap.add_argument("--model", help="LLM model (provider default if omitted)")
     ap.add_argument("--api-base", help="OpenAI-compatible base URL "
                                        "(DeepSeek default: https://api.deepseek.com)")

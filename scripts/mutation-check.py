@@ -27,6 +27,8 @@ ANL = "erpgen/analysis.py"
 AGT = "erpgen/agent.py"
 ANA = "erpgen/analysis.py"
 CFF = "erpgen/conflicts.py"
+TREE = "erpgen/tree.py"
+INF = "erpgen/infer.py"
 
 MUTATIONS = [
     ("bug: effect seq restarts per command", [
@@ -515,6 +517,65 @@ MUTATIONS = [
     ("bug: `erpgen agent` registered without its own flags", [
         (CLI, '    add_agent_flags(p_ag)', '    pass  # MUTANT'),
     ], "tests/test_cli_args.py::test_agent_doctor_runs_through_the_cli_without_an_llm"),
+
+    # ---- self-referencing tree sheets (Customer Group & friends) ----
+    # A tree sheet names its own parents: reporting those as missing blocks
+    # --apply, importing child-first fails the row, and an unflagged parent
+    # silently becomes a leaf with children.
+    ("bug: a tree sheet's own parents reported as missing again", [
+        (TREE, '    provided = sheet_identity_values(source, plan)\n'
+               '    return [v for v in missing if v not in provided]',
+               '    return missing  # MUTANT'),
+    ], "tests/test_tree_sheets.py::test_a_self_referencing_sheets_own_parents_are_not_missing"),
+
+    ("bug: tree rows no longer ordered parents-first", [
+        (TREE, '        ready = [i for i in pending\n'
+               '                 if _parent_of(payloads[i], parent_field) not in (names - done)]',
+               '        ready = list(pending)  # MUTANT'),
+    ], "tests/test_tree_sheets.py::test_rows_are_ordered_parents_first"),
+
+    ("bug: intermediate tree nodes no longer marked is_group", [
+        (TREE, '    if has_is_group:\n'
+               '        flagged = derive_is_group(payloads, plan.id_field, parent_field)',
+               '    if False:  # MUTANT\n'
+               '        flagged = derive_is_group(payloads, plan.id_field, parent_field)'),
+    ], "tests/test_tree_sheets.py::test_a_tree_sheet_is_ordered_and_flagged_end_to_end"),
+
+    ("bug: group sheets no longer inferred from their headers", [
+        (INF, '    ("Customer Group", ["Customer Group Name"]),',
+              '    ("Customer Group", ["Not A Header"]),  # MUTANT'),
+    ], "tests/test_tree_sheets.py::test_group_sheets_are_inferred_from_headers"),
+
+    # ---- a Group node where ERPNext requires a leaf (Customer.customer_group) ----
+    # ERPNext throws (HTTP 417), so every affected row fails mid-import. Reported
+    # as its own kind: the record exists, so "create the missing record" is wrong.
+    ("bug: a Group node accepted where the field needs a leaf", [
+        (CFF, '    return [v for v in values if v in nodes]',
+              '    return []  # MUTANT'),
+    ], "tests/test_link_leaf.py::test_a_group_node_is_reported_as_its_own_kind"),
+
+    ("bug: the leaf-only rule matches nothing", [
+        (CFF, 'LEAF_ONLY_LINKS = {("Customer", "customer_group")}',
+              'LEAF_ONLY_LINKS = set()  # MUTANT'),
+    ], "tests/test_link_leaf.py::test_a_group_node_is_reported_as_its_own_kind"),
+
+    # ...and the opposite: ERPNext only validates Customer.customer_group, so
+    # widening the list invents a conflict the site does not have.
+    ("bug: the leaf-only rule widened to a field ERPNext does not validate", [
+        (CFF, 'LEAF_ONLY_LINKS = {("Customer", "customer_group")}',
+              'LEAF_ONLY_LINKS = {("Customer", "customer_group"),\n'
+              '                  ("Customer", "territory")}  # MUTANT'),
+    ], "tests/test_link_leaf.py::test_a_group_territory_is_not_reported"),
+
+    ("bug: the group-node lookup shares the name lookup's cache entry", [
+        (CFF, '    key = f"!!is_group::{linked_doctype}"',
+              '    key = linked_doctype  # MUTANT'),
+    ], "tests/test_link_leaf.py::test_the_two_lookups_can_share_one_cache_without_colliding"),
+
+    ("bug: flat party sheets skip the leaf check", [
+        (CF, '        if (_DT_CANONICAL.get(kind, ""), field) in LEAF_ONLY_LINKS:',
+             '        if False:  # MUTANT'),
+    ], "tests/test_party_sheets.py::test_a_customer_group_node_is_reported_not_a_missing_record"),
 ]
 
 

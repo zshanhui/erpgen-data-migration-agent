@@ -107,6 +107,7 @@ from erpgen.tools import (  # noqa: E402
     get_record,
     list_records,
 )
+from erpgen.tree import apply_tree_semantics  # noqa: E402
 
 DEFAULT_BASE = "http://localhost:8082"
 
@@ -438,6 +439,9 @@ def _build_plan(args, source):
     _print_plan(plan, source)
 
     payloads, row_errors = engine.build_payloads(source, plan)
+    payloads, tree_warnings = apply_tree_semantics(engine, plan, payloads)
+    for w in tree_warnings:
+        print(f"NOTE: {w}")
     if row_errors:
         print(f"\n{len(row_errors)} rows failed value conversion:")
         for e in row_errors[:10]:

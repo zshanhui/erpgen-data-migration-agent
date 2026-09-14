@@ -728,6 +728,71 @@ def test_link_conflict_reports_only_the_missing_values():
     assert c["missing_values"] == ["Net 45"], "existing values must not be reported"
 
 
+# ------------------------------------------------- link_group_node (flat path)
+def _customer_site(groups):
+    """Customer Group names, optionally flagged as group nodes. Territory and
+    Country are seeded too, so only the group is under test."""
+    return FakeSite({
+        "Customer Group": groups,
+        "Territory": {"All Territories": {"name": "All Territories"}},
+        "Country": {"United States": {"name": "United States"}},
+    })
+
+
+def test_a_customer_group_node_is_reported_not_a_missing_record():
+    """ERPNext throws 'Cannot select a Group type Customer Group' (HTTP 417), so
+    every row would fail; the analysis must say so before the import runs."""
+    a = _analysis(_customer_site({"All Customer Groups": {"name": "All Customer Groups",
+                                                          "is_group": 1}}),
+                  CUSTOMER_HEADERS,
+                  [["Acme Steel Works", "Company", "All Customer Groups",
+                    "All Territories"] + ACME_ROW[4:]],
+                  party="Customer")
+
+    assert _kinds(a, "link_value_conflict") == [], "the node exists — not a missing value"
+    got = _kinds(a, "link_group_node")
+    assert len(got) == 1
+    c = got[0]
+    assert c["doctype"] == "Customer Group"
+    assert c["group_values"] == ["All Customer Groups"]
+    assert c["targets"] == ["customer.customer_group"]
+    assert c["severity"] == "error"
+    assert "value_map" in c["suggested_action"]
+    assert "leaf" in c["suggested_action"]
+    assert "missing" not in c["suggested_action"], (
+        "the value exists — 'create the missing record' is link_value_conflict's "
+        "fix, and sending the agent after it would loop forever")
+
+
+def test_a_leaf_customer_group_is_not_reported():
+    a = _analysis(_customer_site({"Commercial": {"name": "Commercial", "is_group": 0}}),
+                  CUSTOMER_HEADERS, [ACME_ROW], party="Customer")
+    assert _kinds(a, "link_group_node") == []
+    assert a["conflicts"] == []
+
+
+def test_only_the_group_nodes_are_listed():
+    a = _analysis(_customer_site({
+        "All Customer Groups": {"name": "All Customer Groups", "is_group": 1},
+        "Commercial": {"name": "Commercial", "is_group": 0},
+    }), CUSTOMER_HEADERS,
+        [ACME_ROW,
+         ["Acme Two", "Company", "All Customer Groups", "All Territories"]
+         + ACME_ROW[4:]], party="Customer")
+    c = _kinds(a, "link_group_node")[0]
+    assert c["group_values"] == ["All Customer Groups"]
+
+
+def test_a_supplier_group_node_is_not_reported():
+    """ERPNext only validates Customer.customer_group — Supplier has no such
+    check, so flagging it would be a conflict ERPNext does not have."""
+    site = FakeSite({"Supplier Group": {"Raw Material": {"name": "Raw Material",
+                                                         "is_group": 1}},
+                     "Country": {"China": {"name": "China"}}})
+    a = _analysis(site, SUPPLIER_HEADERS, [SHENZHEN_ROW])
+    assert _kinds(a, "link_group_node") == []
+
+
 def test_contract_link_columns_are_validated():
     row = list(SHENZHEN_ROW)
     row[2] = "Nonexistent Group"

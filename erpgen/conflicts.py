@@ -167,3 +167,73 @@ def link_value_conflict(source: str, targets, linked_doctype: str,
             "including child-table ones — then re-run map."
         ),
     }
+
+
+#: Fields that reject a *Group* node and require a leaf. This is the only such
+#: validation in ERPNext (`Customer.validate_customer_group`, which throws
+#: "Cannot select a Group type Customer Group"): an Item and a Customer accept a
+#: group node in `item_group` / `territory`, so treating every tree Link as
+#: leaf-only would report conflicts ERPNext is perfectly happy with.
+LEAF_ONLY_LINKS = {("Customer", "customer_group")}
+
+
+def group_node_values(client: ERPNextClient, values: list[str],
+                      linked_doctype: str,
+                      cache: Optional[dict] = None) -> Optional[list[str]]:
+    """Which of `values` are Group nodes (`is_group`) in `linked_doctype`.
+
+    `None` when the doctype could not be queried — same unverifiable contract as
+    `missing_link_values`, so an unreachable site stays silent rather than
+    reporting every value. `cache` is shared with the value lookups, keyed by a
+    prefixed string so the two never collide.
+    """
+    if not values:
+        return []
+    key = f"!!is_group::{linked_doctype}"
+    if cache is not None and key in cache:
+        nodes = cache[key]
+        if nodes is None:
+            return None
+    else:
+        try:
+            rows = client.list(linked_doctype, fields=["name", "is_group"],
+                               limit=0)
+        except Exception:
+            if cache is not None:
+                cache[key] = None      # remember the failure, don't re-query
+            return None
+        nodes = {str(r.get("name")) for r in rows if r.get("is_group")}
+        if cache is not None:
+            cache[key] = nodes
+    return [v for v in values if v in nodes]
+
+
+def link_group_node(source: str, targets, linked_doctype: str,
+                    nodes: list[str]) -> dict:
+    """A Link value that exists, but is a Group node where a leaf is required.
+
+    Distinct from `link_value_conflict`: the record is there, so "create the
+    missing record" is the wrong fix and would loop the agent forever. The row
+    has to point somewhere else.
+    """
+    qualified = list(targets)
+    return {
+        "kind": "link_group_node",
+        "severity": "error",
+        "source": source,
+        "target": qualified[0],
+        "targets": qualified,
+        "doctype": linked_doctype,
+        "group_values": sorted(nodes)[:MAX_VALUES],
+        "detail": (
+            f"{len(nodes)} source value(s) for '{source}' are Group nodes in "
+            f"{linked_doctype}; ERPNext rejects a Group node here — this field "
+            "needs a leaf."
+        ),
+        "suggested_action": (
+            f"point the row at a leaf instead: pick an existing leaf under the "
+            f"group, or create one (create_record '{linked_doctype}' with its "
+            f"parent set and is_group 0). The value lives in the source, so remap "
+            f"it to that leaf with a value_map on '{qualified[0]}'."
+        ),
+    }

@@ -29,7 +29,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .client import ERPNextClient
-from .conflicts import (distinct_values, fieldtype_for, link_value_conflict,
+from .conflicts import (LEAF_ONLY_LINKS, distinct_values, fieldtype_for,
+                        group_node_values, link_group_node, link_value_conflict,
                         missing_link_values, suggested_custom_field,
                         unmapped_column_conflict)
 from .logger import RunLogger
@@ -594,6 +595,7 @@ def _link_value_conflicts(
         targets.append((header, key, field))
 
     grouped: dict[tuple[str, str], dict] = {}
+    node_grouped: dict[tuple[str, str], dict] = {}
     existing_cache: dict[str, set] = {}
     for header, kind, field in targets:
         if header not in source.headers:
@@ -609,19 +611,34 @@ def _link_value_conflicts(
             continue
         values = distinct_values(source, header,
                                  require_column=spec["name_column"])
-        missing = missing_link_values(client, values, linked, existing_cache)
-        if not missing:
-            continue
-        g = grouped.setdefault((header, linked), {"targets": [], "missing": []})
         qual = f"{kind}.{field}"
-        if qual not in g["targets"]:
-            g["targets"].append(qual)
-        g["missing"] = sorted(set(g["missing"]) | set(missing))
+        missing = missing_link_values(client, values, linked, existing_cache)
+        if missing:
+            g = grouped.setdefault((header, linked), {"targets": [], "missing": []})
+            if qual not in g["targets"]:
+                g["targets"].append(qual)
+            g["missing"] = sorted(set(g["missing"]) | set(missing))
 
-    return [
+        # present but unusable: a leaf-only field rejects a Group node outright,
+        # so it must be reported here rather than failing every row at import
+        if (_DT_CANONICAL.get(kind, ""), field) in LEAF_ONLY_LINKS:
+            nodes = group_node_values(client, values, linked, existing_cache)
+            if nodes:
+                gn = node_grouped.setdefault((header, linked),
+                                             {"targets": [], "nodes": []})
+                if qual not in gn["targets"]:
+                    gn["targets"].append(qual)
+                gn["nodes"] = sorted(set(gn["nodes"]) | set(nodes))
+
+    conflicts = [
         link_value_conflict(header, sorted(g["targets"]), linked, g["missing"])
         for (header, linked), g in grouped.items()
     ]
+    conflicts += [
+        link_group_node(header, sorted(g["targets"]), linked, g["nodes"])
+        for (header, linked), g in node_grouped.items()
+    ]
+    return conflicts
 
 
 #: score at or above which an out-of-contract column is treated as mapping onto
@@ -758,6 +775,9 @@ def _agent_instructions(party: str, flow: str) -> str:
         "do not exist in the linked doctype. Create those records with "
         "create_record (describe_doctype shows the required fields, including "
         "child-table fields), then re-run map.\n"
+        "- link_group_node -> the value exists but is a Group node, and this field "
+        "needs a leaf (ERPNext rejects a Group node on a party). Remap the value "
+        "onto a leaf with a value_map; do not create the group again.\n"
         "After resolving, re-run map to confirm the conflicts are gone, then "
         "import. Do not import until the analysis has zero conflicts."
     )

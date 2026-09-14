@@ -25,10 +25,17 @@ _PRIMARY_HEADERS = [
     ("Item", ["Item Code"]),
     ("Contact", ["First Name", "Contact Name"]),
     ("Address", ["Address Title", "Address Line 1"]),
+    ("Customer Group", ["Customer Group Name"]),
+    ("Supplier Group", ["Supplier Group Name"]),
+    ("Item Group", ["Item Group Name"]),
 ]
 
 # File-name prefix convention (checked case-insensitively against the basename).
+# The group prefixes come first, so `customer_groups.csv` is not read as `customer`.
 _FILE_PREFIXES = [
+    ("customer_groups", "Customer Group"),
+    ("supplier_groups", "Supplier Group"),
+    ("item_groups", "Item Group"),
     ("customers", "Customer"),
     ("items", "Item"),
     ("addresses", "Address"),

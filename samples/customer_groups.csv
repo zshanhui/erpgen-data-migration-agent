@@ -1,0 +1,9 @@
+Customer Group Name,Parent Customer Group,Is Group
+Wholesale Trade,All Customer Groups,1
+Regional Wholesale,Wholesale Trade,1
+North Region,Regional Wholesale,0
+South Region,Regional Wholesale,0
+Retail Trade,All Customer Groups,1
+Retail Chain Stores,Retail Trade,1
+Convenience,Retail Chain Stores,0
+Online Direct,Retail Trade,0

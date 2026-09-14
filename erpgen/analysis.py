@@ -21,11 +21,13 @@ from pathlib import Path
 from typing import Optional
 
 from .client import ERPNextClient
-from .conflicts import (distinct_values, fieldtype_for, link_value_conflict,
+from .conflicts import (LEAF_ONLY_LINKS, distinct_values, fieldtype_for,
+                        group_node_values, link_group_node, link_value_conflict,
                         missing_link_values, suggested_custom_field,
                         unmapped_column_conflict)
 from .mapper import MappingEngine, MappingPlan
 from .source import SourceTable
+from .tree import without_self_provided
 
 
 def _snake(label: str) -> str:
@@ -93,11 +95,24 @@ def build_analysis(
         # unresolvable conflict the agent loops on forever.
         linked = t.meta.links_to_doctype
         if linked:
-            missing = missing_link_values(client, distinct_values(source, m.source),
-                                          linked, existing_cache)
+            values = distinct_values(source, m.source)
+            missing = missing_link_values(client, values, linked, existing_cache)
+            # a self-referencing sheet (Customer Group's parent_customer_group)
+            # creates its own parents, so those values are not missing
+            if missing:
+                missing = without_self_provided(missing, linked, source, plan)
             if missing:
                 conflicts.append(link_value_conflict(
                     m.source, [m.target], linked, missing))
+
+            # present but unusable: ERPNext throws when a leaf-only field is given
+            # a Group node, so catch it here instead of failing every such row
+            # mid-import
+            if (plan.doctype, m.target) in LEAF_ONLY_LINKS:
+                nodes = group_node_values(client, values, linked, existing_cache)
+                if nodes:
+                    conflicts.append(link_group_node(
+                        m.source, [m.target], linked, nodes))
 
     covered = set(plan.mapped_fields()) | set(plan.defaults.keys())
     for f in engine.parent.mandatory_fields():
@@ -118,6 +133,8 @@ def build_analysis(
         "- ambiguous_mapping -> choose the correct target among target/alternatives.\n"
         "- fetch_from -> the field is read-only; set the value on its source doc.\n"
         "- link_value_conflict -> create the missing option records or remap values.\n"
+        "- link_group_node -> the value exists but is a Group node; the field needs "
+        "a leaf, so remap the value onto a leaf instead of creating anything.\n"
         "- required_missing -> supply --defaults or map a source column.\n"
         "Do not import until every 'error'-severity conflict is resolved."
     )

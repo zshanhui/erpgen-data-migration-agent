@@ -128,6 +128,7 @@ What the analysis can report:
 | `ambiguous_mapping` | warning | two fields score equally — choose with `set-mapping` |
 | `required_missing` | error | required field with no source and no default |
 | `link_value_conflict` | error | a Link value has no matching record on the site |
+| `link_group_node` | error | the value is a Group node, but the field needs a leaf |
 | `fetch_from` | warning | read-only field — write the source doc instead |
 
 ## Doctype inference
@@ -135,11 +136,49 @@ What the analysis can report:
 Used when `--doctype` is omitted, in priority order:
 
 1. **Header identity columns** — `Customer Name`, `Supplier Name`, `Item Code`,
-   `First Name`/`Contact Name`, `Address Title`/`Address Line 1`.
+   `First Name`/`Contact Name`, `Address Title`/`Address Line 1`,
+   `Customer Group Name`/`Item Group Name`/`Supplier Group Name`.
 2. **File-name prefix** — `customers*.csv`, `items*.csv`, `addresses*.csv`,
-   `contacts*.csv` (case-insensitive).
+   `contacts*.csv`, `customer_groups*.csv` (case-insensitive).
 
 If neither matches, the tool errors (exit 2) rather than guess.
+
+## Tree sheets
+
+A sheet importing a tree doctype (Customer Group, Item Group, Supplier Group)
+**names its own parents**: `parent_customer_group` holds Customer Group names the
+same file creates. Three things follow, all handled without editing the source:
+
+```bash
+python3 erpgen.py import samples/customer_groups.csv --apply   # doctype inferred
+```
+
+- **Those parents are not "missing".** Link validation would otherwise report
+  `link_value_conflict` for values the sheet itself creates, and `--apply` refuses
+  on error-severity conflicts — so a hierarchical sheet could never be applied.
+  A parent found in neither the sheet nor the site is still reported.
+- **Rows are imported parents-first.** ERPNext rejects a child whose parent does
+  not exist yet (`LinkValidationError`), so a child listed above its parent in the
+  source would fail. A cycle (including a row naming itself) can't be ordered:
+  those rows keep their source order and a `NOTE:` names them.
+- **`is_group` is derived** when the sheet has no Is Group column (or the column
+  is blank): every row some *other* row names as its parent becomes a group.
+  ERPNext does **not** reject a child under a leaf — it silently stores a leaf
+  with children — so without this the tree is malformed rather than broken. An
+  explicit Is Group value in the source always wins.
+
+ERPNext maintains the nested set (`lft`/`rgt`) itself; the created records are
+journaled and revert as one run like any other import.
+
+**A party can only sit on a leaf.** `Customer.customer_group` is the one field in
+ERPNext that validates this (`validate_customer_group`), throwing
+`Cannot select a Group type Customer Group` — so a customer sheet whose Group
+column names a parent group fails every such row at the site. That is reported up
+front as `link_group_node` (error), not as a missing value: the record exists, and
+the fix is to remap the value onto a leaf, not to create the group again. The check
+is deliberately limited to `LEAF_ONLY_LINKS`; `Item.item_group` and
+`Customer.territory` accept a group node, so flagging those would invent conflicts
+ERPNext does not have.
 
 ## Flat party sheets
 
@@ -325,6 +364,17 @@ Integration coverage is the shell scripts (`scripts/test-items-import.sh`,
   source rows becomes several documents.
 - **Flat party sheets are not covered by `revert`** — they log to
   `logs/<flow>-<ts>.jsonl`, which `revert` does not read.
+- **A tree sheet cannot promote a group that already exists as a leaf.** Imports
+  are create-or-skip, so a row that already exists keeps its `is_group`; the
+  derived flag never reaches it, and ERPNext accepts children under a leaf. Check
+  with `describe-doctype`/`get-record` and fix the existing row by hand before
+  importing. (Real case: `Wholesale` and `Retail Chain` ship as leaves in the
+  ERPNext demo, so a sheet that wants them as parents must not reuse those names.)
+- **Flat party imports do not gate on conflicts.** The relational path refuses
+  `--apply` while error-severity conflicts remain; flat party sheets import
+  first and report afterwards, so a `link_group_node` or missing link value only
+  shows up as per-row failures (the run still exits 0). `map` reports it either
+  way — check the analysis before applying a flat sheet.
 
 ## Local demo stack
 
