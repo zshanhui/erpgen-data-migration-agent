@@ -29,12 +29,14 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .client import ERPNextClient
-from .conflicts import (LEAF_ONLY_LINKS, data_quality_conflicts, distinct_values,
-                        fieldtype_for, group_node_values, link_group_node,
-                        link_value_conflict, missing_link_values,
-                        possible_duplicate_pairs, possible_duplicate_row_conflict,
-                        required_mapped_columns, suggested_custom_field,
-                        unmapped_column_conflict)
+from .conflicts import (LEAF_ONLY_LINKS, MAX_PAIRS_ROWS, NEAR_DUP_K,
+                        data_quality_conflicts, distinct_values, fieldtype_for,
+                        group_node_values, link_group_node, link_value_conflict,
+                        missing_link_values, possible_duplicate_pairs,
+                        possible_duplicate_row_conflict, required_mapped_columns,
+                        suggested_custom_field, unmapped_column_conflict)
+from .corrections import (file_sha256, load_worksheet, merged_corrections,
+                          prepare, statuses)
 from .logger import RunLogger
 from .mapper import ColumnMapping, MappingEngine, MappingPlan, convert_value
 from .metadata import fetch_with_children
@@ -475,6 +477,7 @@ def import_flat_parties(
     logger: Optional[RunLogger] = None,
     flat_mappings: Optional[dict[str, tuple[str, str]]] = None,
     journal=None,
+    prepared=None,
 ) -> dict:
     """Import a flat party sheet (party + inline contact/address), deduped per doctype.
 
@@ -486,6 +489,10 @@ def import_flat_parties(
     Per-row insert failures are logged as `failed` (with a stderr warning) and
     skipped, never aborting the run. A failed record is NOT added to its dedup
     set, so fixing the source and re-running retries it — and re-links it.
+
+    `prepared` carries the worksheet's corrections: its rows are what get
+    imported, while every detector and every message keeps referring to the
+    source line numbers it preserves.
     """
     spec = spec_for(party)
     key = spec["key"]
@@ -500,8 +507,10 @@ def import_flat_parties(
         print(f"WARNING: {msg}", file=sys.stderr)
 
     type_map = type_maps(client, party)
-    payloads = build_payloads(source, party, flat_mappings, type_map)
-    for row_no, payload in enumerate(payloads, start=2):
+    payload_source = prepared.source if prepared is not None else source
+    payloads = build_payloads(payload_source, party, flat_mappings, type_map)
+    for i, payload in enumerate(payloads):
+        row_no = payload_source.row_number(i)  # source line number, 1 = header
         status, docname = _upsert_party(client, party, spec, payload[key], defaults or {},
                                         index, apply, logger, warn, row_no, journal)
         counts[key][status] += 1
@@ -546,11 +555,12 @@ def run_flat_parties_import(
     logger: Optional[RunLogger] = None,
     flat_mappings: Optional[dict[str, tuple[str, str]]] = None,
     journal=None,
+    prepared=None,
 ) -> dict:
     spec = spec_for(party)
     counts = import_flat_parties(
         client, source, party=party, defaults=defaults, apply=apply, logger=logger,
-        flat_mappings=flat_mappings, journal=journal,
+        flat_mappings=flat_mappings, journal=journal, prepared=prepared,
     )
     print(f"{spec['flow']} import ({'APPLY' if apply else 'dry run'}):")
     for label, c in counts.items():
@@ -810,7 +820,7 @@ def _contract_plan(doctype: str, mapped: dict[str, str]) -> MappingPlan:
 
 def _flat_data_quality(source: SourceTable, party: str, spec: dict,
                        fmap: dict, flat: dict,
-                       engines: dict) -> list[dict]:
+                       engines: dict, key_column: str = "") -> list[dict]:
     """Duplicate keys and empty required values for a flat party sheet.
 
     A flat row feeds three doctypes at once, so the required-cell check runs per
@@ -831,20 +841,22 @@ def _flat_data_quality(source: SourceTable, party: str, spec: dict,
             engine.parent, _contract_plan(engine.parent.name, mapped)))
 
     contract_columns = [h for h in source.headers if h in set(fmap) | set(flat)]
+    key = key_column or spec["name_column"]
     conflicts = data_quality_conflicts(
         source,
-        key_column=spec["name_column"],
-        key_field=spec["name_field"],
+        key_column=key,
+        key_field=spec["name_field"] if key == spec["name_column"] else "",
         required=required,
         compare_columns=contract_columns,
     )
 
     # near duplicates are a review list, never a gate
     pairs, pair_count, skipped = possible_duplicate_pairs(
-        source, spec["name_column"], compare_columns=contract_columns)
+        source, key, compare_columns=contract_columns)
     if pair_count:
         conflicts.append(possible_duplicate_row_conflict(
-            spec["name_column"], pairs, pair_count, spec["name_field"], skipped))
+            key, pairs, pair_count,
+            spec["name_field"] if key == spec["name_column"] else "", skipped))
     return conflicts
 
 
@@ -856,6 +868,9 @@ def build_party_sheet_analysis(
     base_url: str = "",
     source_path: str = "",
     flat_mappings: Optional[dict[str, tuple[str, str]]] = None,
+    prepared=None,
+    key_source: str = "contract",
+    worksheet_dir: str | Path = "worksheets",
 ) -> dict:
     """Build a flat party-sheet mapping analysis (for the LLM agent).
 
@@ -871,6 +886,12 @@ def build_party_sheet_analysis(
     flat = flat_mappings or {}
     engines = _party_engines(client, party)
     known = set(fmap) | set(flat)
+
+    flow = spec["flow"]
+    previous = load_worksheet(flow, source_path, worksheet_dir)
+    if prepared is None:
+        prepared = prepare(source, previous, sha256=file_sha256(source_path))
+    key_column = prepared.key_column or spec["name_column"]
 
     conflicts: list[dict] = []
     suggested: list[dict] = []
@@ -891,21 +912,38 @@ def build_party_sheet_analysis(
 
     # duplicate party rows and empty required cells, from the same detectors the
     # relational flow uses (conflicts.py) so the two analysers cannot diverge
-    conflicts.extend(_flat_data_quality(source, party, spec, fmap, flat, engines))
+    conflicts.extend(_flat_data_quality(source, party, spec, fmap, flat, engines,
+                                        key_column))
 
-    flow = spec["flow"]
+    sha256 = file_sha256(source_path)
+    prev_sha = (previous.get("source") or {}).get("sha256") or ""
+    effective_source = "correction" if prepared.key_changed else key_source
+    corrections = merged_corrections(previous.get("corrections"), prepared)
+
     return {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "generator": {"tool": "erpgen.py", "k": NEAR_DUP_K,
+                      "max_pairs_rows": MAX_PAIRS_ROWS},
         "doctype": flow,
         "party": party,
-        "source": source_path,
+        "source": {
+            "path": source_path,
+            "sha256": sha256,
+            "rows": source.n_rows,
+            "doctype": flow,
+            "key_column": key_column,
+            "key_source": effective_source,
+        },
         "source_rows": source.n_rows,
         "base_url": base_url,
         "known_mappings": _known_mappings(source, fmap, flat),
         "extra_columns": extra_columns,
         "column_profiles": [p.as_dict() for p in source.profiles],
-        "conflicts": conflicts,
+        "conflicts": statuses(conflicts, prepared, sha256=sha256,
+                              previous=previous.get("conflicts"),
+                              previous_hash=prev_sha),
+        "corrections": corrections,
         "suggested_custom_fields": suggested,
         "agent_instructions": _agent_instructions(party, flow),
     }

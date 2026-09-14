@@ -48,10 +48,21 @@ class SourceTable:
     headers: list[str]
     rows: list[list]  # raw cells (strings preferred)
     profiles: list[ColumnProfile] = field(default_factory=list)
+    #: source line number (1 = header) of each row, when rows were filtered or
+    #: corrected so that a row's position no longer implies its line number
+    row_numbers: Optional[list[int]] = None
 
     @property
     def n_rows(self) -> int:
         return len(self.rows)
+
+    def row_number(self, index: int) -> int:
+        """The source line number of `rows[index]` (1 = header).
+
+        Detection, logging and `{"row": N}` corrections all speak this
+        coordinate, so it has to survive a `skip_row` without shifting.
+        """
+        return self.row_numbers[index] if self.row_numbers else index + 2
 
     def column_index(self, header: str) -> Optional[int]:
         try:

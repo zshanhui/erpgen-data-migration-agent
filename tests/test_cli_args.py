@@ -20,6 +20,8 @@ MINIMAL_ARGV = {
     "get-record": ["Item", "ITEM-1"],
     "list-records": ["Item"],
     "set-mapping": ["Item"],
+    "correct": ["samples/items.csv", "--doctype", "Item",
+                "--json", '{"action":"skip_row","at":{"row":2},"reason":"dup"}'],
     "revert": [],
     "create-record": ["UOM", "--fields", '{"uom_name": "Dozen"}'],
     "status": [],

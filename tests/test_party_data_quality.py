@@ -222,10 +222,14 @@ def test_flat_instructions_cover_the_new_kinds():
 # ------------------------------------------------- flat import conflict gate
 def _gate_args(cli, tmp_path, *extra):
     # --log-dir is a global flag, so it precedes the subcommand
-    return cli.build_parser().parse_args([
+    args = cli.build_parser().parse_args([
         "--log-dir", str(tmp_path / "logs"),
         "import", "samples/x.csv", "--apply",
         "--analysis-dir", str(tmp_path / "analysis"), *extra])
+    # the flat import writes a worksheet beside the analysis; keep it in tmp so
+    # the repo's worksheets/ never accumulates test artifacts
+    args.worksheet_dir = str(tmp_path / "worksheets")
+    return args
 
 
 def _stub_import(cli, monkeypatch):
@@ -244,7 +248,7 @@ def test_flat_import_refuses_while_error_conflicts_remain(cli, monkeypatch, tmp_
     assert rc == 2
     assert calls == [], "nothing may be imported while errors remain"
     out = capsys.readouterr().out
-    assert "error-severity conflict(s) remain" in out
+    assert "still open or stale" in out
     assert "[duplicate_row] Customer Name" in out          # differing duplicates
     assert "[missing_value] Customer Name" in out          # blank key
     assert "or pass --bypass-conflicts to import anyway" in out

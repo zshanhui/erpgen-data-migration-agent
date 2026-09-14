@@ -181,6 +181,8 @@ def describe_inverse(inv: dict) -> str:
     if op == "remove_record_link":
         return (f"unlink {inv.get('link_doctype')}/{inv.get('link_name')} "
                 f"from {inv.get('doctype')}/{inv.get('name')}")
+    if op == "correction_revoke":
+        return f"revoke correction {inv.get('correction_id')} in {inv.get('path')}"
     return f"unknown inverse op {op!r}"
 
 
@@ -207,6 +209,11 @@ def apply_inverse(client: ERPNextClient, inv: dict, apply: bool = True) -> tuple
             return True, ""
         if op == "remove_record_link":
             return _remove_record_link(client, inv)
+        if op == "correction_revoke":
+            from .corrections import revoke
+
+            revoke(inv.get("path") or "", inv.get("correction_id") or "")
+            return True, ""
         return False, f"unknown inverse op {op!r}"
     except Exception as e:  # noqa: BLE001 — collected, never fatal
         msg = str(e)

@@ -98,6 +98,7 @@ from erpgen.customers_full import (  # noqa: E402
     party_for_flow,
     run_flat_parties_import,
 )
+from erpgen.corrections import WORKSHEET_DIR  # noqa: E402
 from erpgen.overrides import (  # noqa: E402
     DEFAULT_OVERRIDES,
     apply_overrides,
@@ -223,11 +224,14 @@ def _inject_id_column(source, payloads, plan, id_column: str) -> None:
     col_idx = source.column_index(id_column)
     if col_idx is None:
         return
+    # `__row` is a source line number, which is not an index once a correction
+    # has dropped rows, so map it back explicitly
+    index_of = {source.row_number(i): i for i in range(source.n_rows)}
     for p in payloads:
         ridx = p.get("__row")
-        if ridx is None or ridx - 2 >= len(source.rows):
+        if ridx is None or ridx not in index_of:
             continue
-        row = source.rows[ridx - 2]
+        row = source.rows[index_of[ridx]]
         if col_idx < len(row) and str(row[col_idx]).strip():
             p[id_field] = str(row[col_idx]).strip()
 
@@ -299,8 +303,13 @@ def cmd_map(args) -> int:
         client, source, plan, engine,
         id_column=infer_id_column(plan, source, args.id_column),
         base_url=args.base, source_path=args.source,
+        key_source="explicit" if args.id_column else
+        ("mapped" if args.doctype else "guessed"),
+        worksheet_dir=getattr(args, "worksheet_dir", None) or WORKSHEET_DIR,
     )
-    apath = save_analysis(analysis, args.analysis_dir)
+    apath = save_analysis(analysis, args.analysis_dir,
+                          worksheet_dir=getattr(args, "worksheet_dir", None)
+                          or WORKSHEET_DIR)
     print(f"Analysis saved to {apath}  "
           f"({len(analysis['conflicts'])} conflicts, "
           f"{len(analysis['suggested_custom_fields'])} suggested custom fields)")
@@ -321,22 +330,26 @@ def _import_flat_party_sheet(args, source, party: str) -> int:
     flat_mappings = load_flat_mappings(args.overrides or DEFAULT_OVERRIDES, flow)
 
     # ---- analysis + fail-before-apply gate ----
-    # The relational path refuses while error-severity conflicts remain; a flat
-    # row feeds THREE doctypes at once, so an unresolved error here can corrupt
-    # all three. Same contract, same escape hatch.
+    # The relational path refuses while an error-severity conflict stays open or
+    # stale; a flat row feeds THREE doctypes at once, so an unresolved error here
+    # can corrupt all three. Same contract, same escape hatch.
+    prepared = _load_corrections(args, source, flow)
     analysis = build_party_sheet_analysis(
         client, source, party, base_url=args.base, source_path=args.source,
-        flat_mappings=flat_mappings)
-    apath = save_analysis(analysis, args.analysis_dir)
+        flat_mappings=flat_mappings, prepared=prepared,
+        worksheet_dir=getattr(args, "worksheet_dir", None) or WORKSHEET_DIR)
+    apath = save_analysis(analysis, args.analysis_dir,
+                          worksheet_dir=getattr(args, "worksheet_dir", None)
+                          or WORKSHEET_DIR)
     print(f"Analysis saved to {apath}  ({len(analysis['conflicts'])} conflicts)")
 
-    errs = [c for c in analysis["conflicts"] if c["severity"] == "error"]
+    errs = _blocking_conflicts(analysis)
     if args.apply and errs and not args.bypass_conflicts:
-        print(f"\nERROR: {len(errs)} error-severity conflict(s) remain:")
+        print(f"\nERROR: {len(errs)} conflict(s) still open or stale:")
         for c in errs:
             print(f"  [{c['kind']}] {c.get('source') or c.get('field')}")
-        print("Resolve them (set-mapping / createfield / create_record) and re-run, "
-              "or pass --bypass-conflicts to import anyway.")
+        print("Resolve them (set-mapping / createfield / create_record) or record a "
+              "worksheet correction, or pass --bypass-conflicts to import anyway.")
         return 2
 
     logger = RunLogger(args.log_dir, tag=flow) if args.apply else None
@@ -347,6 +360,7 @@ def _import_flat_party_sheet(args, source, party: str) -> int:
     run_flat_parties_import(
         client, source, party=party, defaults=defaults, apply=args.apply,
         logger=logger, flat_mappings=flat_mappings, journal=journal,
+        prepared=prepared,
     )
     if logger:
         logger.run_end()
@@ -386,7 +400,14 @@ def _open_import_run(args, plan, analysis: dict, row_errors: list,
     logger = RunLogger(args.log_dir, tag=f"import-{plan.doctype.lower().replace(' ', '-')}")
     ctx = _context(args, plan.doctype, args.source, command="import")
     if ctx:
-        ctx.add_requirements(analysis["conflicts"])
+        # resolved conflicts are no longer detected, so they have nothing to
+        # require; corrected/waived ones are answered by the worksheet and close
+        # with the trail the audit wants (via: "correction")
+        fresh = [c for c in analysis["conflicts"] if c["status"] != "resolved"]
+        ctx.add_requirements(fresh)
+        for c in fresh:
+            if c["status"] in ("corrected", "waived"):
+                ctx.satisfy_conflict(c, via="correction")
     journal = ctx or MigrationJournal(args.log_dir, doctype=plan.doctype,
                                       source=args.source, base_url=args.base)
     logger.run_start(
@@ -474,10 +495,51 @@ def _verified_created(client, plan, spec, to_create: list, key_label: str) -> in
                               [k for k in created if k]))
 
 
-def _build_plan(args, source):
+def _blocking_conflicts(analysis: dict) -> list:
+    """Conflicts that stop an import.
+
+    Status decides, not severity alone: an error-severity conflict that is
+    `corrected`, `waived` or `resolved` passes. Warnings never block regardless
+    of status — near-duplicates are review-only by design.
+    """
+    return [c for c in analysis["conflicts"]
+            if c["severity"] == "error"
+            and c.get("status", "open") in ("open", "stale")]
+
+
+def _load_corrections(args, source, doctype: str):
+    """Read the worksheet for `(doctype, source)` and resolve its corrections.
+
+    Corrections change the payload, never the detection — the detectors keep
+    reading the raw source — so the returned rows are only ever handed to a
+    payload builder. Returns None when the sheet has no worksheet.
+    """
+    from erpgen.corrections import (WORKSHEET_DIR, file_sha256, load_worksheet,
+                                   prepare, worksheet_path)
+
+    worksheet_dir = getattr(args, "worksheet_dir", None) or WORKSHEET_DIR
+    worksheet = load_worksheet(doctype, args.source, worksheet_dir)
+    if not worksheet:
+        return None
+    prepared = prepare(source, worksheet, sha256=file_sha256(args.source))
+    path = worksheet_path(doctype, args.source, worksheet_dir)
+    print(f"\nWorksheet {path}: {len(prepared.corrections)} correction(s), "
+          f"{len(prepared.applied())} applied, {len(prepared.inert())} inert")
+    for cid in prepared.inert():
+        why = prepared.verdicts[cid]["why"]
+        if prepared.verdicts[cid]["invalid"]:
+            print(f"WARNING: correction {cid} rejected: {why}", file=sys.stderr)
+        else:
+            print(f"  [{cid}] {why}")
+    return prepared
+
+
+def _build_plan(args, source, payload_source=None):
     """Score the mapping, apply overrides, and build the payloads.
 
-    Returns `(engine, client, plan, payloads, row_errors)`.
+    `payload_source` is the corrected view of the same sheet: mapping decisions
+    are made from the raw source (its profiles and samples describe the file),
+    while the payloads are built from the corrections.
     """
     engine, client = _engine(args, args.doctype)
     plan = engine.suggest(source)
@@ -486,7 +548,7 @@ def _build_plan(args, source):
         print(f"Applied mapping override(s) from {overrides_path}")
     _print_plan(plan, source)
 
-    payloads, row_errors = engine.build_payloads(source, plan)
+    payloads, row_errors = engine.build_payloads(payload_source or source, plan)
     payloads, tree_warnings = apply_tree_semantics(engine, plan, payloads)
     for w in tree_warnings:
         print(f"NOTE: {w}")
@@ -520,7 +582,9 @@ def cmd_import(args) -> int:
     if not _check_id_column(args, source):
         return 2
 
-    engine, client, plan, payloads, row_errors = _build_plan(args, source)
+    prepared = _load_corrections(args, source, args.doctype)
+    engine, client, plan, payloads, row_errors = _build_plan(
+        args, source, payload_source=prepared.source if prepared else None)
 
     # ---- idempotency setup ----
     id_column = infer_id_column(plan, source, args.id_column)
@@ -529,7 +593,8 @@ def cmd_import(args) -> int:
               f"(id field: {plan.id_field!r}). Pass --id-column <source column>.")
         return 2
     if args.id_column:
-        _inject_id_column(source, payloads, plan, args.id_column)
+        _inject_id_column(prepared.source if prepared else source, payloads, plan,
+                          args.id_column)
 
     key_label = dedup_key_label(plan.doctype, plan, payloads)
     spec = DEDUP_KEYS.get(plan.doctype)
@@ -540,8 +605,13 @@ def cmd_import(args) -> int:
     analysis = build_analysis(
         client, source, plan, engine,
         id_column=id_column, base_url=args.base, source_path=args.source,
+        prepared=prepared,
+        key_source="explicit" if args.id_column else "mapped",
+        worksheet_dir=getattr(args, "worksheet_dir", None) or WORKSHEET_DIR,
     )
-    apath = save_analysis(analysis, args.analysis_dir)
+    apath = save_analysis(analysis, args.analysis_dir,
+                          worksheet_dir=getattr(args, "worksheet_dir", None)
+                          or WORKSHEET_DIR)
     print(f"Analysis saved to {apath}  "
           f"({len(analysis['conflicts'])} conflicts, "
           f"{len(analysis['suggested_custom_fields'])} suggested custom fields)")
@@ -562,13 +632,13 @@ def cmd_import(args) -> int:
         _print_dry_run_preview(args, engine, plan, payloads)
         return 0
 
-    errs = [c for c in analysis["conflicts"] if c["severity"] == "error"]
+    errs = _blocking_conflicts(analysis)
     if errs and not args.bypass_conflicts:
-        print(f"\nERROR: {len(errs)} error-severity conflict(s) remain:")
+        print(f"\nERROR: {len(errs)} conflict(s) still open or stale:")
         for c in errs:
             print(f"  [{c['kind']}] {c.get('source') or c.get('field')}")
-        print("Resolve them (set-mapping / createfield / create_record) and re-run, "
-              "or pass --bypass-conflicts to import anyway.")
+        print("Resolve them (set-mapping / createfield / create_record) or record a "
+              "worksheet correction, or pass --bypass-conflicts to import anyway.")
         return 2
 
     to_create, skipped = dedup_payloads(
@@ -777,6 +847,36 @@ def cmd_set_mapping(args) -> int:
     if hasattr(sink, "config_delta"):
         sink.config_delta(path, args.doctype, {"mappings": {args.column: args.target}})
     sink.close()
+    print(sink.summary())
+    return 0
+
+
+def cmd_correct(args) -> int:
+    """Record a worksheet correction; journaled so `revert` revokes it."""
+    from erpgen.corrections import WORKSHEET_DIR, add_correction, worksheet_path
+
+    ws_dir = getattr(args, "worksheet_dir", None) or WORKSHEET_DIR
+    path = worksheet_path(args.doctype, args.source, ws_dir)
+    try:
+        corr = json.loads(args.json)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: --json is not valid JSON: {e}", file=sys.stderr)
+        return 2
+    try:
+        saved, created = add_correction(path, corr, created_by=args.by)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    if not created:
+        print(f"correction {saved['id']} already recorded (no change)")
+        return 0
+    sink = _effect_sink(args, args.doctype, source=args.source, command="correct")
+    sink.effect("correction_add",
+                {"op": "correction_revoke", "path": str(path),
+                 "correction_id": saved["id"]},
+                doctype=args.doctype, source=args.source, correction_id=saved["id"])
+    sink.close()
+    print(f"correction {saved['id']} added to {path}")
     print(sink.summary())
     return 0
 
@@ -1169,6 +1269,20 @@ def _add_query_parsers(sub) -> None:
     p_sm.add_argument("--unset", metavar="COLUMN", help="remove a mapping override")
     p_sm.add_argument("--list", action="store_true", help="show current overrides")
     p_sm.set_defaults(fn=cmd_set_mapping)
+
+    p_co = sub.add_parser(
+        "correct",
+        help="record a worksheet correction (set_value, skip_row, merge_rows, "
+             "dismiss_conflict, change_key); journaled so `revert` revokes it",
+    )
+    p_co.add_argument("source", help="the source sheet the correction answers")
+    p_co.add_argument("--doctype", required=True)
+    p_co.add_argument("--json", required=True,
+                      help='the correction object, e.g. \'{"action":"set_value", '
+                           '"at":{"row":7},"column":"Customer Name","value":"X", '
+                           '"conflict":"missing_value:Customer Name:customer_name"}\'')
+    p_co.add_argument("--by", default="human", help="who authored it (human|agent)")
+    p_co.set_defaults(fn=cmd_correct)
 
 
 def _add_lifecycle_parsers(sub) -> None:

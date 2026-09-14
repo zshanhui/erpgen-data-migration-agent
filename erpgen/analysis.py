@@ -21,12 +21,14 @@ from pathlib import Path
 from typing import Optional
 
 from .client import ERPNextClient
-from .conflicts import (LEAF_ONLY_LINKS, data_quality_conflicts, distinct_values,
-                        fieldtype_for, group_node_values, link_group_node,
-                        link_value_conflict, missing_link_values,
-                        possible_duplicate_pairs, possible_duplicate_row_conflict,
-                        required_mapped_columns, suggested_custom_field,
-                        unmapped_column_conflict)
+from .conflicts import (LEAF_ONLY_LINKS, MAX_PAIRS_ROWS, NEAR_DUP_K,
+                        data_quality_conflicts, distinct_values, fieldtype_for,
+                        group_node_values, link_group_node, link_value_conflict,
+                        missing_link_values, possible_duplicate_pairs,
+                        possible_duplicate_row_conflict, required_mapped_columns,
+                        suggested_custom_field, unmapped_column_conflict)
+from .corrections import (WORKSHEET_DIR, file_sha256, load_worksheet,
+                          merged_corrections, prepare, statuses, worksheet_path)
 from .mapper import MappingEngine, MappingPlan
 from .source import SourceTable
 from .tree import without_self_provided
@@ -60,6 +62,9 @@ def build_analysis(
     id_column: Optional[str] = None,
     base_url: str = "",
     source_path: str = "",
+    prepared=None,
+    key_source: str = "",
+    worksheet_dir: str | Path = WORKSHEET_DIR,
 ) -> dict:
     conflicts: list[dict] = []
     suggested: list[dict] = []
@@ -131,24 +136,31 @@ def build_analysis(
                         m.source, [m.target], linked, nodes))
 
     # ---- cleaning stage: duplicate keys and empty required/key values -------
-    # pure and offline, so it costs nothing beyond the scan
+    # pure and offline, so it costs nothing beyond the scan. The key column is
+    # the one corrections and detection agree on: a `change_key` correction
+    # retargets it without touching the import's id column.
+    previous = load_worksheet(plan.doctype, source_path, worksheet_dir)
+    if prepared is None:
+        prepared = prepare(source, previous, sha256=file_sha256(source_path))
+    key_column = prepared.key_column or id_column
     conflicts.extend(data_quality_conflicts(
         source,
-        key_column=id_column,
-        key_field=_mapped_field(plan, id_column),
+        key_column=key_column,
+        key_field=_mapped_field(plan, key_column),
         required=required_mapped_columns(engine.parent, plan),
         compare_columns=[m.source for m in plan.mappings if m.target],
     ))
 
     # ---- near duplicates: review-only, never a gate ------------------------
-    if id_column:
+    if key_column:
         pairs, pair_count, skipped = possible_duplicate_pairs(
-            source, id_column,
+            source, key_column,
             compare_columns=[m.source for m in plan.mappings if m.target],
         )
         if pair_count:
             conflicts.append(possible_duplicate_row_conflict(
-                id_column, pairs, pair_count, _mapped_field(plan, id_column), skipped))
+                key_column, pairs, pair_count, _mapped_field(plan, key_column),
+                skipped))
 
     covered = set(plan.mapped_fields()) | set(plan.defaults.keys())
     for f in engine.parent.mandatory_fields():
@@ -185,30 +197,69 @@ def build_analysis(
         "Do not import until every 'error'-severity conflict is resolved."
     )
 
+    prev_sha = (previous.get("source") or {}).get("sha256") or ""
+    sha256 = file_sha256(source_path)
+    effective_source = key_source or ("correction" if prepared.key_changed else "guessed")
+    # corrections persist: revoked ones stay for the audit trail, active ones are
+    # refreshed with the tool-added fields (`id`, `key_column`, `from`, …)
+    corrections = merged_corrections(previous.get("corrections"), prepared)
+
     return {
         "schema_version": 1,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "generator": {"tool": "erpgen.py", "k": NEAR_DUP_K,
+                      "max_pairs_rows": MAX_PAIRS_ROWS},
         "doctype": plan.doctype,
-        "source": source_path,
+        "source": {
+            "path": source_path,
+            "sha256": sha256,
+            "rows": source.n_rows,
+            "doctype": plan.doctype,
+            "key_column": key_column or "",
+            "key_source": effective_source,
+        },
         "source_rows": source.n_rows,
         "id_field": plan.id_field,
         "id_column": id_column,
         "base_url": base_url,
         "plan": plan.as_dict(),
         "column_profiles": [p.as_dict() for p in source.profiles],
-        "conflicts": conflicts,
+        "conflicts": statuses(conflicts, prepared, sha256=sha256,
+                              previous=previous.get("conflicts"),
+                              previous_hash=prev_sha),
+        "corrections": corrections,
         "suggested_custom_fields": suggested,
         "agent_instructions": agent_instructions,
     }
 
 
-def save_analysis(analysis: dict, analysis_dir: str | Path) -> Path:
+def save_analysis(analysis: dict, analysis_dir: str | Path,
+                  worksheet_dir: str | Path = WORKSHEET_DIR) -> Path:
     d = Path(analysis_dir)
     d.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S%f")
     path = d / f"analysis-{analysis['doctype'].lower().replace(' ', '-')}-{stamp}.json"
     path.write_text(json.dumps(analysis, indent=2, default=str), encoding="utf-8")
     prune_analyses(d)
+    _write_worksheet(analysis, worksheet_dir)
+    return path
+
+
+def _write_worksheet(analysis: dict,
+                     worksheet_dir: str | Path) -> Optional[Path]:
+    """Write the stable worksheet beside the timestamped snapshot.
+
+    The worksheet is the same document at a stable path, never pruned: it is the
+    one editable block a human changes and the one file the next run reads its
+    corrections back from. Only written when the analysis names a real source
+    (retention tests save bare `{"doctype": ...}` dicts with no source).
+    """
+    src = analysis.get("source")
+    if not isinstance(src, dict) or not src.get("path"):
+        return None
+    path = worksheet_path(analysis["doctype"], src["path"], worksheet_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(analysis, indent=2, default=str), encoding="utf-8")
     return path
 
 

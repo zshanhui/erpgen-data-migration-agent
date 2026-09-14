@@ -11,6 +11,7 @@ and passes with the fix. Files are always restored from an in-memory backup.
 """
 from __future__ import annotations
 
+import importlib.util
 import signal
 import subprocess
 import sys
@@ -200,7 +201,9 @@ MUTATIONS = [
 
     # ---- the decomposed run loop ----
     ("bug: every conflict treated as blocking (not just error severity)", [
-        (AGT, '    return [c for c in analysis["conflicts"] if c["severity"] == "error"]',
+        (AGT, '    return [c for c in analysis["conflicts"]\n'
+              '            if c["severity"] == "error"\n'
+              '            and c.get("status", "open") in ("open", "stale")]',
               '    return list(analysis["conflicts"])  # MUTANT'),
     ], "tests/test_agent_loop.py::test_error_conflicts_filters_by_severity"),
 
@@ -598,7 +601,8 @@ MUTATIONS = [
 
     # ---- phase 3: flat party-sheet analyser wiring ------------------------
     ("bug: flat party sheets skip the cleaning detectors", [
-        (CF, '    conflicts.extend(_flat_data_quality(source, party, spec, fmap, flat, engines))',
+        (CF, '    conflicts.extend(_flat_data_quality(source, party, spec, fmap, flat, engines,\n'
+             '                                        key_column))',
              '    pass  # MUTANT'),
     ], "tests/test_party_data_quality.py::test_both_analysers_report_the_same_defect_identically"),
 
@@ -669,6 +673,25 @@ def run_test(node: str) -> int:
     ).returncode
 
 
+def _restore_file(rel: str, content: str) -> None:
+    """Rewrite a mutated source and drop the bytecode compiled from the mutant.
+
+    A mutation is often the same byte length as the original and is restored
+    within the same second, so the `.pyc` CPython left behind still looks valid
+    for the restored source and the NEXT import — the next mutation's targeted
+    test, and anything run afterwards — silently executes the mutant. Observed
+    with `    if require_effects:` -> `    if False:  # MUTANT` (both 23 bytes),
+    which left `latest_run` preferring logs with nothing to undo long after the
+    source was clean.
+    """
+    path = ROOT / rel
+    path.write_text(content)
+    try:
+        Path(importlib.util.cache_from_source(str(path))).unlink()
+    except OSError:
+        pass
+
+
 def _install_restore_guard(backups: dict) -> None:
     """Restore mutated sources on SIGTERM/SIGINT.
 
@@ -678,7 +701,7 @@ def _install_restore_guard(backups: dict) -> None:
     """
     def _restore(signum, _frame):
         for rel, content in backups.items():
-            (ROOT / rel).write_text(content)
+            _restore_file(rel, content)
         print(f"\n  restored {len(backups)} mutated file(s) on signal {signum}",
               file=sys.stderr)
         raise SystemExit(130)
@@ -711,15 +734,15 @@ def main() -> int:
                     failures.append((label, "test passed with the bug present"))
                 # restore before the next mutation
                 for rel, content in backups.items():
-                    (ROOT / rel).write_text(content)
+                    _restore_file(rel, content)
                 backups.clear()
                 continue
             for rel, content in backups.items():
-                (ROOT / rel).write_text(content)
+                _restore_file(rel, content)
             backups.clear()
     finally:
         for rel, content in backups.items():
-            (ROOT / rel).write_text(content)
+            _restore_file(rel, content)
 
     print()
     if failures:

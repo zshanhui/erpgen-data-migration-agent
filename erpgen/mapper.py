@@ -347,7 +347,8 @@ class MappingEngine:
 
         payloads: list[dict] = []
         errors: list[dict] = []
-        for r_idx, row in enumerate(source.rows, start=2):  # row 1 = header
+        for i, row in enumerate(source.rows):
+            r_idx = source.row_number(i)  # source line number, 1 = header
             parent: dict[str, Any] = dict(plan.defaults)
             child_rows: dict[str, dict] = {}
             row_errors: list[str] = []

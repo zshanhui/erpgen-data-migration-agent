@@ -173,6 +173,21 @@ class MigrationContext:
                 self._log(event="requirement_satisfied", id=rid, by_effect=by_effect,
                           via=via, kind=req.get("kind"))
 
+    def satisfy_conflict(self, conflict: dict, via: str = "correction") -> bool:
+        """Close the requirement a conflict describes, if one is pending.
+
+        A worksheet correction is not an effect — nothing on the site changed —
+        so it closes the requirement by identity with `via: "correction"`, which
+        keeps the run log reading *requirement → satisfied by correction* rather
+        than pretending a fix landed.
+        """
+        ident = _identity_of(conflict)
+        rid = self._ident_pending.get(ident)
+        if rid is None:
+            return False
+        self.satisfy(rid, by_effect=0, via=via)
+        return True
+
     def note_condition(self, kind: str, **info) -> None:
         """Record that a requirement's condition already holds in the world.
 

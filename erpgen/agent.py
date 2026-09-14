@@ -85,14 +85,41 @@ def _erpgen(args: list[str], timeout: int = 300) -> tuple[int, str]:
     return res.returncode, (res.stdout or "") + (res.stderr or "")
 
 
-def latest_analysis(doctype: str):
-    """Newest analysis for exactly this doctype.
+def latest_analysis(doctype: str, source: str = ""):
+    """The analysis to work from: the worksheet, or the newest snapshot.
 
-    Resolution lives in `analysis.analysis_paths` because the filename slug must
-    be matched exactly: a prefix match returns a longer doctype's analysis
-    (Customer vs Customer Group).
+    Worksheet-first because it is the one document a correction is recorded in;
+    the timestamped `analysis/*.json` files are output-only history. The
+    worksheet is matched by the `doctype`/`source.path` it carries rather than by
+    filename, because a doctype slug can be a prefix of another's (Customer vs
+    Customer Group) and the same trap the snapshot lookup once had.
     """
     from erpgen.analysis import analysis_paths  # noqa: PLC0415
+
+    ws_dir = ROOT / "worksheets"
+    worksheets: list[tuple[Path, dict]] = []
+    if ws_dir.exists():
+        for p in ws_dir.glob("*.json"):
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+            if d.get("doctype") == doctype:
+                worksheets.append((p, d))
+
+    if source:
+        for _p, d in worksheets:
+            if (d.get("source") or {}).get("path") == source:
+                return d
+        return None
+
+    if len(worksheets) == 1:
+        return worksheets[0][1]
+    if len(worksheets) > 1:
+        print(f"ERROR: {len(worksheets)} worksheets for {doctype!r}: "
+              + ", ".join(p.name for p, _ in worksheets)
+              + " — pass a source to pick one.", file=sys.stderr)
+        return None
 
     files = analysis_paths(doctype, ROOT / "analysis")
     if not files:
@@ -159,7 +186,7 @@ def t_run_map(source: str, doctype: str = "", defaults: str = "{}") -> str:
         cmd += ["--defaults", defaults]
     code, out = _erpgen(cmd)
     dt = doctype or (flow_for_party(party) if party else guess_doctype(src))
-    fresh = latest_analysis(dt) if dt else None
+    fresh = latest_analysis(dt, source) if dt else None
     if fresh is None:
         return f"map failed (exit {code}):\n{out[-1500:]}"
     return f"map exit {code}. Fresh analysis:\n{_j(fresh)}"
@@ -289,6 +316,24 @@ def t_set_mapping(doctype: str, column: str, target: str) -> str:
         return _j({"error": str(e)})
 
 
+def t_correct(source: str, doctype: str, correction_json: str) -> str:
+    """Record one worksheet correction; the CLI journals it so revert revokes it."""
+    try:
+        corr = json.loads(correction_json)
+    except json.JSONDecodeError as e:
+        return _j({"error": f"correction_json is not valid JSON: {e}"})
+    cmd: list = []
+    run_id = _TRANSCRIPT_CTX.get("run")
+    if run_id:
+        # --run precedes the subcommand, as with run_import, so `revert <run-id>`
+        # revokes the correction alongside the rows it caused
+        cmd += ["--run", str(run_id)]
+    cmd += ["correct", source, "--doctype", doctype, "--by", "agent",
+            "--json", json.dumps(corr)]
+    code, out = _erpgen(cmd)
+    return f"correct exit {code}:\n{out[-1500:]}"
+
+
 def t_describe_doctype(doctype: str) -> str:
     try:
         return _j(describe_doctype(CLIENT, doctype))
@@ -333,6 +378,13 @@ TOOLS = [
                     "sheets use doctype='customers_full'|'suppliers_full' and "
                     "target='<customer|supplier|contact|address>.<fieldname>' "
                     "(e.g. customer.tax_id, supplier.tax_id)."},
+    {"fn": t_correct, "name": "correct",
+     "description": "Record one worksheet correction for a source sheet: set_value "
+                    "(fill a blank cell), skip_row (drop a row), merge_rows (fold a "
+                    "duplicate into another row), dismiss_conflict (waive a conflict "
+                    "with a reason), change_key (retarget the review key). Pass the "
+                    "correction object as JSON; it must name the conflict it answers "
+                    "in its 'conflict' field."},
     {"fn": t_describe_doctype, "name": "describe_doctype",
      "description": "Summarize a doctype's structure (required fields, links, "
                     "child tables, fetch_from, id field)."},
@@ -364,6 +416,12 @@ Conflict kinds and how to fix them:
   value_map, or dismiss the conflict if they are genuinely separate. Do not try to
   make this kind disappear before importing.
 
+Record every correction with the `correct` tool (never edit files by hand). A
+correction must name the conflict it answers in its `conflict` field (the key is
+"<kind>:<source or field>[:<target>]"); for duplicate_row, merge_rows/skip_row
+close it, and for a conflict you have decided to accept, dismiss_conflict with a
+reason closes it.
+
 Flat party sheets (doctype='customers_full' or 'suppliers_full'; ONE file with
 a party + Contact + Address): every conflict is an out-of-contract column and is
 error-severity (blocking). Resolve each via its suggested_action:
@@ -378,15 +436,18 @@ Contacts/Addresses shared between party types are linked automatically on import
 
 Per-iteration workflow:
 1. Read the analysis from the user message or latest_analysis.
-2. Resolve every error-severity conflict (create fields/records, set mappings).
+2. Resolve every error-severity conflict: create fields/records, set mappings,
+   or record a worksheet correction with `correct` (set_value for a blank,
+   skip_row/merge_rows for a duplicate, dismiss_conflict to waive one with a
+   reason). A corrected conflict turns "corrected"/"waived" on the next map.
 3. run_map again and confirm the error-severity conflicts decreased. Repeat until zero.
 4. run_import with apply=True.
 5. Verify with get_record / list_records if useful, then give a final summary.
 
 Rules:
-- Never import while error-severity conflicts remain.
+- Never import while error-severity conflicts remain open or stale.
 - Imports are idempotent: re-running is safe and skips existing records.
-- Never modify source files; record decisions via set_mapping / create_field.
+- Never modify source files; record decisions via set_mapping / create_field / correct.
 - Tools return JSON; reason over it before acting."""  # noqa: E501
 
 
@@ -983,7 +1044,7 @@ def _load_analysis(args, doctype: Optional[str], flat: bool) -> Optional[dict]:
         if args.defaults:
             cmd += ["--defaults", args.defaults]
         _erpgen(cmd)
-        analysis = latest_analysis(doctype)
+        analysis = latest_analysis(doctype, args.source)
         if analysis is None:
             print("ERROR: map produced no analysis", file=sys.stderr)
         return analysis
@@ -994,7 +1055,15 @@ def _load_analysis(args, doctype: Optional[str], flat: bool) -> Optional[dict]:
 
 
 def _error_conflicts(analysis: dict) -> list:
-    return [c for c in analysis["conflicts"] if c["severity"] == "error"]
+    """The conflicts that still stop an import.
+
+    Status, not severity: a `corrected`/`waived`/`resolved` conflict no longer
+    needs the agent's attention, or the loop would stall re-fixing what the
+    worksheet already answered.
+    """
+    return [c for c in analysis["conflicts"]
+            if c["severity"] == "error"
+            and c.get("status", "open") in ("open", "stale")]
 
 
 def _stall_fingerprint(errs: list) -> frozenset:
@@ -1237,7 +1306,9 @@ async def run_agent(args) -> int:
               f"{c.get('source') or c.get('field')}")
 
     doctype = analysis["doctype"]
-    source = analysis.get("source") or args.source or "unknown"
+    src = analysis.get("source")
+    source = (src.get("path") if isinstance(src, dict) else src) \
+        or args.source or "unknown"
 
     # With no conflicts there is nothing for the model to decide, so run the
     # import deterministically and only wake the agent if rows actually failed.
