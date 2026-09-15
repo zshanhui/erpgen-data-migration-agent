@@ -209,7 +209,7 @@ MUTATIONS = [
     # ---- analysis retention ----
     ("bug: retention keeps the OLDEST analyses and deletes the newest", [
         (ANL, 'sorted(entries, key=lambda e: e[0], reverse=True)[keep:]',
-              'sorted(entries, key=lambda e: e[0], reverse=False)[keep:]  # MUTANT'),
+              'sorted(entries, key=lambda e: e[0], reverse=False)[keep:]'),
     ], "tests/test_analysis_retention.py::test_keeps_the_newest_not_the_oldest"),
 
     ("bug: retention caps globally instead of per doctype", [
@@ -219,7 +219,7 @@ MUTATIONS = [
 
     ("bug: retention off-by-one (drops below the cap)", [
         (ANL, 'sorted(entries, key=lambda e: e[0], reverse=True)[keep:]',
-              'sorted(entries, key=lambda e: e[0], reverse=True)[keep - 1:]  # MUTANT'),
+              'sorted(entries, key=lambda e: e[0], reverse=True)[keep - 1:]'),
     ], "tests/test_analysis_retention.py::test_save_analysis_prunes_automatically"),
 
     # ---- the decomposed run loop ----
@@ -693,7 +693,7 @@ MUTATIONS = [
     ], "tests/test_employees.py::test_every_alias_spelling_is_recognised_as_the_id_column"),
 
     ("bug: the employee ID column keeps its scored target", [
-        (EMP, '    mapping.target = ID_FIELD', '    pass  # MUTANT'),
+        (EMP, '    mapping.target = target', '    pass  # MUTANT'),
     ], "tests/test_employees.py::test_the_scorer_alone_would_pick_the_wrong_field"),
 
     ("bug: missing employee IDs are not generated", [
@@ -704,6 +704,41 @@ MUTATIONS = [
         (DED, '    "Employee": {"source": "employee_number", "target": "employee_number"},',
               '    # MUTANT: no Employee key'),
     ], "tests/test_employees.py::test_the_dedup_spec_queries_employee_number_not_name"),
+
+    # ---- the full name, and the columns with no built-in home ----
+    ("bug: the full name maps to the recomputed employee_name again", [
+        (EMP, '        if norm(header) not in NAME_ALIASES or not engine.parent.get("first_name"):',
+              '        if True:  # MUTANT'),
+    ], "tests/test_employees.py::test_full_name_maps_to_first_name_not_employee_name"),
+
+    ("bug: Bank Branch loses its own-field rule (lands on the branch Link)", [
+        (EMP, '    return OWN_FIELDS.get(norm(header))', '    return None  # MUTANT'),
+    ], "tests/test_employees.py::test_bank_branch_is_not_left_on_the_office_branch_link"),
+
+    # ---- department: docnames are `<name> - <company abbr>` ----
+    ("bug: Department targets ignore the company abbreviation", [
+        (EMP, '            mapping[value] = f"{value} - {abbr}"',
+              '            mapping[value] = value  # MUTANT'),
+    ], "tests/test_employees.py::test_department_targets_use_the_company_abbreviation"),
+
+    ("bug: an existing Department is duplicated instead of reused", [
+        (EMP, '        docname = existing.get(value)', '        docname = None  # MUTANT'),
+    ], "tests/test_employees.py::test_an_existing_department_is_reused_by_name_not_duplicated"),
+
+    ("bug: a multi-company sheet gets one per-row value_map", [
+        (EMP, '    return values[0] if len(values) == 1 else ""',
+              '    return values[0] if values else ""  # MUTANT'),
+    ], "tests/test_employees.py::test_two_companies_stop_the_department_mapping"),
+
+    ("bug: prerequisites stop creating the missing Department", [
+        (EMP, '    lines.extend(create_missing_departments(source, client, journal))',
+              '    pass  # MUTANT'),
+    ], "tests/test_employees.py::test_prerequisites_create_the_field_and_the_missing_department"),
+
+    ("bug: the analysis checks raw values instead of mapped ones", [
+        (ANL, '    return [str(vmap.get(v, v)) for v in values]',
+              '    return values  # MUTANT'),
+    ], "tests/test_employees.py::test_link_checks_validate_the_mapped_value"),
 ]
 
 
@@ -787,7 +822,19 @@ def main() -> int:
                     print(f"  SKIP  {label}: anchor not found in {rel}")
                     failures.append((label, "anchor missing"))
                     break
-                p.write_text(s.replace(old, new, 1))
+                mutant = s.replace(old, new, 1)
+                try:
+                    # a mutant that cannot be imported proves nothing: the test
+                    # never runs, and every non-zero exit used to read as CAUGHT.
+                    # Two entries appended `# MUTANT` to a `for ... in <expr>:` line
+                    # and were silently scoring as catches off a SyntaxError.
+                    compile(mutant, rel, "exec")
+                except SyntaxError as e:
+                    print(f"  BROKEN {label}: mutation is not valid Python "
+                          f"({rel}:{e.lineno}: {e.msg})")
+                    failures.append((label, f"mutation does not compile: {e.msg}"))
+                    break
+                p.write_text(mutant)
             else:
                 rc = run_test(node)
                 status = "CAUGHT" if rc == 1 else "MISSED"

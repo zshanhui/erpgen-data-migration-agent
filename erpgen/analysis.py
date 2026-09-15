@@ -95,6 +95,15 @@ def _agent_instructions(doctype: str) -> str:
     )
 
 
+def _mapped_values(values: list[str], plan: MappingPlan,
+                   fieldname: str) -> list[str]:
+    """Apply the field's value_map, so checks see what will land on the site."""
+    vmap = (plan.value_maps or {}).get(fieldname)
+    if not vmap:
+        return values
+    return [str(vmap.get(v, v)) for v in values]
+
+
 def build_analysis(
     client: ERPNextClient,
     source: SourceTable,
@@ -158,7 +167,10 @@ def build_analysis(
         # unresolvable conflict the agent loops on forever.
         linked = t.meta.links_to_doctype
         if linked:
-            values = distinct_values(source, m.source)
+            # validate what will actually land, not the raw cell: a value_map
+            # (Department `Management` -> `Management - DM`) changes it, so
+            # checking the raw value invents a conflict the import never hits
+            values = _mapped_values(distinct_values(source, m.source), plan, m.target)
             missing = missing_link_values(client, values, linked, existing_cache)
             # a self-referencing sheet (Customer Group's parent_customer_group)
             # creates its own parents, so those values are not missing

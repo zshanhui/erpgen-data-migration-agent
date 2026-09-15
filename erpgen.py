@@ -254,7 +254,7 @@ def cmd_map(args) -> int:
         n = apply_overrides(plan, source, engine, overrides)
         if n:
             print(f"Applied {n} mapping override(s) from {o_path}")
-    for line in employees.apply(engine, plan, source):
+    for line in employees.apply(engine, plan, source, client):
         print(f"NOTE: {line}")
     _print_plan(plan, source)
     if args.save:
@@ -509,7 +509,7 @@ def _build_plan(args, source, payload_source=None):
     overrides_path, overrides = _overrides_for(args, plan.doctype)
     if overrides and apply_overrides(plan, source, engine, overrides):
         print(f"Applied mapping override(s) from {overrides_path}")
-    for line in employees.apply(engine, plan, source):
+    for line in employees.apply(engine, plan, source, client):
         print(f"NOTE: {line}")
     _print_plan(plan, source)
 
@@ -550,6 +550,19 @@ def cmd_import(args) -> int:
         return 2
 
     prepared = _load_corrections(args, source, args.doctype)
+
+    # Fields the mapping needs must exist BEFORE the engine reads the doctype:
+    # targets are matched by fieldname, so a column pointing at a field that is
+    # not there yet is dropped without a conflict. Writes, so --apply only.
+    if args.apply:
+        sink = _effect_sink(args, args.doctype, source=args.source,
+                            command="import")
+        try:
+            for line in employees.prerequisites(source, _client(args), journal=sink):
+                print(f"NOTE: {line}")
+        finally:
+            sink.close()
+
     engine, client, plan, payloads, row_errors = _build_plan(
         args, source, payload_source=prepared.source if prepared else None)
 
