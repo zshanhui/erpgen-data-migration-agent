@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""The LLM agent — LlamaIndex AgentWorkflow driving the erpgen migration loop.
+"""The LLM agent — the run loop, the convergence policy and the CLI.
 
-Reached as `erpgen agent ...` (see `add_agent_flags`); there is no separate
-script. `run(args)` takes an already-parsed namespace so the CLI owns argv.
+`erpgen agent ...` lands here (see `add_agent_flags`); there is no separate
+script. Reads the latest mapping analysis for a doctype, then an LLM agent
+resolves the conflicts using tools and loops until error-severity conflicts are
+gone, then imports and verifies.
 
-Reads the latest mapping analysis for a doctype, then an LLM agent resolves the
-conflicts using tools (create fields, create missing records, set mapping
-overrides, re-run map/import) and loops until error-severity conflicts are gone,
-then imports and verifies.
+Layout — this module keeps the *deciding*, the submodules keep the *plumbing*:
+
+  erpgen/agent/tools.py   the eleven tools the model may call, and the registry
+  erpgen/agent/trace.py   live progress on stdout + per-call LLM instrumentation
+  erpgen/agent/__init__.py  (here) the round loop, stall detection, data-quality
+                          flow, reporting, journal wiring and argv handling
+  erpgen/llm_providers.py which provider, endpoint, credential and model
 
 Usage:
   # fresh analysis + agent run
@@ -28,7 +33,10 @@ LLM provider: --provider openai|deepseek|deepinfra (auto-detected from
 OPENAI_API_KEY / DEEPSEEK_API_KEY / DEEPINFRA_API_KEY). DeepSeek defaults to model
 deepseek-flash (V4.1 Flash) on https://api.deepseek.com (--api-base to override),
 and accepts --model flash|pro as shorthands for deepseek-flash / deepseek-v4-pro.
-DeepInfra defaults to model zai-org/GLM-5.3.
+DeepInfra takes full model ids only (no shorthands), e.g.
+--model Qwen/Qwen3.8-Flash; it defaults to the GLM-5.3 flagship zai-org/GLM-5.3.
+The DeepInfra ids checked against /v1/models are listed in DEEPINFRA_KNOWN_MODELS
+and printed by --doctor; any other id the provider serves works too.
 Run with the project venv: .venv/bin/python erpgen.py agent ...
 
 Global flags (--base/--run/--log-dir) live on the CLI's main parser and come
@@ -41,50 +49,73 @@ import asyncio
 import json
 import os
 import re
-import subprocess
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from erpgen.client import ERPNextClient  # noqa: E402
+from erpgen.customers_full import detect_party_sheet, flow_for_party  # noqa: E402
 from erpgen.infer import guess_doctype  # noqa: E402
-from erpgen.mapper import MappingEngine  # noqa: E402
-from erpgen.metadata import fetch_with_children  # noqa: E402
-from erpgen.overrides import DEFAULT_OVERRIDES, load_overrides, set_mapping  # noqa: E402
-from erpgen.customers_full import (  # noqa: E402
-    detect_party_sheet,
-    flat_map_for,
-    flow_for_party,
-    parse_flat_target,
-    party_for_flow,
+# Every provider fact lives in erpgen.llm_providers; only what the run loop
+# actually calls is imported here. It must come in *by name* so that
+# `monkeypatch.setattr(agent, "get_llm", ...)` still intercepts the call.
+from erpgen.llm_providers import (  # noqa: E402
+    DEEPINFRA_KNOWN_MODELS,
+    describe_llm_error,
+    get_llm,
 )
+from erpgen.llm_providers import _is_llm_error, _llm_base, _preflight_llm  # noqa: E402
+from erpgen.overrides import DEFAULT_OVERRIDES  # noqa: E402
 from erpgen.prompts import SYSTEM_PROMPT, correction_proposal_prompt  # noqa: E402
 from erpgen.source import read_source  # noqa: E402
-from erpgen.tools import (  # noqa: E402
-    create_field,
-    create_record,
-    describe_doctype,
-    get_record,
-    list_records,
+
+# The package facade. `__init__` re-exports its own submodules so that
+# `erpgen.agent.<name>` keeps working for the CLI and the tests, which reach for
+# the tools and the tracer through the package rather than by deep path. Names
+# the loop itself uses are called here; the rest are the deliberate surface.
+from erpgen.agent import tools as _tools  # noqa: E402
+from erpgen.agent.tools import (  # noqa: E402
+    TOOLS,
+    _erpgen,
+    import_failure_count,
+    t_correct,
+    t_latest_analysis,
+    t_run_import,
+    t_run_map,
+    warning_digest,
+)
+from erpgen.agent.trace import (  # noqa: E402
+    _LIVE,
+    _TRANSCRIPT_CTX,
+    _brief,
+    _brief_args,
+    _live,
+    _log_llm_event,
+    _requested_tools,
+    _safe,
+    _text,
+    _thinking,
+    _wrap_tool,
+    instrumented_llm,
+    llm_usage,
 )
 
-CLIENT: ERPNextClient = None  # set in main()
-_TRANSCRIPT_CTX: dict = {}  # {round, log_event} set before each agent round
-
-
-# ---------------------------------------------------------------- plumbing
-def _erpgen(args: list[str], timeout: int = 300) -> tuple[int, str]:
-    res = subprocess.run(
-        [sys.executable, str(ROOT / "erpgen.py"), *args],
-        capture_output=True, text=True, cwd=ROOT, timeout=timeout,
-    )
-    return res.returncode, (res.stdout or "") + (res.stderr or "")
+#: Re-exported on purpose: a package `__init__` is the facade for its own
+#: submodules, and the CLI and the tests reach for these as `erpgen.agent.<name>`
+#: rather than by deep path. Listed so the re-export reads as deliberate instead
+#: of as imports nobody got round to using.
+__all__ = [
+    "TOOLS", "_erpgen", "import_failure_count", "t_correct",
+    "t_latest_analysis", "t_run_import", "t_run_map", "warning_digest",
+    "_LIVE", "_TRANSCRIPT_CTX", "_brief", "_brief_args", "_live",
+    "_log_llm_event", "_requested_tools", "_safe", "_text", "_thinking",
+    "_wrap_tool", "instrumented_llm", "llm_usage",
+]
 
 
 def latest_analysis(doctype: str, source: str = ""):
@@ -129,767 +160,12 @@ def latest_analysis(doctype: str, source: str = ""):
     return json.loads(files[-1].read_text(encoding="utf-8"))
 
 
-def _j(v) -> str:
-    return json.dumps(v, indent=2, default=str)
-
-
-def _text(value) -> str:
-    """Normalize an agent result to plain text.
-
-    llama-index may hand back a str, a ChatMessage, or an AgentOutput depending
-    on how the workflow finishes — unwrap any of them safely.
-
-    A message with no content (the model ended its turn on a tool call) yields
-    "", never a role repr like "user: None".
-    """
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    content = getattr(value, "content", None)
-    if isinstance(content, str) and content.strip():
-        return content
-    # newer llama-index keeps text in .blocks
-    blocks = getattr(value, "blocks", None) or []
-    parts = [getattr(b, "text", None) for b in blocks if getattr(b, "text", None)]
-    if parts:
-        return "\n".join(parts)
-    if content:
-        return str(content)
-    if hasattr(value, "role") or hasattr(value, "blocks"):
-        return ""          # content-less chat message: no text to show
-    return str(value)
-
-
-def _safe(value, limit: int = 1000) -> str:
-    """Serialize arbitrary tool args/results for the transcript log."""
-    try:
-        s = json.dumps(value, default=str)
-    except Exception:
-        s = str(value)
-    return s[:limit]
-
-
-# ---------------------------------------------------------------- tools
-def t_latest_analysis(doctype: str, source: str = "") -> str:
-    a = latest_analysis(doctype, source)
-    if a is None:
-        return "No analysis found. Run map first (or use the run_map tool)."
-    return _j(a)
-
-
-def t_run_map(source: str, doctype: str = "", defaults: str = "{}") -> str:
-    cmd = ["map", source]
-    src = read_source(source)
-    party = detect_party_sheet(src)
-    if not party and doctype:
-        cmd += ["--doctype", doctype]
-    if defaults and defaults != "{}":
-        cmd += ["--defaults", defaults]
-    code, out = _erpgen(cmd)
-    dt = doctype or (flow_for_party(party) if party else guess_doctype(src))
-    fresh = latest_analysis(dt, source) if dt else None
-    if fresh is None:
-        return f"map failed (exit {code}):\n{out[-1500:]}"
-    return f"map exit {code}. Fresh analysis:\n{_j(fresh)}"
-
-
-def warning_digest(out: str, cap: int = 5) -> str:
-    """Group the per-row `WARNING:` lines so the *reason* survives truncation.
-
-    Only the tail of an import is returned to the model, but with many failing
-    rows the per-row warnings — which carry the actual error — sit at the front
-    and get cut off. The agent then knows "29 failed" without knowing why, and
-    burns rounds guessing at it.
-    """
-    counts: dict[str, int] = {}
-    first_seen: dict[str, str] = {}
-    for line in out.splitlines():
-        line = line.strip()
-        if not line.startswith("WARNING:"):
-            continue
-        msg = " ".join(line[len("WARNING:"):].split())
-        # "row 2: Customer 'Acme' failed: <reason>" — group on <reason>, not the
-        # row-specific prefix, or every row looks like a distinct problem
-        head, sep, body = msg.partition(" failed: ")
-        key = " ".join((body if sep else msg).split())[:220]
-        counts[key] = counts.get(key, 0) + 1
-        first_seen.setdefault(key, head)
-    if not counts:
-        return ""
-    total = sum(counts.values())
-    lines = [f"\n{total} row warning(s), grouped by cause (most common first):"]
-    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    for msg, n in ranked[:cap]:
-        where = f"   [first: {first_seen[msg]}]" if first_seen.get(msg) else ""
-        lines.append(f"  x{n}  {msg}{where}")
-    if len(ranked) > cap:
-        lines.append(f"  ... +{len(ranked) - cap} more distinct warning(s)")
-    if len(ranked) == 1 and total > 1:
-        lines.append("  -> every failing row shares ONE reason: suspect a "
-                     "schema/environment problem (e.g. a custom field whose "
-                     "database column is missing), not bad source data.")
-    return "\n".join(lines)
-
-
-def import_failure_count(out: str) -> int:
-    """Row failures reported by an import run, across its three output shapes."""
-    m = re.search(r"REST upsert: created \d+, failed (\d+)", out)
-    if m:
-        return int(m.group(1))
-    flat = [int(n) for n in re.findall(r"\|\s*failed (\d+)", out)]
-    if flat:
-        return sum(flat)
-    m = re.search(r'"failed":\s*(\d+)', out)      # --bulk result JSON
-    if m:
-        return int(m.group(1))
-    m = re.search(r"failed:\s*(\d+)", out)        # "Import summary" block
-    if m:
-        return int(m.group(1))
-    # last resort: the summary was truncated away, so count the row warnings
-    return sum(1 for line in out.splitlines() if line.strip().startswith("WARNING:"))
-
-
-def t_run_import(source: str, doctype: str = "", apply: bool = False,
-                 defaults: str = "{}") -> str:
-    cmd: list = []
-    run_id = _TRANSCRIPT_CTX.get("run")
-    if run_id:
-        # --run is a GLOBAL flag, so it must precede the subcommand. Without it
-        # the import journals to its own file, and `revert <run-id>` would leave
-        # every imported row behind (it cannot order across files).
-        cmd += ["--run", str(run_id)]
-    cmd += ["import", source]
-    if doctype:
-        cmd += ["--doctype", doctype]
-    if defaults and defaults != "{}":
-        cmd += ["--defaults", defaults]
-    if apply:
-        cmd.append("--apply")
-    code, out = _erpgen(cmd, timeout=900)
-    return f"import exit {code}:\n{out[-2000:]}{warning_digest(out)}"
-
-
-def t_create_field(doctype: str, label: str, fieldtype: str = "Data") -> str:
-    try:
-        r = create_field(CLIENT, doctype, label, fieldtype=fieldtype)
-        return _j(r)
-    except Exception as e:  # noqa: BLE001
-        return _j({"error": str(e)})
-
-
-def t_create_record(doctype: str, fields_json: str) -> str:
-    try:
-        fields = json.loads(fields_json)
-        r = create_record(CLIENT, doctype, fields)
-        return _j(r)
-    except Exception as e:  # noqa: BLE001
-        return _j({"error": str(e)})
-
-
-def t_set_mapping(doctype: str, column: str, target: str) -> str:
-    try:
-        flow_party = party_for_flow(doctype)
-        if flow_party:
-            parsed = parse_flat_target(target)
-            if parsed is None:
-                allowed = "|".join(sorted({k for k, _ in flat_map_for(flow_party).values()}))
-                return _j({"error": f"flat target must be '<doctype>.<fieldname>' "
-                                    f"with doctype in {allowed} (got {target!r})"})
-            dt_key, field = parsed
-            canonical = {"customer": "Customer", "supplier": "Supplier",
-                         "contact": "Contact", "address": "Address"}[dt_key]
-            parent, children = fetch_with_children(CLIENT, canonical)
-            valid = {t.qualified for t in MappingEngine(parent, children).targets}
-            if field not in valid:
-                return _j({"error": f"field '{field}' is not on {canonical}; "
-                                    "create_field it first"})
-        path = str(ROOT / DEFAULT_OVERRIDES)
-        prev = ((load_overrides(path).get(doctype) or {}).get("mappings") or {}).get(column)
-        set_mapping(path, doctype, column, target)
-        # journal the decision like the CLI does, so it is revertible (inverse
-        # restores the previous mapping) and resolves ambiguous_mapping requirements
-        from erpgen import tools as _t  # noqa: PLC0415
-        if _t.ACTIVE_JOURNAL is not None:
-            _t.ACTIVE_JOURNAL.override_set(doctype, column, target, prev, path)
-        return _j({"saved": f"{doctype}.{column} -> {target}", "file": path,
-                   "previous": prev})
-    except Exception as e:  # noqa: BLE001
-        return _j({"error": str(e)})
-
-
-def t_correct(source: str, doctype: str, correction_json: str,
-              conflict: str = "") -> str:
-    """Record one worksheet correction; the CLI journals it so revert revokes it.
-
-    `conflict` is accepted for leniency: the tool description asks for it inside
-    `correction_json`, but the model sometimes passes it top-level too. When it
-    does (and the correction does not already name one), merge it in rather than
-    failing the call.
-    """
-    try:
-        corr = json.loads(correction_json)
-    except json.JSONDecodeError as e:
-        return _j({"error": f"correction_json is not valid JSON: {e}"})
-    if conflict and isinstance(corr, dict) and not corr.get("conflict"):
-        corr["conflict"] = conflict
-    cmd: list = []
-    run_id = _TRANSCRIPT_CTX.get("run")
-    if run_id:
-        # --run precedes the subcommand, as with run_import, so `revert <run-id>`
-        # revokes the correction alongside the rows it caused
-        cmd += ["--run", str(run_id)]
-    cmd += ["correct", source, "--doctype", doctype, "--by", "agent",
-            "--json", json.dumps(corr)]
-    code, out = _erpgen(cmd)
-    return f"correct exit {code}:\n{out[-1500:]}"
-
-
-def t_describe_doctype(doctype: str) -> str:
-    try:
-        return _j(describe_doctype(CLIENT, doctype))
-    except Exception as e:  # noqa: BLE001
-        return _j({"error": str(e)})
-
-
-def t_get_record(doctype: str, name: str) -> str:
-    try:
-        return _j(get_record(CLIENT, doctype, name))
-    except Exception as e:  # noqa: BLE001
-        return _j({"error": str(e)})
-
-
-def t_list_records(doctype: str, filters_json: str = "") -> str:
-    try:
-        filters = json.loads(filters_json) if filters_json else None
-        return _j(list_records(CLIENT, doctype, filters=filters))
-    except Exception as e:  # noqa: BLE001
-        return _j({"error": str(e)})
-
-
-TOOLS = [
-    {"fn": t_latest_analysis, "name": "latest_analysis",
-     "description": "Return the most recent mapping analysis JSON for a doctype "
-                    "(conflicts, mappings, suggested custom fields). Pass source "
-                    "to disambiguate when several sheets share one doctype."},
-    {"fn": t_run_map, "name": "run_map",
-     "description": "Re-run the mapper for a source file and doctype; returns the "
-                    "fresh analysis JSON. Pass defaults as JSON for required fields."},
-    {"fn": t_run_import, "name": "run_import",
-     "description": "Run the (idempotent) import for a source file and doctype. "
-                    "Set apply=True to actually import; default is a dry run."},
-    {"fn": t_create_field, "name": "create_field",
-     "description": "Create a custom field (column) on a doctype. Idempotent."},
-    {"fn": t_create_record, "name": "create_record",
-     "description": "Create a record in any doctype. Pass fields as JSON. "
-                    "Idempotent by the doctype's name field. Use describe_doctype "
-                    "to learn required fields."},
-    {"fn": t_set_mapping, "name": "set_mapping",
-     "description": "Record a forced source-column -> target-field mapping override "
-                    "for a doctype. Fixes ambiguous/missed mappings. For flat party "
-                    "sheets use doctype='customers_full'|'suppliers_full' and "
-                    "target='<customer|supplier|contact|address>.<fieldname>' "
-                    "(e.g. customer.tax_id, supplier.tax_id)."},
-    {"fn": t_correct, "name": "correct",
-     "description": "Record ONE worksheet correction for a source sheet. Actions "
-                    "and their exact JSON fields (a row ref is the key value as a "
-                    "string, or {\"row\": N} for a source line number, 1 = header):\n"
-                    "- set_value: {\"action\":\"set_value\",\"at\":<ref>,\"column\":\"<col>\",\"value\":\"<v>\",\"conflict\":\"<key>\"}\n"
-                    "- skip_row: {\"action\":\"skip_row\",\"at\":<ref>,\"reason\":\"...\",\"conflict\":\"<key>\"}\n"
-                    "- merge_rows: {\"action\":\"merge_rows\",\"keep\":<ref>,\"drop\":[<ref>,...],\"field_overrides\":{\"<col>\":\"<v>\"},\"conflict\":\"<key>\"}\n"
-                    "- dismiss_conflict: {\"action\":\"dismiss_conflict\",\"conflict\":\"<key>\",\"reason\":\"...\"}\n"
-                    "- change_key: {\"action\":\"change_key\",\"column\":\"<col>\",\"reason\":\"...\"}\n"
-                    "The conflict key is \"<kind>:<source or field>[:<target>]\" "
-                    "(e.g. \"duplicate_row:Customer Name:customer_name\")."},
-    {"fn": t_describe_doctype, "name": "describe_doctype",
-     "description": "Summarize a doctype's structure (required fields, links, "
-                    "child tables, fetch_from, id field)."},
-    {"fn": t_get_record, "name": "get_record",
-     "description": "Fetch a single record by name as JSON."},
-    {"fn": t_list_records, "name": "list_records",
-     "description": "List records of a doctype (optional ERPNext filters JSON)."},
-]
-
-
-# ---------------------------------------------------------------- llm
-# Live progress, streamed to stdout. A single round can take minutes and make
-# dozens of remote calls; without this the CLI user watches a blank screen and
-# has to guess whether it is working. `--quiet` silences it.
-_LIVE: dict = {"enabled": True, "indent": "  ", "echo_content": True}
-
-
-def _live(message: str) -> None:
-    if _LIVE["enabled"]:
-        print(message, flush=True)
-
-
-def _brief(value: Any, limit: int = 100) -> str:
-    """One-line, length-capped rendering for live output."""
-    text = " ".join(str(value).split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
-def _brief_args(args, kwargs) -> str:
-    if kwargs:
-        parts = [f"{k}={_brief(v, 45)}" for k, v in kwargs.items()]
-    else:
-        parts = [_brief(a, 45) for a in args]
-    return ", ".join(parts)
-
-
-def _thinking(response) -> str:
-    """The model's own words for this step — its visible reasoning."""
-    msg = getattr(response, "message", None)
-    return _brief(getattr(msg, "content", "") or "", 170)
-
-
-def _requested_tools(response) -> list:
-    """Names of the tools the model asked for in this response.
-
-    llama-index exposes these on the response, which delegates to the message;
-    fall back to the message directly for response shapes that only set it there.
-    """
-    calls = getattr(response, "tool_calls", None)
-    if not calls:
-        calls = getattr(getattr(response, "message", None), "tool_calls", None)
-    names: list = []
-    for call in (calls or []):
-        name = getattr(call, "tool_name", None)
-        if not name:
-            tool = getattr(call, "tool", None)
-            name = (getattr(getattr(tool, "metadata", None), "name", None)
-                    or getattr(tool, "name", None))
-        if name:
-            names.append(str(name))
-    return names
-
-
-def _live_llm_request(messages) -> None:
-    if _LIVE["enabled"]:
-        _live(f"{_LIVE['indent']}· llm #{_TRANSCRIPT_CTX.get('llm_calls', 0)} → "
-              f"{len(messages)} msg(s)")
-
-
-def _live_llm_response(response, started: float) -> None:
-    """Show what one remote call cost, and what it decided to do next."""
-    if not _LIVE["enabled"]:
-        return
-    bits = [f"{_elapsed_ms(started)}ms"]
-    usage = llm_usage(response)
-    if usage.get("total_tokens") is not None:
-        bits.append(f"{usage['total_tokens']:,} tok")
-    wanted = _requested_tools(response)
-    if wanted:
-        bits.append("wants " + ", ".join(wanted))
-    _live(f"{_LIVE['indent']}· llm #{_TRANSCRIPT_CTX.get('llm_calls', 0)} ← "
-          + " · ".join(bits))
-    if _LIVE.get("echo_content", True):
-        thought = _thinking(response)
-        if thought:
-            _live(f"{_LIVE['indent']}    “{thought}”")
-
-
-def _log_llm_event(event: str, **fields) -> None:
-    """Record an LLM transport event on the active transcript (if any).
-
-    Also counts requests, so the run can report how many remote calls it cost.
-    """
-    if event == "llm_request":
-        _TRANSCRIPT_CTX["llm_calls"] = _TRANSCRIPT_CTX.get("llm_calls", 0) + 1
-        fields.setdefault("call_no", _TRANSCRIPT_CTX["llm_calls"])
-    log = _TRANSCRIPT_CTX.get("log_event")
-    if log:
-        log(event=event, round=_TRANSCRIPT_CTX.get("round"), **fields)
-
-
-def _elapsed_ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
-
-
-def llm_usage(response) -> dict:
-    """Token usage from a ChatResponse, when the provider reports it.
-
-    Deliberately tolerant: `raw` may be an OpenAI object, a plain dict, or
-    absent entirely, and a missing usage block must never break a run.
-    """
-    raw = getattr(response, "raw", None)
-    usage = getattr(raw, "usage", None)
-    if usage is None and isinstance(raw, dict):
-        usage = raw.get("usage")
-    if usage is None:
-        return {}
-
-    def _get(key):
-        if isinstance(usage, dict):
-            return usage.get(key)
-        return getattr(usage, key, None)
-
-    out = {}
-    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        value = _get(key)
-        if value is not None:
-            out[key] = value
-    return out
-
-
-def instrumented_llm(base_cls):
-    """Wrap an LLM class so every remote call lands in the run transcript.
-
-    llama-index does NOT emit callback events for `OpenAILike` (the
-    `@llm_chat_callback()` decorator is only applied in `custom.py` and
-    `structured_llm.py`), so this instruments the two entry points
-    `FunctionAgent` actually funnels through: `achat_with_tools` -> `achat`,
-    and `astream_chat_with_tools` -> `astream_chat`.
-
-    Emits `llm_request` / `llm_response` / `llm_failure` with the round, elapsed
-    time and token usage. Message *content* is never logged — only counts.
-    """
-
-    class _Instrumented(base_cls):
-        async def achat(self, *args, **kwargs):
-            messages = kwargs.get("messages") or (args[0] if args else None) or []
-            started = time.monotonic()
-            _log_llm_event(event="llm_request", method="achat",
-                           model=str(getattr(self, "model", "") or ""),
-                           messages=len(messages))
-            _live_llm_request(messages)
-            try:
-                response = await super().achat(*args, **kwargs)
-            except BaseException as e:
-                _log_llm_event(event="llm_failure", method="achat",
-                               duration_ms=_elapsed_ms(started),
-                               error=f"{type(e).__name__}: {e}")
-                _live(f"{_LIVE['indent']}· llm failed after "
-                      f"{_elapsed_ms(started)}ms: {type(e).__name__}")
-                raise
-            _log_llm_event(event="llm_response", method="achat",
-                           duration_ms=_elapsed_ms(started),
-                           **llm_usage(response))
-            _live_llm_response(response, started)
-            return response
-
-        async def astream_chat(self, *args, **kwargs):
-            messages = kwargs.get("messages") or (args[0] if args else None) or []
-            started = time.monotonic()
-            _log_llm_event(event="llm_request", method="astream_chat",
-                           model=str(getattr(self, "model", "") or ""),
-                           messages=len(messages))
-            _live_llm_request(messages)
-            try:
-                inner = await super().astream_chat(*args, **kwargs)
-            except BaseException as e:
-                # fails before a generator exists — still a remote call attempt
-                _log_llm_event(event="llm_failure", method="astream_chat",
-                               duration_ms=_elapsed_ms(started),
-                               error=f"{type(e).__name__}: {e}")
-                _live(f"{_LIVE['indent']}· llm failed after "
-                      f"{_elapsed_ms(started)}ms: {type(e).__name__}")
-                raise
-
-            async def _logged():
-                last = None
-                try:
-                    async for chunk in inner:
-                        last = chunk
-                        yield chunk
-                except BaseException as e:
-                    _log_llm_event(event="llm_failure", method="astream_chat",
-                                   duration_ms=_elapsed_ms(started),
-                                   error=f"{type(e).__name__}: {e}")
-                    _live(f"{_LIVE['indent']}· llm stream failed after "
-                          f"{_elapsed_ms(started)}ms: {type(e).__name__}")
-                    raise
-                # a streaming call is only complete once fully drained
-                _log_llm_event(event="llm_response", method="astream_chat",
-                               duration_ms=_elapsed_ms(started),
-                               streamed=True, **llm_usage(last))
-                _live_llm_response(last, started)
-
-            return _logged()
-
-    _Instrumented.__name__ = f"Instrumented{base_cls.__name__}"
-    return _Instrumented
-
-
-#: hard bound on one LLM request, so a hung endpoint surfaces as a timeout
-#: error instead of an open connection the operator has to Ctrl-C out of
-LLM_TIMEOUT = 120
-
-#: DeepSeek's canonical id for V4.1 Flash. DeepSeek still accepts the older
-#: aliases (`deepseek-v4-flash`, `deepseek-chat`) and serves this same model for
-#: them, but `deepseek-v4.1-flash` is rejected outright — /v1/models lists only
-#: `deepseek-flash` and `deepseek-v4-pro`.
-DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
-
-#: Short `--model` names, so `--model pro` / `--model flash` work without the
-#: caller having to know that the flash id dropped its version number.
-DEEPSEEK_MODEL_ALIASES = {
-    "flash": "deepseek-flash",
-    "pro": "deepseek-v4-pro",
-}
-
-
-def resolve_deepseek_model(model: str) -> str:
-    """Map a short alias to DeepSeek's canonical id; pass anything else through.
-
-    Only `flash`/`pro` (case- and whitespace-insensitive) are rewritten, so
-    `--model` can still name any model the provider serves — a full id is never
-    second-guessed. An empty name means "provider default".
-    """
-    name = (model or "").strip()
-    return DEEPSEEK_MODEL_ALIASES.get(name.lower()) or name or DEFAULT_DEEPSEEK_MODEL
-
-
-def _deepseek_llm(model: str, api_base: str):
-    """OpenAI-compatible client for DeepSeek.
-
-    Uses llama-index's OpenAILike (not the OpenAI class, whose metadata
-    property validates model names against OpenAI's registry and rejects
-    DeepSeek model ids). is_function_calling_model=True is required for the
-    FunctionAgent tool loop.
-
-    The default is `DEFAULT_DEEPSEEK_MODEL` (V4.1 Flash); see
-    `resolve_deepseek_model` for the `flash`/`pro` shorthands.
-    """
-    from llama_index.llms.openai_like import OpenAILike
-
-    return instrumented_llm(OpenAILike)(
-        model=resolve_deepseek_model(model),
-        api_key=os.environ.get("DEEPSEEK_API_KEY"),
-        api_base=api_base or "https://api.deepseek.com",
-        is_chat_model=True,
-        is_function_calling_model=True,
-        # fail fast and loud: no silent SDK retries, and a hard read bound so a
-        # hung request surfaces as APITimeoutError instead of an open connection
-        timeout=LLM_TIMEOUT,
-        max_retries=0,
-    )
-
-
-def _deepinfra_llm(model: str, api_base: str):
-    """OpenAI-compatible client for DeepInfra (GLM and friends)."""
-    from llama_index.llms.openai_like import OpenAILike
-
-    return instrumented_llm(OpenAILike)(
-        model=model or "zai-org/GLM-5.3",
-        api_key=os.environ.get("DEEPINFRA_API_KEY"),
-        api_base=api_base or "https://api.deepinfra.com/v1/openai",
-        is_chat_model=True,
-        is_function_calling_model=True,
-        timeout=LLM_TIMEOUT,
-        max_retries=0,
-    )
-
-
-def llm_preflight(api_base: str, api_key: str, *, timeout: int = 10,
-                  resolve=None, open_url=None) -> tuple[bool, str]:
-    """Probe the LLM endpoint so a network problem is reported clearly.
-
-    The OpenAI SDK wraps *every* transport failure — DNS, TLS verification,
-    a dead proxy, connection refused — in a bare `APIConnectionError` with no
-    hint about which. This resolves the host, does a real request, and reports
-    the HTTP status: 401/403 means the endpoint is reachable, so the problem is
-    the key rather than the network.
-
-    `resolve`/`open_url` are injection seams so this can be unit-tested offline.
-    """
-    import socket
-    import urllib.error
-    import urllib.request
-    from urllib.parse import urlparse
-
-    resolve = resolve or socket.getaddrinfo
-    open_url = open_url or urllib.request.urlopen
-
-    url = api_base if "://" in api_base else f"https://{api_base}"
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    proxies = {k: v for k, v in os.environ.items()
-               if k.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy")}
-
-    try:
-        infos = resolve(host, port, proto=socket.IPPROTO_TCP)
-        ips = sorted({i[4][0] for i in infos})
-    except Exception as e:  # noqa: BLE001 — DNS failure is the whole point
-        return False, (f"DNS lookup failed for {host}: {type(e).__name__}: {e}\n"
-                       f"  proxies in env: {proxies or 'none'}")
-
-    try:
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
-        with open_url(req, timeout=timeout) as resp:
-            return True, f"{url} reachable (HTTP {resp.status})"
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return True, (f"{url} reachable (HTTP {e.code}) — network is fine, "
-                          "check the API key")
-        if e.code == 404:
-            # DNS, TCP and TLS all succeeded — an API root routinely has no
-            # handler, so blaming --api-base here is misleading noise.
-            return True, (f"{url} reachable (HTTP 404 at the root — normal for "
-                          "many API hosts)")
-        return True, (f"{url} reachable (HTTP {e.code}) — if calls also fail, "
-                      "check --api-base")
-    except Exception as e:  # noqa: BLE001
-        return False, (f"cannot reach {url}: {type(e).__name__}: {e}\n"
-                       f"  resolved {host} -> {', '.join(ips)}\n"
-                       f"  proxies in env: {proxies or 'none'}")
-
-
-def describe_llm_error(exc: BaseException, api_base: str, model: str = "",
-                       provider: str = "") -> str:
-    """Turn any LLM failure into an actionable help block.
-
-    Classifies by HTTP status first, then by class name, because the OpenAI SDK
-    raises the *same* `APIConnectionError` for DNS failure, TLS verification
-    errors, a dead proxy and a refused connection. Always prints the endpoint and
-    model actually in use, then concrete next steps.
-    """
-    name = type(exc).__name__
-    status = getattr(exc, "status_code", None)
-    raw = " ".join(str(exc).split())[:300]
-    low = f"{name} {raw}".lower()
-    curl = "curl -sS -m 5 -o /dev/null -w '%{http_code}\\n' " + api_base + "/"
-
-    if status == 401 or "authenticationerror" in low:
-        cause = "The API key is missing, wrong, or revoked (HTTP 401)."
-        steps = ["export DEEPSEEK_API_KEY=... then re-run",
-                 "Or use --provider openai with OPENAI_API_KEY."]
-    elif status == 403 or "permissiondenied" in low:
-        cause = "The key is valid but not allowed to use this model (HTTP 403)."
-        steps = ["Check the key's project/scope, or change --model."]
-    elif status == 404 or "notfounderror" in low:
-        cause = "Endpoint or model not found (HTTP 404)."
-        steps = [f"Model in use: {model or '(provider default)'} — check the exact id.",
-                 "For DeepSeek use: --api-base https://api.deepseek.com"]
-    elif status == 429 or "ratelimit" in low:
-        cause = "Rate limited or out of quota (HTTP 429)."
-        steps = ["Retry shortly; lower --max-rounds; check the account balance."]
-    elif status == 400 or "badrequesterror" in low:
-        cause = ("The request was rejected (HTTP 400) — usually context length, "
-                 "or a tool schema the model refuses.")
-        steps = ["Try one smaller sheet, or a model with a larger context window."]
-    elif isinstance(status, int) and 500 <= status < 600:
-        cause = f"The provider failed server-side (HTTP {status})."
-        steps = ["Retry; if it persists, try --provider openai."]
-    elif any(k in low for k in ("connection", "connect", "timeout", "ssl",
-                                "proxy", "unreachable", "getaddrinfo")):
-        cause = ("Network/transport failure — DNS, TLS verification, a dead proxy "
-                 "or a firewall. The SDK reports all of these identically.")
-        steps = ["env | grep -iE 'proxy'    # a stale HTTPS_PROXY is the usual cause",
-                 curl,
-                 "401 from curl = network works (so the key is the problem);",
-                 "no response at all = blocked by DNS/VPN/firewall.",
-                 "Or pass --api-base <url>, or --provider openai."]
-    else:
-        cause = "Unexpected LLM failure."
-        steps = ["Re-run with AGENT_DEBUG=1 to see the full traceback."]
-
-    out = [f"LLM call failed — {name}: {raw}", "",
-           f"  endpoint : {api_base}",
-           f"  model    : {model or '(provider default)'}"]
-    if provider:
-        out.append(f"  provider : {provider}")
-    out += ["", f"  {cause}", "", "  Next steps:"]
-    out += [f"    {s}" for s in steps]
-    out += ["", "  No LLM needed (builds every analysis offline):",
-            "    DOCTOR=1 scripts/run-all-agentic.sh"]
-    return "\n".join(out)
-
-
 def _is_iteration_exhausted(exc: BaseException) -> bool:
     """True when the workflow stopped because its internal step budget ran out."""
     name = type(exc).__name__
     if "WorkflowRuntimeError" in name or "MaxIterations" in name:
         return True
     return "max iterations" in str(exc).lower()
-
-
-def _is_llm_error(exc: BaseException) -> bool:
-    """True for OpenAI/httpx API failures, as opposed to a bug in our own code."""
-    if type(exc).__module__.split(".")[0] in ("openai", "httpx", "httpcore"):
-        return True
-    name = type(exc).__name__.lower()
-    return any(k in name for k in ("apierror", "connection", "timeout", "ratelimit",
-                                   "authentication", "permissiondenied", "notfound"))
-
-
-def _openai_llm(model: str):
-    """OpenAI LLM, instrumented so its calls are logged like DeepSeek's."""
-    from llama_index.llms.openai import OpenAI
-
-    return instrumented_llm(OpenAI)(model=model or "gpt-4o-mini",
-                                    timeout=LLM_TIMEOUT, max_retries=0)
-
-
-def get_llm(provider: str, model: str, api_base: str = ""):
-    if provider == "openai":
-        return _openai_llm(model)
-    if provider == "deepseek":
-        if not os.environ.get("DEEPSEEK_API_KEY"):
-            raise SystemExit(
-                "DEEPSEEK_API_KEY is not set. export DEEPSEEK_API_KEY=... "
-                "(or pass --provider openai)"
-            )
-        return _deepseek_llm(model, api_base)
-    if provider == "deepinfra":
-        if not os.environ.get("DEEPINFRA_API_KEY"):
-            raise SystemExit(
-                "DEEPINFRA_API_KEY is not set. export DEEPINFRA_API_KEY=... "
-                "(or pass --provider openai)"
-            )
-        return _deepinfra_llm(model, api_base)
-    if os.environ.get("OPENAI_API_KEY"):
-        return _openai_llm(model)
-    if os.environ.get("DEEPSEEK_API_KEY"):
-        return _deepseek_llm(model, api_base)
-    if os.environ.get("DEEPINFRA_API_KEY"):
-        return _deepinfra_llm(model, api_base)
-    raise SystemExit(
-        "No LLM provider configured. Set OPENAI_API_KEY, DEEPSEEK_API_KEY "
-        "or DEEPINFRA_API_KEY and choose --provider openai|deepseek|deepinfra."
-    )
-
-
-def _wrap_tool(fn, name):
-    """Wrap a tool function so every call is logged to the run transcript.
-
-    functools.wraps preserves the original signature, so FunctionTool still
-    builds the correct JSON schema for the model.
-    """
-    import functools
-
-    @functools.wraps(fn)
-    def wrapped(*args, **kwargs):
-        ctx = _TRANSCRIPT_CTX
-        log = ctx.get("log_event")
-        rnd = ctx.get("round")
-        call_args = kwargs if kwargs else args
-        if log:
-            log(event="tool_call", round=rnd, name=name,
-                kwargs=_safe(call_args))
-        # greppable marker: `grep ToolUse:` lists every tool the agent ran
-        _live(f"{_LIVE['indent']}  ToolUse:{name} {_brief_args(args, kwargs)}")
-        try:
-            result = fn(*args, **kwargs)
-        except BaseException as e:
-            # a raising tool must be visible immediately, not just in the log
-            if log:
-                log(event="tool_result", round=rnd, tool=name,
-                    args=_safe(call_args), result_tail=f"raised {type(e).__name__}: {e}")
-            _live(f"{_LIVE['indent']}    ToolResult:{name} ✗ "
-                  f"{type(e).__name__}: {_brief(e, 90)}")
-            raise
-        if log:
-            log(event="tool_result", round=rnd, tool=name,
-                args=_safe(call_args),
-                result_tail=_text(result)[-600:])
-        text = _text(result)
-        first = next((ln for ln in text.splitlines() if ln.strip()), "")
-        _live(f"{_LIVE['indent']}    ToolResult:{name} ✓ {_brief(first, 100)}")
-        return result
-
-    return wrapped
 
 
 # ---------------------------------------------------------------- workflow
@@ -936,6 +212,9 @@ def cmd_doctor(args) -> int:
     print(f"\nTools ({len(TOOLS)}):")
     for t in TOOLS:
         print(f"  - {t['name']}: {t['description'][:80]}")
+    print(f"\nVetted deepinfra models (--model <full id>; any other id also works):")
+    for mid, note in DEEPINFRA_KNOWN_MODELS.items():
+        print(f"  - {mid:<24} {note}")
     print(f"\nOverrides file: {ROOT / DEFAULT_OVERRIDES}")
     return 0
 
@@ -1014,27 +293,6 @@ class RunOutcome:
     converged: bool = False
     response: str = ""
     exit_code: int = 0  # non-zero => bailed out (LLM failure / step budget)
-
-
-def _llm_base(args) -> str:
-    return args.api_base or "https://api.deepseek.com"
-
-
-def _preflight_llm(args) -> bool:
-    """Probe the endpoint once, so a network problem is not a mid-loop traceback."""
-    if args.provider == "openai":
-        return True
-    base = _llm_base(args)
-    key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
-    ok, detail = llm_preflight(base, key)
-    if not ok:
-        # the probe knows *why*; the shared help block knows the next steps
-        print(f"ERROR: LLM endpoint unreachable — {detail}", file=sys.stderr)
-        print(describe_llm_error(ConnectionError(detail), base,
-                                 args.model or "", args.provider), file=sys.stderr)
-        return False
-    print(f"LLM preflight: {detail}")
-    return True
 
 
 def _load_analysis(args, doctype: Optional[str], flat: bool) -> Optional[dict]:
@@ -1217,7 +475,7 @@ async def _llm_data_quality_loop(args, analysis: dict, doctype: str,
     if not blockers:
         return 0
 
-    llm = get_llm(args.provider, args.model, args.api_base)
+    llm = get_llm(args.provider, args.model, args.api_base, wrap=instrumented_llm)
     if not _preflight_llm(args):
         return 2
 
@@ -1577,7 +835,7 @@ async def run_agent(args) -> int:
         pre_import = warning_digest(out) or out[-1500:]
         print(f"  {failed} row(s) failed — engaging the agent to investigate.")
 
-    llm = get_llm(args.provider, args.model, args.api_base)
+    llm = get_llm(args.provider, args.model, args.api_base, wrap=instrumented_llm)
     if not _preflight_llm(args):
         return 2
 
@@ -1607,8 +865,6 @@ async def run_agent(args) -> int:
     return 0
 
 
-
-
 def add_agent_flags(ap: argparse.ArgumentParser) -> None:
     """Agent-specific flags, added to the `erpgen agent` subparser.
 
@@ -1624,8 +880,10 @@ def add_agent_flags(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--provider", default="auto",
                     choices=["auto", "openai", "deepseek", "deepinfra"])
     ap.add_argument("--model", help="LLM model (provider default if omitted). "
-                                    "For DeepSeek, 'flash' and 'pro' are accepted "
-                                    "and resolve to deepseek-flash / deepseek-v4-pro")
+                                    "deepseek accepts 'flash'|'pro' -> deepseek-flash "
+                                    "/ deepseek-v4-pro; deepinfra takes the full id, "
+                                    "e.g. zai-org/GLM-5.3-Flash or Qwen/Qwen3.8-Flash "
+                                    "(--doctor lists the vetted ids)")
     ap.add_argument("--api-base", help="OpenAI-compatible base URL "
                                        "(DeepSeek default: https://api.deepseek.com)")
     ap.add_argument("--max-iterations", type=int, default=50,
@@ -1671,10 +929,11 @@ def run(args) -> int:
         # doctor only inspects files + tools — no ERPNext connection needed
         return cmd_doctor(args)
 
-    global CLIENT
-    CLIENT = ERPNextClient(args.base, username=args.user, password=args.password)
+    # the tools own the client, so the CLI hands it to them rather than keeping
+    # a second module-level copy that could drift from theirs
+    _tools.CLIENT = ERPNextClient(args.base, username=args.user, password=args.password)
 
-    base = args.api_base or "https://api.deepseek.com"
+    base = _llm_base(args)
     try:
         return asyncio.run(run_agent(args))
     except KeyboardInterrupt:

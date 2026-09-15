@@ -12,6 +12,10 @@ from __future__ import annotations
 import argparse
 import json
 
+from erpgen import llm_providers as P  # provider logic lives here now
+from erpgen.agent import tools as agent_tools
+
+
 # ------------------------------------------------------------------- helpers
 def _args(**kw):
     base = dict(api_base=None, model=None, provider="deepseek", max_iterations=50,
@@ -170,20 +174,37 @@ def test_run_outcome_is_mutable(agent_mod):
     assert o.converged and o.response == "done"
 
 
-# ------------------------------------------------------------------- llm base
-def test_llm_base_defaults_to_deepseek(agent_mod):
-    assert agent_mod._llm_base(_args()) == "https://api.deepseek.com"
-    assert agent_mod._llm_base(_args(api_base="http://127.0.0.1:8765/v1")) == \
+# ------------------------------------------- endpoint (provider-aware)
+def test_llm_base_follows_the_provider(agent_mod):
+    """It used to hardcode DeepSeek's host for every provider."""
+    assert P._llm_base(_args()) == "https://api.deepseek.com"
+    assert P._llm_base(_args(provider="deepinfra")) == \
+        "https://api.deepinfra.com/v1/openai"
+    assert P._llm_base(_args(provider="openai")) == "https://api.openai.com/v1"
+    # an explicit --api-base still wins over the provider's own
+    assert P._llm_base(_args(api_base="http://127.0.0.1:8765/v1")) == \
         "http://127.0.0.1:8765/v1"
 
 
 def test_preflight_is_skipped_for_openai(agent_mod, monkeypatch):
-    """OpenAI keys have no DeepSeek preflight; otherwise every run would probe."""
+    """OpenAI keys have no preflight; otherwise every run would probe."""
     called = []
-    monkeypatch.setattr(agent_mod, "llm_preflight",
+    monkeypatch.setattr(P, "llm_preflight",
                         lambda *a, **k: called.append(a) or (True, ""))
-    assert agent_mod._preflight_llm(_args(provider="openai")) is True
+    assert P._preflight_llm(_args(provider="openai")) is True
     assert called == []
+
+
+def test_preflight_probes_the_provider_that_will_actually_serve(monkeypatch):
+    """The bug: a DeepInfra run was probed against DeepSeek's host and key."""
+    seen = {}
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "di-key")
+    monkeypatch.setattr(P, "llm_preflight",
+                        lambda base, key, **k: seen.update(base=base, key=key)
+                        or (True, "ok"))
+    assert P._preflight_llm(_args(provider="deepinfra")) is True
+    assert seen["base"] == "https://api.deepinfra.com/v1/openai"
+    assert seen["key"] == "di-key", "must send the key that host expects"
 
 
 # ------------------------------------------------------------ data-quality gate
@@ -369,7 +390,7 @@ def test_correct_tool_merges_a_top_level_conflict_kwarg(agent_mod, monkeypatch):
         seen["cmd"] = cmd
         return 0, "correct exit 0:\ncorrection c1 added"
 
-    monkeypatch.setattr(agent_mod, "_erpgen", _fake_erpgen)
+    monkeypatch.setattr(agent_tools, "_erpgen", _fake_erpgen)
     out = agent_mod.t_correct(
         "samples/customers.csv", "Customer",
         '{"action":"set_value","at":{"row":5},"column":"Country","value":"US"}',
@@ -389,7 +410,7 @@ def test_correct_tool_does_not_override_an_existing_conflict(agent_mod, monkeypa
         seen["cmd"] = cmd
         return 0, "correct exit 0:\ncorrection c1 added"
 
-    monkeypatch.setattr(agent_mod, "_erpgen", _fake_erpgen)
+    monkeypatch.setattr(agent_tools, "_erpgen", _fake_erpgen)
     agent_mod.t_correct(
         "samples/customers.csv", "Customer",
         '{"action":"set_value","at":{"row":5},"column":"Country","value":"US",'

@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from erpgen import llm_providers as P  # provider logic lives here
+from erpgen.agent import tools as agent_tools
+
 
 # ------------------------------------------------------------------- fakes
 def _resolve_ok(host, port, **kw):
@@ -59,7 +62,7 @@ def _open_raises(exc):
 # ------------------------------------------------------------------- tests
 def test_dns_failure_is_reported_with_proxy_hints(agent_mod, monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
-    ok, detail = agent_mod.llm_preflight("https://api.deepseek.com", "k",
+    ok, detail = P.llm_preflight("https://api.deepseek.com", "k",
                                          resolve=_resolve_fail)
     assert ok is False
     assert "DNS lookup failed" in detail
@@ -68,7 +71,7 @@ def test_dns_failure_is_reported_with_proxy_hints(agent_mod, monkeypatch):
 
 def test_reachable_401_means_the_key_is_the_problem(agent_mod, monkeypatch):
     monkeypatch.delenv("HTTPS_PROXY", raising=False)
-    ok, detail = agent_mod.llm_preflight("https://api.deepseek.com", "k",
+    ok, detail = P.llm_preflight("https://api.deepseek.com", "k",
                                          resolve=_resolve_ok,
                                          open_url=_open_status(401))
     assert ok is True, "401 proves the network path works"
@@ -76,7 +79,7 @@ def test_reachable_401_means_the_key_is_the_problem(agent_mod, monkeypatch):
 
 
 def test_reachable_403_is_also_a_key_problem(agent_mod):
-    ok, detail = agent_mod.llm_preflight("https://api.deepseek.com", "k",
+    ok, detail = P.llm_preflight("https://api.deepseek.com", "k",
                                          resolve=_resolve_ok,
                                          open_url=_open_status(403))
     assert ok is True and "check the API key" in detail
@@ -85,7 +88,7 @@ def test_reachable_403_is_also_a_key_problem(agent_mod):
 def test_root_404_is_reachable_and_does_not_blame_api_base(agent_mod):
     """An API root routinely has no handler; DNS+TCP+TLS all succeeded, so
     telling the user to check --api-base is misleading noise."""
-    ok, detail = agent_mod.llm_preflight("https://api.deepseek.com", "k",
+    ok, detail = P.llm_preflight("https://api.deepseek.com", "k",
                                          resolve=_resolve_ok,
                                          open_url=_open_status(404))
     assert ok is True
@@ -94,7 +97,7 @@ def test_root_404_is_reachable_and_does_not_blame_api_base(agent_mod):
 
 
 def test_200_is_reachable(agent_mod):
-    ok, detail = agent_mod.llm_preflight("https://api.deepseek.com", "k",
+    ok, detail = P.llm_preflight("https://api.deepseek.com", "k",
                                          resolve=_resolve_ok,
                                          open_url=_open_status(200))
     assert ok is True and "HTTP 200" in detail
@@ -102,7 +105,7 @@ def test_200_is_reachable(agent_mod):
 
 def test_transport_error_reports_resolved_ips(agent_mod, monkeypatch):
     monkeypatch.delenv("HTTPS_PROXY", raising=False)
-    ok, detail = agent_mod.llm_preflight(
+    ok, detail = P.llm_preflight(
         "https://api.deepseek.com", "k", resolve=_resolve_ok,
         open_url=_open_raises(OSError("connection refused")))
     assert ok is False
@@ -117,7 +120,7 @@ def test_bare_host_is_upgraded_to_https(agent_mod):
         seen["url"] = req.full_url
         return _Resp(200)
 
-    agent_mod.llm_preflight("api.deepseek.com", "k", resolve=_resolve_ok,
+    P.llm_preflight("api.deepseek.com", "k", resolve=_resolve_ok,
                             open_url=_open)
     assert seen["url"] == "https://api.deepseek.com"
 
@@ -129,7 +132,7 @@ def test_api_key_is_sent_as_a_bearer_header(agent_mod):
         seen["auth"] = req.get_header("Authorization")
         return _Resp(200)
 
-    agent_mod.llm_preflight("https://api.deepseek.com", "sk-secret",
+    P.llm_preflight("https://api.deepseek.com", "sk-secret",
                             resolve=_resolve_ok, open_url=_open)
     assert seen["auth"] == "Bearer sk-secret"
 
@@ -631,7 +634,7 @@ def test_run_import_result_includes_the_digest(agent_mod, monkeypatch):
         # the reason sits at the FRONT, far outside a 2000-char tail
         return 0, _warnings(range(2, 31), SCHEMA_ERR) + "\nREST upsert: created 0, failed 29"
 
-    monkeypatch.setattr(agent_mod, "_erpgen", _fake_erpgen)
+    monkeypatch.setattr(agent_tools, "_erpgen", _fake_erpgen)
     result = agent_mod.t_run_import("samples/customers.csv", "Customer", apply=True)
     assert "Unknown column 'lead_time_days'" in result, \
         "the failure reason must survive into the tool result"
@@ -1099,10 +1102,10 @@ def test_model_defaults_when_not_supplied(agent_mod):
 
 def test_the_deepseek_default_is_the_canonical_v41_flash_id(agent_mod):
     """`deepseek-v4.1-flash` is rejected by the API; the id is `deepseek-flash`."""
-    assert agent_mod.DEFAULT_DEEPSEEK_MODEL == "deepseek-flash"
+    assert P.DEFAULT_DEEPSEEK_MODEL == "deepseek-flash"
 
 
-# ------------------------------------------------ --model flash|pro shorthands
+# ----------------------------------------------- --model flash|pro (DeepSeek)
 @pytest.mark.parametrize("given,expected", [
     ("flash", "deepseek-flash"),
     ("pro", "deepseek-v4-pro"),
@@ -1114,21 +1117,125 @@ def test_the_deepseek_default_is_the_canonical_v41_flash_id(agent_mod):
     ("gpt-4o-mini", "gpt-4o-mini"),
 ])
 def test_deepseek_model_shorthands_resolve(agent_mod, given, expected):
-    assert agent_mod.resolve_deepseek_model(given) == expected
+    assert P.resolve_deepseek_model(given) == expected
 
 
-def test_the_flash_alias_tracks_the_default(agent_mod):
-    """One source of truth: `flash` and the omitted-model default cannot drift."""
-    assert agent_mod.DEEPSEEK_MODEL_ALIASES["flash"] == \
-        agent_mod.DEFAULT_DEEPSEEK_MODEL
+def test_the_flash_alias_tracks_the_deepseek_default(agent_mod):
+    """DeepSeek's default IS the flash tier, so the two cannot drift."""
+    assert P.DEEPSEEK_MODEL_ALIASES["flash"] == \
+        P.DEFAULT_DEEPSEEK_MODEL
+
+
+def test_deepinfra_has_no_model_shorthands(agent_mod):
+    """DeepInfra ids are used in full; there is no alias table to drift."""
+    assert not hasattr(agent_mod, "DEEPINFRA_MODEL_ALIASES")
+    assert P.DEFAULT_DEEPINFRA_MODEL == "zai-org/GLM-5.3"
+
+
+def test_vetted_deepinfra_ids_are_full_names(agent_mod):
+    """Every vetted id is namespaced, and the default is among them."""
+    known = agent_mod.DEEPINFRA_KNOWN_MODELS
+    assert known, "the vetted list must not be empty"
+    assert all("/" in mid for mid in known), "ids must keep their namespace"
+    assert P.DEFAULT_DEEPINFRA_MODEL in known
+    for mid in ("Qwen/Qwen3.8-Flash", "Qwen/Qwen3.8-27B"):
+        assert mid in known, f"{mid} is vetted and must be listed"
+
+
+def test_the_vetted_list_is_not_an_allow_list(agent_mod, monkeypatch):
+    """A provider id we never vetted still reaches the client unrewritten."""
+    pytest.importorskip("llama_index.llms.openai_like")
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "dummy-key-no-network")
+    unvetted = "Qwen/Qwen3.5-397B-A17B"
+    assert unvetted not in agent_mod.DEEPINFRA_KNOWN_MODELS
+    assert P._deepinfra_llm(unvetted, "").model == unvetted
+
+
+def test_doctor_lists_the_vetted_deepinfra_models(agent_mod, capsys, monkeypatch):
+    monkeypatch.setattr(agent_mod, "resolve_doctype", lambda args: ("Supplier", False))
+    monkeypatch.setattr(agent_mod, "latest_analysis", lambda dt: None)
+    agent_mod.cmd_doctor(_run_args())
+    out = capsys.readouterr().out
+    assert "Qwen/Qwen3.8-Flash" in out
+    assert "Qwen/Qwen3.8-27B" in out
+    assert "any other id also works" in out, "must not read as an allow-list"
 
 
 def test_deepseek_llm_uses_the_resolved_model(agent_mod, monkeypatch):
     pytest.importorskip("llama_index.llms.openai_like")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "dummy-key-no-network")
-    assert agent_mod._deepseek_llm("pro", "").model == "deepseek-v4-pro"
-    assert agent_mod._deepseek_llm("flash", "").model == "deepseek-flash"
-    assert agent_mod._deepseek_llm("", "").model == "deepseek-flash"
+    assert P._deepseek_llm("pro", "").model == "deepseek-v4-pro"
+    assert P._deepseek_llm("flash", "").model == "deepseek-flash"
+    assert P._deepseek_llm("", "").model == "deepseek-flash"
+
+
+def test_deepinfra_llm_uses_the_full_model_name(agent_mod, monkeypatch):
+    pytest.importorskip("llama_index.llms.openai_like")
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "dummy-key-no-network")
+    # the full namespaced id reaches the client verbatim, never rewritten
+    assert P._deepinfra_llm("zai-org/GLM-5.3-Flash", "").model == \
+        "zai-org/GLM-5.3-Flash"
+    assert P._deepinfra_llm("zai-org/GLM-5.3", "").model == "zai-org/GLM-5.3"
+    assert P._deepinfra_llm("zai-org/GLM-5.2", "").model == "zai-org/GLM-5.2"
+    # omitted -> the flagship default, also spelled in full
+    assert P._deepinfra_llm("", "").model == "zai-org/GLM-5.3"
+    assert P._deepinfra_llm("   ", "").model == "zai-org/GLM-5.3"
+
+
+# ------------------------------------------------------- provider resolution
+@pytest.fixture
+def no_keys(monkeypatch):
+    for name in ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "DEEPINFRA_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_effective_provider_honours_an_explicit_choice(no_keys, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")   # what auto-detect would pick
+    assert P.effective_provider("deepinfra") == "deepinfra"
+
+
+def test_effective_provider_resolves_auto_in_preference_order(no_keys, monkeypatch):
+    assert P.effective_provider("auto") == "", "no key means no provider"
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "x")
+    assert P.effective_provider("auto") == "deepinfra"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "x")
+    assert P.effective_provider("auto") == "deepseek"
+    monkeypatch.setenv("OPENAI_API_KEY", "x")
+    assert P.effective_provider("auto") == "openai"
+
+
+def test_effective_provider_rejects_an_unknown_name(no_keys, monkeypatch):
+    """A typo must not silently fall through to auto-detection."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "x")
+    assert P.effective_provider("deepsek") == ""
+
+
+def test_api_base_for_prefers_the_flag_then_the_provider(no_keys, monkeypatch):
+    assert P.api_base_for("deepinfra") == "https://api.deepinfra.com/v1/openai"
+    assert P.api_base_for("openai") == "https://api.openai.com/v1"
+    assert P.api_base_for("deepinfra", "http://localhost:9/v1") == \
+        "http://localhost:9/v1"
+    # auto must follow the key that actually won, not assume DeepSeek
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "x")
+    assert P.api_base_for("auto") == "https://api.deepinfra.com/v1/openai"
+
+
+def test_get_llm_names_the_key_that_is_missing(no_keys):
+    with pytest.raises(SystemExit, match="DEEPINFRA_API_KEY is not set"):
+        P.get_llm("deepinfra", "")
+
+
+def test_get_llm_explains_when_nothing_is_configured(no_keys):
+    with pytest.raises(SystemExit, match="No LLM provider configured"):
+        P.get_llm("auto", "")
+
+
+def test_get_llm_builds_the_auto_detected_provider(no_keys, monkeypatch):
+    pytest.importorskip("llama_index.llms.openai_like")
+    monkeypatch.setenv("DEEPINFRA_API_KEY", "dummy-key-no-network")
+    llm = P.get_llm("auto", "")
+    assert llm.model == P.DEFAULT_DEEPINFRA_MODEL
+    assert llm.api_base == "https://api.deepinfra.com/v1/openai"
 
 
 # ------------------------------------------------------------ _is_llm_error
@@ -1161,7 +1268,7 @@ def test_run_import_propagates_the_run_id_as_a_global_flag(agent_mod, monkeypatc
         seen["cmd"] = cmd
         return 0, "ok"
 
-    monkeypatch.setattr(agent_mod, "_erpgen", _fake)
+    monkeypatch.setattr(agent_tools, "_erpgen", _fake)
     agent_mod._TRANSCRIPT_CTX.clear()
     agent_mod._TRANSCRIPT_CTX["run"] = "r1"
     agent_mod.t_run_import("samples/x.csv", "Customer", apply=True)
@@ -1177,7 +1284,7 @@ def test_run_import_omits_the_flag_without_a_run_id(agent_mod, monkeypatch):
         seen["cmd"] = cmd
         return 0, "ok"
 
-    monkeypatch.setattr(agent_mod, "_erpgen", _fake)
+    monkeypatch.setattr(agent_tools, "_erpgen", _fake)
     agent_mod._TRANSCRIPT_CTX.clear()
     agent_mod.t_run_import("samples/x.csv", "Customer", apply=True)
     assert "--run" not in seen["cmd"]
