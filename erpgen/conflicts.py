@@ -235,8 +235,8 @@ def link_group_node(source: str, targets, linked_doctype: str,
         "suggested_action": (
             f"point the row at a leaf instead: pick an existing leaf under the "
             f"group, or create one (create_record '{linked_doctype}' with its "
-            f"parent set and is_group 0). The value lives in the source, so remap "
-            f"it to that leaf with a value_map on '{qualified[0]}'."
+            f"parent set and is_group 0). The value lives in the source, so record "
+            f"a set_value correction on '{source}' that writes the leaf's name."
         ),
     }
 
@@ -351,8 +351,9 @@ def duplicate_row_conflict(
                   f"({affected} row(s)); {len(differing)} group(s) have differing "
                   f"values, which ERPNext would import as a second record named "
                   f"\"<key> - 1\".")
-        action = ("resolve the conflicting cells in one row, drop the duplicate, "
-                  "or point --id-column at a column that is unique per entity.")
+        action = ("merge the rows (merge_rows, choosing the cells that survive), "
+                  "drop the extra row (skip_row), or retarget the review key with "
+                  "change_key when the wrong column was guessed.")
     else:
         detail = (f"{group_count} key value(s) appear on more than one row "
                   f"({affected} row(s)); the rows are identical, so the extra "
@@ -644,7 +645,8 @@ def possible_duplicate_row_conflict(
         "signal_a_skipped": bool(skipped_signal_a),
         "detail": detail,
         "suggested_action": (
-            "review each pair: merge them, unify the spelling with a value_map, or "
-            "dismiss the conflict if they are genuinely separate entities."
+            "review each pair: merge them (merge_rows), unify the spelling "
+            "(set_value), or dismiss the conflict if they are genuinely separate "
+            "entities."
         ),
     }

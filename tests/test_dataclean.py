@@ -325,7 +325,7 @@ def test_build_analysis_instructions_cover_the_new_kinds():
     text = analysis["agent_instructions"]
     for kind in ("duplicate_row", "missing_value"):
         assert f"- {kind} ->" in text
-    assert "cannot invent" in text          # the agent's real constraint
+    assert "Never invent a value" in text   # the agent's real constraint
 
 
 def test_build_analysis_without_a_key_column_skips_duplicate_detection():

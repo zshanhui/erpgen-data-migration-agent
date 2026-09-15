@@ -216,7 +216,7 @@ def test_flat_instructions_cover_the_new_kinds():
     text = flat["agent_instructions"]
     for kind in ("duplicate_row", "missing_value"):
         assert f"- {kind} ->" in text
-    assert "cannot be invented" in text
+    assert "Never invent a value" in text
 
 
 # ------------------------------------------------- flat import conflict gate

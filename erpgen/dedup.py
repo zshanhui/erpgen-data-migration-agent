@@ -24,6 +24,7 @@ NATURAL_KEYS = (
     "supplier_name",
     "item_code",
     "employee_name",
+    "employee_number",
     "lead_name",
     "project_name",
     "party_name",
@@ -39,6 +40,10 @@ DEDUP_KEYS = {
     "Contact": {"source": "email_ids.email_id", "target": "email_id"},
     "Address": {"source": ("address_title", "address_type"),
                 "target": ("address_title", "address_type")},
+    # Employee is named from naming_series (HR-EMP-#####), so without this the
+    # existence query would filter `name` on `EMP-001`-style values, find
+    # nothing, and duplicate the whole sheet on every re-run.
+    "Employee": {"source": "employee_number", "target": "employee_number"},
 }
 
 

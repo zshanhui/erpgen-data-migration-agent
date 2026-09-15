@@ -8,6 +8,17 @@ Usage:  .venv/bin/python scripts/mutation-check.py
 
 For every mutation we assert that the targeted test FAILS with the bug present
 and passes with the fix. Files are always restored from an in-memory backup.
+
+Two ways this harness used to lie, both now reported instead:
+
+* a mutated module that no longer exists aborted the whole run with a traceback,
+  so every mutation after the first dead path silently stopped being checked;
+* only pytest exit code 1 counts as CAUGHT. A node id that matches no test exits
+  4, which the old `rc != 0` test scored as a catch — four parametrized node ids
+  were "catching" their bug while running nothing at all.
+
+Targeted node ids are exact, so rename or re-parametrize a test and this reports
+MISSED rather than passing quietly: that is the signal to re-point the entry.
 """
 from __future__ import annotations
 
@@ -25,13 +36,25 @@ CF = "erpgen/customers_full.py"
 TLS = "erpgen/tools.py"
 OVR = "erpgen/overrides.py"
 ANL = "erpgen/analysis.py"
-AGT = "erpgen/agent.py"
+# the agent used to be one module (`erpgen/agent.py`, split in dd5dd91); the
+# entries below point at the file each anchor actually lives in now
+AGT = "erpgen/agent/__init__.py"      # run loop
+AGTOOLS = "erpgen/agent/tools.py"     # tool wrappers + digests
+AGTRACE = "erpgen/agent/trace.py"     # live stream + transcript
+LLM = "erpgen/llm_providers.py"       # providers + error classification
 ANA = "erpgen/analysis.py"
 CFF = "erpgen/conflicts.py"
 TREE = "erpgen/tree.py"
 INF = "erpgen/infer.py"
+EMP = "erpgen/employees.py"
+DED = "erpgen/dedup.py"
 
 MUTATIONS = [
+    ("bug: update_record journals no inverse", [
+        (TLS, '    if ACTIVE_JOURNAL is not None:\n        ACTIVE_JOURNAL.record_updated(doctype, name, before)',
+              '    pass  # MUTANT'),
+    ], "tests/test_update_record.py::test_the_effect_records_the_previous_values"),
+
     ("bug: effect seq restarts per command", [
         (CTX, '                    self.effects += 1\n                    effects.append(e)',
               '                    pass  # MUTANT\n                    effects.append(e)'),
@@ -113,13 +136,13 @@ MUTATIONS = [
         (CLI, '    p_imp.add_argument("--defaults")',
               '    p_imp.add_argument("--defaults")\n'
               '    p_imp.add_argument("--log-dir", default="logs")'),
-    ], "tests/test_cli_args.py::test_every_subcommand_carries_the_global_flags"),
+    ], "tests/test_cli_args.py::test_log_dir_override_reaches_every_subcommand[map]"),
 
     # ---- flat party sheets (Customer/Supplier) ----
     ("bug: flat values not converted to the target field type (Check 'Yes' -> 0)", [
         (CF, '            return convert_value(raw, ftype)',
              '            return raw  # MUTANT'),
-    ], "tests/test_party_sheets.py::test_check_column_is_converted_not_stored_raw"),
+    ], "tests/test_party_sheets.py::test_check_column_is_converted_not_stored_raw[Yes-1]"),
 
     ("bug: Supplier.country no longer mirrored onto the party record", [
         (CF, '        for col, field in (spec.get("mirror_columns") or {}).items():',
@@ -152,7 +175,7 @@ MUTATIONS = [
     ("bug: supplier is not a valid flat target", [
         (CF, '_FLAT_KEYS = frozenset(_DT_CANONICAL)',
              '_FLAT_KEYS = frozenset({"customer", "contact", "address"})  # MUTANT'),
-    ], "tests/test_party_sheets.py::test_parse_flat_target_valid"),
+    ], "tests/test_party_sheets.py::test_parse_flat_target_valid[supplier.tax_id-expected1]"),
 
     ("bug: mapped Link values are never checked against the site", [
         (CF, '    conflicts.extend(_link_value_conflicts(client, source, spec, fmap, flat, engines))',
@@ -219,23 +242,23 @@ MUTATIONS = [
 
     # ---- LLM endpoint preflight ----
     ("bug: DNS failure no longer fails fast (endpoint reported reachable)", [
-        (AGT, '        return False, (f"DNS lookup failed for {host}: {type(e).__name__}: {e}\\n"',
+        (LLM, '        return False, (f"DNS lookup failed for {host}: {type(e).__name__}: {e}\\n"',
               '        return True, ""  # MUTANT\n'
               '        return False, (f"DNS lookup failed for {host}: {type(e).__name__}: {e}\\n"'),
     ], "tests/test_agent_preflight.py::test_dns_failure_is_reported_with_proxy_hints"),
 
     ("bug: reachable endpoint reported as unreachable (401 loses the key hint)", [
-        (AGT, '        if e.code in (401, 403):',
+        (LLM, '        if e.code in (401, 403):',
               '        if False:  # MUTANT'),
     ], "tests/test_agent_preflight.py::test_reachable_401_means_the_key_is_the_problem"),
 
     ("bug: transport failures lose their network guidance", [
-        (AGT, '    elif any(k in low for k in ("connection", "connect", "timeout", "ssl",',
+        (LLM, '    elif any(k in low for k in ("connection", "connect", "timeout", "ssl",',
               '    elif False and any(k in low for k in ("connection", "connect", "timeout", "ssl",'),
     ], "tests/test_agent_preflight.py::test_connection_error_explains_the_sdk_conflates_transport_failures"),
 
     ("bug: every exception dressed up as an LLM/network problem", [
-        (AGT, '    if type(exc).__module__.split(".")[0] in ("openai", "httpx", "httpcore"):\n'
+        (LLM, '    if type(exc).__module__.split(".")[0] in ("openai", "httpx", "httpcore"):\n'
               '        return True',
               '    if True:  # MUTANT\n        return True'),
     ], "tests/test_agent_preflight.py::test_is_llm_error_rejects_our_own_bugs"),
@@ -264,7 +287,7 @@ MUTATIONS = [
     ], "tests/test_agent_preflight.py::test_iteration_exhaustion_is_recognized_by_name"),
 
     ("bug: a reachable API root 404 blamed on --api-base", [
-        (AGT, '        if e.code == 404:',
+        (LLM, '        if e.code == 404:',
               '        if False:  # MUTANT'),
     ], "tests/test_agent_preflight.py::test_root_404_is_reachable_and_does_not_blame_api_base"),
 
@@ -329,7 +352,7 @@ MUTATIONS = [
 
     # ---- the agent's import must join its own run context ----
     ("bug: agent's run_import journals separately (revert misses its rows)", [
-        (AGT, '    run_id = _TRANSCRIPT_CTX.get("run")\n'
+        (AGTOOLS, '    run_id = _TRANSCRIPT_CTX.get("run")\n'
               '    if run_id:',
               '    run_id = None  # MUTANT\n'
               '    if run_id:'),
@@ -389,24 +412,24 @@ MUTATIONS = [
     ], "tests/test_agent_preflight.py::test_always_llm_skips_the_deterministic_pre_import"),
 
     ("bug: import failures misread as success", [
-        (AGT, '    m = re.search(r"REST upsert: created \\d+, failed (\\d+)", out)\n'
+        (AGTOOLS, '    m = re.search(r"REST upsert: created \\d+, failed (\\d+)", out)\n'
               '    if m:\n'
               '        return int(m.group(1))',
               '    m = None  # MUTANT\n'
               '    if m:\n'
               '        return int(m.group(1))'),
-    ], "tests/test_agent_preflight.py::test_import_failure_count_parses_every_output_shape"),
+    ], "tests/test_agent_preflight.py::test_import_failure_count_parses_every_output_shape[REST upsert: created 0, failed 29-29]"),
 
     # ---- live progress stream (so the user need not guess) ----
     ("bug: --quiet does not silence the live stream", [
-        (AGT, 'def _live(message: str) -> None:\n'
+        (AGTRACE, 'def _live(message: str) -> None:\n'
               '    if _LIVE["enabled"]:',
               'def _live(message: str) -> None:\n'
               '    if True:  # MUTANT'),
     ], "tests/test_agent_preflight.py::test_live_is_silent_when_disabled"),
 
     ("bug: LLM calls are not announced live", [
-        (AGT, '            _log_llm_event(event="llm_response", method="achat",\n'
+        (AGTRACE, '            _log_llm_event(event="llm_response", method="achat",\n'
               '                           duration_ms=_elapsed_ms(started),\n'
               '                           **llm_usage(response))\n'
               '            _live_llm_response(response, started)',
@@ -416,25 +439,25 @@ MUTATIONS = [
     ], "tests/test_agent_preflight.py::test_llm_call_is_announced_live"),
 
     ("bug: tool calls lose their ToolUse marker", [
-        (AGT, '        _live(f"{_LIVE[\'indent\']}  ToolUse:{name} {_brief_args(args, kwargs)}")',
+        (AGTRACE, '        _live(f"{_LIVE[\'indent\']}  ToolUse:{name} {_brief_args(args, kwargs)}")',
               '        pass  # MUTANT'),
     ], "tests/test_agent_preflight.py::test_tool_calls_carry_a_ToolUse_marker"),
 
     ("bug: a raising tool is not shown live", [
-        (AGT, '            _live(f"{_LIVE[\'indent\']}    ToolResult:{name} ✗ "\n'
+        (AGTRACE, '            _live(f"{_LIVE[\'indent\']}    ToolResult:{name} ✗ "\n'
               '                  f"{type(e).__name__}: {_brief(e, 90)}")',
               '            pass  # MUTANT'),
     ], "tests/test_agent_preflight.py::test_failing_tool_calls_carry_a_ToolResult_marker"),
 
     ("bug: the model's thinking is hidden", [
-        (AGT, '    thought = _thinking(response)\n'
-              '    if thought:\n'
-              '        _live(f"{_LIVE[\'indent\']}    “{thought}”")',
-              '    pass  # MUTANT'),
+        (AGTRACE, '        thought = _thinking(response)\n'
+                   '        if thought:',
+                   '        thought = ""  # MUTANT\n'
+                   '        if thought:'),
     ], "tests/test_agent_preflight.py::test_live_shows_what_the_model_wants_to_do"),
 
     ("bug: live output loses the requested tool names", [
-        (AGT, '    calls = getattr(response, "tool_calls", None)\n'
+        (AGTRACE, '    calls = getattr(response, "tool_calls", None)\n'
               '    if not calls:\n'
               '        calls = getattr(getattr(response, "message", None), "tool_calls", None)',
               '    calls = None  # MUTANT'),
@@ -442,37 +465,37 @@ MUTATIONS = [
 
     # ---- import failure digest (why the agent flailed on customers.csv) ----
     ("bug: failure reasons truncated away from the agent", [
-        (AGT, '    return f"import exit {code}:\\n{out[-2000:]}{warning_digest(out)}"',
+        (AGTOOLS, '    return f"import exit {code}:\\n{out[-2000:]}{warning_digest(out)}"',
               '    return f"import exit {code}:\\n{out[-2000:]}"  # MUTANT'),
     ], "tests/test_agent_preflight.py::test_run_import_result_includes_the_digest"),
 
     ("bug: warnings grouped by row instead of by cause", [
-        (AGT, '        key = " ".join((body if sep else msg).split())[:220]',
+        (AGTOOLS, '        key = " ".join((body if sep else msg).split())[:220]',
               '        key = msg[:220]  # MUTANT'),
     ], "tests/test_agent_preflight.py::test_warning_digest_groups_identical_causes"),
 
     ("bug: a shared root cause no longer flagged", [
-        (AGT, '    if len(ranked) == 1 and total > 1:',
+        (AGTOOLS, '    if len(ranked) == 1 and total > 1:',
               '    if False:  # MUTANT'),
     ], "tests/test_agent_preflight.py::test_warning_digest_flags_a_single_shared_cause"),
 
     # ---- remote LLM call logging ----
     ("bug: LLM requests are not logged", [
-        (AGT, '            _log_llm_event(event="llm_request", method="achat",\n'
+        (AGTRACE, '            _log_llm_event(event="llm_request", method="achat",\n'
               '                           model=str(getattr(self, "model", "") or ""),\n'
               '                           messages=len(messages))',
               '            pass  # MUTANT'),
     ], "tests/test_agent_preflight.py::test_every_llm_call_is_logged"),
 
     ("bug: failed LLM calls are not logged", [
-        (AGT, '                _log_llm_event(event="llm_failure", method="achat",\n'
+        (AGTRACE, '                _log_llm_event(event="llm_failure", method="achat",\n'
               '                               duration_ms=_elapsed_ms(started),\n'
               '                               error=f"{type(e).__name__}: {e}")',
               '                pass  # MUTANT'),
     ], "tests/test_agent_preflight.py::test_llm_failures_are_logged_and_still_raised"),
 
     ("bug: streaming failure at call time is not logged", [
-        (AGT, '                # fails before a generator exists — still a remote call attempt\n'
+        (AGTRACE, '                # fails before a generator exists — still a remote call attempt\n'
               '                _log_llm_event(event="llm_failure", method="astream_chat",\n'
               '                               duration_ms=_elapsed_ms(started),\n'
               '                               error=f"{type(e).__name__}: {e}")',
@@ -480,7 +503,7 @@ MUTATIONS = [
     ], "tests/test_agent_preflight.py::test_streaming_failure_is_logged"),
 
     ("bug: prompt content leaks into the transcript", [
-        (AGT, '            _log_llm_event(event="llm_request", method="achat",\n'
+        (AGTRACE, '            _log_llm_event(event="llm_request", method="achat",\n'
               '                           model=str(getattr(self, "model", "") or ""),\n'
               '                           messages=len(messages))',
               '            _log_llm_event(event="llm_request", method="achat",\n'
@@ -489,7 +512,7 @@ MUTATIONS = [
     ], "tests/test_agent_preflight.py::test_prompt_content_is_not_logged"),
 
     ("bug: token usage no longer recorded", [
-        (AGT, '            _log_llm_event(event="llm_response", method="achat",\n'
+        (AGTRACE, '            _log_llm_event(event="llm_response", method="achat",\n'
               '                           duration_ms=_elapsed_ms(started),\n'
               '                           **llm_usage(response))',
               '            _log_llm_event(event="llm_response", method="achat",\n'
@@ -663,6 +686,24 @@ MUTATIONS = [
               '    files = sorted(d.glob("*.jsonl"), key=creation_key, reverse=True)  # MUTANT'),
     ], "tests/test_journal.py::test_prune_ignores_run_contexts"),
 
+    # ---- employee ID: the column that becomes the dedup key ----
+    ("bug: the employee ID header alias is not recognised", [
+        (EMP, '        if norm(header) in ALIASES:\n            return header',
+              '        if False:  # MUTANT\n            return header'),
+    ], "tests/test_employees.py::test_every_alias_spelling_is_recognised_as_the_id_column"),
+
+    ("bug: the employee ID column keeps its scored target", [
+        (EMP, '    mapping.target = ID_FIELD', '    pass  # MUTANT'),
+    ], "tests/test_employees.py::test_the_scorer_alone_would_pick_the_wrong_field"),
+
+    ("bug: missing employee IDs are not generated", [
+        (EMP, '        p[ID_FIELD] = value', '        pass  # MUTANT'),
+    ], "tests/test_employees.py::test_a_sheet_with_no_id_column_at_all_gets_ids"),
+
+    ("bug: Employee dedup queries `name` again (duplicates every re-run)", [
+        (DED, '    "Employee": {"source": "employee_number", "target": "employee_number"},',
+              '    # MUTANT: no Employee key'),
+    ], "tests/test_employees.py::test_the_dedup_spec_queries_employee_number_not_name"),
 ]
 
 
@@ -671,6 +712,20 @@ def run_test(node: str) -> int:
         [sys.executable, "-m", "pytest", node, "-x", "--no-header", "-q"],
         cwd=ROOT, capture_output=True, text=True,
     ).returncode
+
+
+#: pytest exit codes. Only `1` means the targeted test ran and failed: anything
+#: else (a node id that no longer exists, a collection error, an interrupt) used
+#: to be read as "the suite caught it", which is how four parametrized node ids
+#: kept claiming to catch their bug long after they matched nothing.
+PYTEST_EXIT = {
+    0: "the targeted test PASSED with the bug present",
+    1: "failed as expected",
+    2: "interrupted, or the test module failed to collect",
+    3: "pytest internal error",
+    4: "usage error — the node id matches no test",
+    5: "no tests collected",
+}
 
 
 def _restore_file(rel: str, content: str) -> None:
@@ -718,6 +773,13 @@ def main() -> int:
         for label, edits, node in MUTATIONS:
             for rel, old, new in edits:
                 p = ROOT / rel
+                if not p.exists():
+                    # a moved/renamed module must not stop the whole run: report it
+                    # and keep checking the rest, or one refactor hides every
+                    # mutation after it (which is exactly what the agent split did)
+                    print(f"  STALE {label}: {rel} does not exist")
+                    failures.append((label, f"{rel} does not exist"))
+                    break
                 if rel not in backups:
                     backups[rel] = p.read_text()
                 s = p.read_text()
@@ -728,10 +790,11 @@ def main() -> int:
                 p.write_text(s.replace(old, new, 1))
             else:
                 rc = run_test(node)
-                status = "CAUGHT" if rc != 0 else "MISSED"
+                status = "CAUGHT" if rc == 1 else "MISSED"
                 print(f"  {status:<6} {label}")
-                if rc == 0:
-                    failures.append((label, "test passed with the bug present"))
+                if rc != 1:
+                    failures.append((label, f"exit {rc}: {PYTEST_EXIT.get(rc, '?')}"
+                                            f" [{node}]"))
                 # restore before the next mutation
                 for rel, content in backups.items():
                     _restore_file(rel, content)

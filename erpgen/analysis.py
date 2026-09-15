@@ -53,6 +53,48 @@ def _mapped_field(plan: MappingPlan, column: Optional[str]) -> str:
     return ""
 
 
+def _agent_instructions(doctype: str) -> str:
+    """The per-kind playbook shipped inside the analysis artifact.
+
+    Kept in step with the system prompt (`erpgen/prompts.py`): every remedy here
+    is reachable through the agent's tools, and the import gate is the same
+    status-based one (`open`/`stale` block) — so `corrected` conflicts need no
+    further work even though they stay in the analysis.
+    """
+    return (
+        f"You are the migration-fix agent for ERPNext doctype '{doctype}'. "
+        "Act on the conflicts below:\n"
+        "- unmapped_column -> give the column a home: create_field for it, or map "
+        "it with set_mapping. Then re-run map.\n"
+        "- ambiguous_mapping -> choose the correct target among target/alternatives "
+        "and force it with set_mapping.\n"
+        "- fetch_from -> the field is read-only and populated from another "
+        "document, so there is nothing to write. Note it and move on.\n"
+        "- link_value_conflict -> create the missing option records with "
+        "create_record, then re-run map.\n"
+        "- link_group_node -> the value exists but is a Group node and the field "
+        "needs a leaf: create the leaf with create_record (parent set, is_group 0), "
+        "then point the row at it with a set_value correction. Do not create the "
+        "group again.\n"
+        "- required_missing -> pass defaults to run_map/run_import, or map a source "
+        "column to it.\n"
+        "- duplicate_row -> merge the rows (merge_rows with field_overrides), drop "
+        "the extra row (skip_row), or retarget the review key with change_key when "
+        "the wrong column was guessed.\n"
+        "- missing_value -> the cell is empty in the source sheet; record the value "
+        "as a worksheet correction (set_value), or pass defaults when a constant is "
+        "legitimate.\n"
+        "- possible_duplicate_row -> review-only (warning): two rows may be the "
+        "same entity spelled two ways. Decide per pair and record it as a worksheet "
+        "correction (merge_rows, set_value to unify the spelling, or "
+        "dismiss_conflict when they are genuinely separate). Do not block the "
+        "import on this.\n"
+        "Never invent a value. Import once no error-severity conflict is open or "
+        "stale: a corrected or waived conflict stays in this analysis with severity "
+        "'error' and needs no further work."
+    )
+
+
 def build_analysis(
     client: ERPNextClient,
     source: SourceTable,
@@ -174,28 +216,7 @@ def build_analysis(
                 "suggested_action": "map a source column to it, or supply --defaults.",
             })
 
-    agent_instructions = (
-        f"You are the migration-fix agent for ERPNext doctype '{plan.doctype}'. "
-        "Act on the conflicts below:\n"
-        "- unmapped_column -> run the suggested create_command, then re-run import.\n"
-        "- ambiguous_mapping -> choose the correct target among target/alternatives.\n"
-        "- fetch_from -> the field is read-only; set the value on its source doc.\n"
-        "- link_value_conflict -> create the missing option records or remap values.\n"
-        "- link_group_node -> the value exists but is a Group node; the field needs "
-        "a leaf, so remap the value onto a leaf instead of creating anything.\n"
-        "- required_missing -> supply --defaults or map a source column.\n"
-        "- duplicate_row -> resolve the conflicting cells in one row, drop the "
-        "duplicate, or point --id-column at a column that is unique per entity. "
-        "You cannot invent the missing value yourself.\n"
-        "- missing_value -> the cell is empty in the source sheet; record the value "
-        "as a worksheet correction, or use --defaults when a constant is legitimate. "
-        "You cannot invent the value yourself.\n"
-        "- possible_duplicate_row -> review-only (warning): two rows may be the same "
-        "entity spelled two ways. Decide per pair and record it as a worksheet "
-        "correction (merge_rows, or dismiss_conflict when they are genuinely "
-        "separate). Do not block the import on this.\n"
-        "Do not import until every 'error'-severity conflict is resolved."
-    )
+    agent_instructions = _agent_instructions(plan.doctype)
 
     prev_sha = (previous.get("source") or {}).get("sha256") or ""
     sha256 = file_sha256(source_path)

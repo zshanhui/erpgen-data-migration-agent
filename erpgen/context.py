@@ -277,6 +277,17 @@ class MigrationContext:
                     doctype=doctype, name=name, link_doctype=link_doctype,
                     link_name=link_name)
 
+    def record_updated(self, doctype: str, name: str, before: dict) -> None:
+        """An EXISTING record's fields changed; `before` holds what they were.
+
+        Only the fields that were written are captured, so a revert restores
+        those cells rather than overwriting anything changed since.
+        """
+        self.effect("record_update",
+                    {"op": "restore_record", "doctype": doctype, "name": name,
+                     "fields": dict(before)},
+                    doctype=doctype, name=name, fields=sorted(before))
+
     def override_set(self, doctype: str, column: str, target: Optional[str],
                      previous: Optional[str], overrides_path: str) -> None:
         self.effect("override_set",

@@ -104,6 +104,17 @@ class MigrationJournal:
                     doctype=doctype, name=name, link_doctype=link_doctype,
                     link_name=link_name)
 
+    def record_updated(self, doctype: str, name: str, before: dict) -> None:
+        """An EXISTING record's fields changed; `before` holds what they were.
+
+        Only the fields that were written are captured, so a revert restores
+        those cells rather than overwriting anything changed since.
+        """
+        self.effect("record_update",
+                    {"op": "restore_record", "doctype": doctype, "name": name,
+                     "fields": dict(before)},
+                    doctype=doctype, name=name, fields=sorted(before))
+
     def override_set(self, doctype: str, column: str, target: Optional[str],
                      previous: Optional[str], overrides_path: str) -> None:
         self.effect("override_set",
@@ -181,6 +192,9 @@ def describe_inverse(inv: dict) -> str:
     if op == "remove_record_link":
         return (f"unlink {inv.get('link_doctype')}/{inv.get('link_name')} "
                 f"from {inv.get('doctype')}/{inv.get('name')}")
+    if op == "restore_record":
+        fields = ", ".join(sorted(inv.get("fields") or {})) or "(no fields)"
+        return f"restore {inv.get('doctype')}/{inv.get('name')} {fields}"
     if op == "correction_revoke":
         return f"revoke correction {inv.get('correction_id')} in {inv.get('path')}"
     return f"unknown inverse op {op!r}"
@@ -209,6 +223,12 @@ def apply_inverse(client: ERPNextClient, inv: dict, apply: bool = True) -> tuple
             return True, ""
         if op == "remove_record_link":
             return _remove_record_link(client, inv)
+        if op == "restore_record":
+            fields = dict(inv.get("fields") or {})
+            if not fields:
+                return True, ""      # nothing was changed, nothing to restore
+            client.update(inv["doctype"], inv["name"], fields)
+            return True, ""
         if op == "correction_revoke":
             from .corrections import revoke
 

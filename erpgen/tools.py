@@ -199,6 +199,26 @@ def create_record(client: ERPNextClient, doctype: str, fields: dict) -> dict:
     return {"name": doc.get("name"), "created": True}
 
 
+def update_record(client: ERPNextClient, doctype: str, name: str,
+                  fields: dict) -> dict:
+    """Change fields on an EXISTING record, journaling what they held before.
+
+    The read comes first so the inverse is exact: only the keys being written are
+    captured, and a missing record fails here (404) rather than halfway through.
+    `name` is refused — renaming moves links with it and is not a field write.
+    """
+    if not fields:
+        raise ValueError("update_record needs at least one field to write")
+    if "name" in fields:
+        raise ValueError("update_record cannot rename a record; drop 'name'")
+    doc = client.get(doctype, name)
+    before = {f: doc.get(f) for f in fields}
+    updated = client.update(doctype, name, fields)
+    if ACTIVE_JOURNAL is not None:
+        ACTIVE_JOURNAL.record_updated(doctype, name, before)
+    return {"name": updated.get("name") or name, "updated": sorted(fields)}
+
+
 def list_records(
     client: ERPNextClient,
     doctype: str,

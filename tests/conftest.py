@@ -130,13 +130,38 @@ class FakeClient:
     """
 
     def __init__(self, existing: tuple = (), fail_with: dict | None = None,
-                 records: dict | None = None):
+                 records: dict | None = None, docs: dict | None = None):
         #: {(doctype, name)} that still exist on the "site"
         self.existing = set(existing)
         self.calls: list[tuple] = []
         self.fail_with = fail_with or {}
         #: {doctype: [row, ...]} returned by list(); empty means "no records yet"
         self.records = records or {}
+        #: {(doctype, name): {field: value}} returned by get(); update writes here
+        self.docs = {(dt, n): dict(v) for (dt, n), v in (docs or {}).items()}
+        for dt, name in self.existing:
+            self.docs.setdefault((dt, name), {"name": name})
+
+    def get(self, doctype, name):
+        self.calls.append(("get", doctype, name))
+        if (doctype, name) not in self.existing:
+            raise ERPNextError(
+                'HTTP 404 GET /api/resource/'
+                f'{doctype}/{name}: {{"exc_type":"DoesNotExistError"}}'
+            )
+        return dict(self.docs.get((doctype, name), {"name": name}))
+
+    def update(self, doctype, name, doc):
+        self.calls.append(("update", doctype, name))
+        if doctype in self.fail_with:
+            raise ERPNextError(self.fail_with[doctype])
+        if (doctype, name) not in self.existing:
+            raise ERPNextError(
+                'HTTP 404 PUT /api/resource/'
+                f'{doctype}/{name}: {{"exc_type":"DoesNotExistError"}}'
+            )
+        self.docs.setdefault((doctype, name), {"name": name}).update(doc)
+        return dict(self.docs[(doctype, name)])
 
     def list(self, doctype, filters=None, fields=None, limit=0, **kw):
         self.calls.append(("list", doctype))

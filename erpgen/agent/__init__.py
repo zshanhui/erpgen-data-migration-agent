@@ -639,8 +639,9 @@ def _round_message(round_no: int, doctype: str, source: str, analysis: dict,
     return (
         f"Round {round_no}. These error-severity conflicts REMAIN after your last "
         f"round:\n{json.dumps(_error_conflicts(analysis), indent=2, default=str)}\n\n"
-        "Fix them (create_field / create_record / set_mapping), then run_map to "
-        "confirm they are gone. Import only once no error conflicts remain."
+        "Fix them (create_field / create_record / update_record / set_mapping / "
+        "correct), then run_map to confirm they are gone. Import only once no "
+        "error-severity conflict is open or stale."
     )
 
 

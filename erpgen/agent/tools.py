@@ -35,6 +35,7 @@ from erpgen.tools import (
     describe_doctype,
     get_record,
     list_records,
+    update_record,
 )
 
 from .trace import _TRANSCRIPT_CTX
@@ -187,6 +188,14 @@ def t_create_record(doctype: str, fields_json: str) -> str:
         return _j({"error": str(e)})
 
 
+def t_update_record(doctype: str, name: str, fields_json: str) -> str:
+    try:
+        fields = json.loads(fields_json)
+        return _j(update_record(CLIENT, doctype, name, fields))
+    except Exception as e:  # noqa: BLE001
+        return _j({"error": str(e)})
+
+
 def t_set_mapping(doctype: str, column: str, target: str) -> str:
     try:
         flow_party = party_for_flow(doctype)
@@ -284,6 +293,12 @@ TOOLS = [
      "description": "Create a record in any doctype. Pass fields as JSON. "
                     "Idempotent by the doctype's name field. Use describe_doctype "
                     "to learn required fields."},
+    {"fn": t_update_record, "name": "update_record",
+     "description": "Change fields on an EXISTING record (identified by its name). "
+                    "Pass fields as JSON. Use it when a record the import depends "
+                    "on is in the way — a leaf that must become a group, a wrong "
+                    "parent, a value that is already set. Revertible: the previous "
+                    "values are journalled. It cannot rename a record."},
     {"fn": t_set_mapping, "name": "set_mapping",
      "description": "Record a forced source-column -> target-field mapping override "
                     "for a doctype. Fixes ambiguous/missed mappings. For flat party "

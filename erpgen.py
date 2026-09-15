@@ -72,8 +72,10 @@ from erpgen.tools import (  # noqa: E402
     describe_doctype,
     get_record,
     list_records,
+    update_record,
 )
 from erpgen.tree import apply_tree_semantics  # noqa: E402
+from erpgen import employees  # noqa: E402
 
 DEFAULT_BASE = "http://localhost:8082"
 
@@ -252,6 +254,8 @@ def cmd_map(args) -> int:
         n = apply_overrides(plan, source, engine, overrides)
         if n:
             print(f"Applied {n} mapping override(s) from {o_path}")
+    for line in employees.apply(engine, plan, source):
+        print(f"NOTE: {line}")
     _print_plan(plan, source)
     if args.save:
         Path(args.save).write_text(json.dumps(plan.as_dict(), indent=2))
@@ -505,12 +509,16 @@ def _build_plan(args, source, payload_source=None):
     overrides_path, overrides = _overrides_for(args, plan.doctype)
     if overrides and apply_overrides(plan, source, engine, overrides):
         print(f"Applied mapping override(s) from {overrides_path}")
+    for line in employees.apply(engine, plan, source):
+        print(f"NOTE: {line}")
     _print_plan(plan, source)
 
     payloads, row_errors = engine.build_payloads(payload_source or source, plan)
     payloads, tree_warnings = apply_tree_semantics(engine, plan, payloads)
     for w in tree_warnings:
         print(f"NOTE: {w}")
+    for line in employees.ensure_ids(payloads):
+        print(f"NOTE: {line}")
     if row_errors:
         print(f"\n{len(row_errors)} rows failed value conversion:")
         for e in row_errors[:10]:
@@ -547,7 +555,9 @@ def cmd_import(args) -> int:
 
     # ---- idempotency setup ----
     id_column = infer_id_column(plan, source, args.id_column)
-    if id_column is None:
+    # A doctype with its own dedup spec does not key off `name`, so an ID column
+    # is not required — Employee can generate one instead.
+    if id_column is None and not DEDUP_KEYS.get(plan.doctype):
         print(f"\nERROR: cannot determine the ID column for {plan.doctype} "
               f"(id field: {plan.id_field!r}). Pass --id-column <source column>.")
         return 2
@@ -1026,6 +1036,32 @@ def cmd_create_record(args) -> int:
     return 0
 
 
+def cmd_update_record(args) -> int:
+    """Update fields on an existing record (journaled like the agent's tool)."""
+    client = _client(args)
+    fields = _json_arg("fields", args.fields)
+    if not isinstance(fields, dict):
+        print("ERROR: --fields must be a JSON object, e.g. '{\"is_group\": 1}'",
+              file=sys.stderr)
+        return 2
+
+    ctx = _context(args, args.doctype, command="update-record")
+    from erpgen import tools as erpgen_tools  # noqa: PLC0415
+
+    erpgen_tools.ACTIVE_JOURNAL = ctx
+    try:
+        result = update_record(client, args.doctype, args.name, fields)
+    finally:
+        erpgen_tools.ACTIVE_JOURNAL = None
+        if ctx:
+            ctx.close()
+    print(json.dumps(result, indent=2, default=str))
+    if ctx:
+        print(f"Run context: {ctx.path}  ({ctx.effects} effect(s))")
+        print(f"  revert it: python3 erpgen.py revert {ctx.run_id} --apply")
+    return 0
+
+
 def cmd_status(args) -> int:
     """Show a migration context: requirements (pending/satisfied) + effects."""
     target = args.run_log
@@ -1255,6 +1291,17 @@ def _add_lifecycle_parsers(sub) -> None:
     p_cr.add_argument("--fields", required=True,
                       help='JSON object, e.g. \'{"item_group_name": "Tooling"}\'')
     p_cr.set_defaults(fn=cmd_create_record)
+
+    p_ur = sub.add_parser(
+        "update-record",
+        help="change fields on an EXISTING record; journaled with the values it "
+             "held before, so revert puts them back",
+    )
+    p_ur.add_argument("doctype")
+    p_ur.add_argument("name", help="the record's name (its id on the site)")
+    p_ur.add_argument("--fields", required=True,
+                      help='JSON object, e.g. \'{"is_group": 1}\'')
+    p_ur.set_defaults(fn=cmd_update_record)
 
     p_st = sub.add_parser(
         "status",

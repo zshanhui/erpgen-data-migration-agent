@@ -757,7 +757,10 @@ def test_a_customer_group_node_is_reported_not_a_missing_record():
     assert c["group_values"] == ["All Customer Groups"]
     assert c["targets"] == ["customer.customer_group"]
     assert c["severity"] == "error"
-    assert "value_map" in c["suggested_action"]
+    assert "set_value" in c["suggested_action"]
+    assert "value_map" not in c["suggested_action"], (
+        "there is no value_map operation — the suggestion has to name a verb the "
+        "agent can actually call")
     assert "leaf" in c["suggested_action"]
     assert "missing" not in c["suggested_action"], (
         "the value exists — 'create the missing record' is link_value_conflict's "

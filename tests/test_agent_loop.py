@@ -74,6 +74,19 @@ def test_error_conflicts_on_a_clean_analysis(agent_mod):
     assert agent_mod._error_conflicts(_analysis("info", "warning")) == []
 
 
+def test_error_conflicts_filters_by_status_not_just_severity(agent_mod):
+    """`corrected`/`waived` are answered, not outstanding work.
+
+    Detectors read the raw source, so a corrected conflict is re-detected on every
+    map with severity "error" and status "corrected". Counting it as outstanding
+    makes `repeat until zero` unachievable by construction.
+    """
+    a = _analysis("error", "error")
+    for c, status in zip(a["conflicts"], ("corrected", "waived")):
+        c["status"] = status
+    assert agent_mod._error_conflicts(a) == []
+
+
 # --------------------------------------------------------------- round prompt
 def test_first_round_gets_the_whole_analysis(agent_mod):
     a = _analysis("error", "info", base_url="http://x")
@@ -232,6 +245,63 @@ def test_data_quality_blockers_on_a_clean_analysis(agent_mod):
     a = {"conflicts": [_conflict("link_value_conflict"),
                        _conflict("missing_value", status="corrected")]}
     assert agent_mod._data_quality_blockers(a) == []
+
+
+# ------------------------------------------------------- prompt ↔ gate agreement
+def test_the_system_prompt_states_the_gate_criterion_the_code_enforces(agent_mod):
+    """The prompt must name the criterion the gate actually applies.
+
+    The gate blocks on status, so the prompt has to say so: `repeat until zero
+    error-severity conflicts` cannot be satisfied, because a corrected conflict
+    stays in the analysis with severity "error" forever. Told that, an agent
+    either re-fixes what the worksheet already answered or refuses to import.
+    """
+    prompt = agent_mod.SYSTEM_PROMPT
+    assert 'has status "open" or "stale"' in prompt
+    assert "never re-fix one" in prompt
+    assert "Repeat until zero" not in prompt
+    assert "confirm zero conflicts remain" not in prompt
+
+    # the statuses the prompt names are exactly the ones the gate blocks on
+    blocking = {c["status"] for c in agent_mod._error_conflicts(
+        {"conflicts": [_conflict("missing_value", status=s)
+                       for s in ("open", "corrected", "stale", "waived", "resolved")]})}
+    assert blocking == {"open", "stale"}
+    for status in blocking:
+        assert f'"{status}"' in prompt
+
+
+def test_the_flat_agent_instructions_do_not_demand_zero_conflicts():
+    """The flat flow teaches worksheet corrections, so it cannot ask for zero."""
+    from erpgen.customers_full import _agent_instructions
+
+    text = _agent_instructions("Customer", "customers_full")
+    assert "open or stale" in text
+    assert "zero conflicts" not in text
+
+
+def test_no_playbook_names_a_mechanism_the_tools_do_not_have(agent_mod):
+    """Every remedy has to be reachable, or the agent loops on an impossible one.
+
+    `value_map` and `--id-column` are the two that bit: neither exists as an agent
+    operation (value remaps are unbuilt; only the CLI takes `--id-column`), so an
+    agent told to use them can never resolve the conflict it is looking at. The
+    reachable replacements are `set_value` and `change_key`.
+    """
+    from erpgen.analysis import _agent_instructions as relational
+    from erpgen.customers_full import _agent_instructions as flat
+    from erpgen.prompts import CORRECTION_SCHEMA
+
+    playbooks = {
+        "system prompt": agent_mod.SYSTEM_PROMPT,
+        "correction schema": CORRECTION_SCHEMA,
+        "relational instructions": relational("Customer"),
+        "flat instructions": flat("Customer", "customers_full"),
+    }
+    for where, text in playbooks.items():
+        assert "value_map" not in text, where
+        assert "--id-column" not in text, where
+        assert "change_key" in text or "correct" in text, where
 
 
 def test_run_agent_gates_on_data_quality_before_any_llm(agent_mod, monkeypatch):

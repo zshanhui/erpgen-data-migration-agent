@@ -167,4 +167,6 @@ def test_the_conflict_never_asks_for_the_record_to_be_created_again():
                         ["All Customer Groups"])
     assert "missing" not in c["suggested_action"]
     assert "leaf" in c["suggested_action"]
-    assert "value_map" in c["suggested_action"]
+    # the reachable verb, not the `value_map` the tools do not have
+    assert "set_value" in c["suggested_action"]
+    assert "value_map" not in c["suggested_action"]

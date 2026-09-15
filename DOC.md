@@ -229,6 +229,7 @@ added to its dedup set, so fixing the source and re-running retries it.
 | `get-record` / `list-records` | read records as JSON |
 | `set-mapping` | record a forced source-column → target-field decision |
 | `create-record` | create a lookup record (Item Group, UOM, …) |
+| `update-record` | change fields on an existing record; the values it replaced are journaled |
 | `agent` | LLM loop over the analysis: resolve conflicts, then import (`--doctor` skips the LLM) |
 | `status` | show a `--run` context: effects applied, requirements pending |
 | `revert` | undo a journal / run by replaying its recorded inverses |
@@ -284,7 +285,7 @@ failing a run. `--overrides <file>` selects a different file (e.g. per client).
 
 Every mutation is journaled **when it happens**, together with the inverse that
 undoes it. `revert` replays those inverses newest-first, so one command undoes
-records, custom fields and overrides together:
+records, custom fields, overrides and field updates together:
 
 ```bash
 python3 erpgen.py revert --latest Item           # dry run: list the inverses

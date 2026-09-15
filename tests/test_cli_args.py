@@ -24,6 +24,7 @@ MINIMAL_ARGV = {
                 "--json", '{"action":"skip_row","at":{"row":2},"reason":"dup"}'],
     "revert": [],
     "create-record": ["UOM", "--fields", '{"uom_name": "Dozen"}'],
+    "update-record": ["Item Group", "Tooling", "--fields", '{"is_group": 1}'],
     "status": [],
     "delete": ["--doctype", "Item", "--names", "A"],
     "clean": ["samples/items.csv"],
