@@ -169,8 +169,8 @@ def _safe(value, limit: int = 1000) -> str:
 
 
 # ---------------------------------------------------------------- tools
-def t_latest_analysis(doctype: str) -> str:
-    a = latest_analysis(doctype)
+def t_latest_analysis(doctype: str, source: str = "") -> str:
+    a = latest_analysis(doctype, source)
     if a is None:
         return "No analysis found. Run map first (or use the run_map tool)."
     return _j(a)
@@ -359,7 +359,8 @@ def t_list_records(doctype: str, filters_json: str = "") -> str:
 TOOLS = [
     {"fn": t_latest_analysis, "name": "latest_analysis",
      "description": "Return the most recent mapping analysis JSON for a doctype "
-                    "(conflicts, mappings, suggested custom fields)."},
+                    "(conflicts, mappings, suggested custom fields). Pass source "
+                    "to disambiguate when several sheets share one doctype."},
     {"fn": t_run_map, "name": "run_map",
      "description": "Re-run the mapper for a source file and doctype; returns the "
                     "fresh analysis JSON. Pass defaults as JSON for required fields."},
@@ -379,12 +380,16 @@ TOOLS = [
                     "target='<customer|supplier|contact|address>.<fieldname>' "
                     "(e.g. customer.tax_id, supplier.tax_id)."},
     {"fn": t_correct, "name": "correct",
-     "description": "Record one worksheet correction for a source sheet: set_value "
-                    "(fill a blank cell), skip_row (drop a row), merge_rows (fold a "
-                    "duplicate into another row), dismiss_conflict (waive a conflict "
-                    "with a reason), change_key (retarget the review key). Pass the "
-                    "correction object as JSON; it must name the conflict it answers "
-                    "in its 'conflict' field."},
+     "description": "Record ONE worksheet correction for a source sheet. Actions "
+                    "and their exact JSON fields (a row ref is the key value as a "
+                    "string, or {\"row\": N} for a source line number, 1 = header):\n"
+                    "- set_value: {\"action\":\"set_value\",\"at\":<ref>,\"column\":\"<col>\",\"value\":\"<v>\",\"conflict\":\"<key>\"}\n"
+                    "- skip_row: {\"action\":\"skip_row\",\"at\":<ref>,\"reason\":\"...\",\"conflict\":\"<key>\"}\n"
+                    "- merge_rows: {\"action\":\"merge_rows\",\"keep\":<ref>,\"drop\":[<ref>,...],\"field_overrides\":{\"<col>\":\"<v>\"},\"conflict\":\"<key>\"}\n"
+                    "- dismiss_conflict: {\"action\":\"dismiss_conflict\",\"conflict\":\"<key>\",\"reason\":\"...\"}\n"
+                    "- change_key: {\"action\":\"change_key\",\"column\":\"<col>\",\"reason\":\"...\"}\n"
+                    "The conflict key is \"<kind>:<source or field>[:<target>]\" "
+                    "(e.g. \"duplicate_row:Customer Name:customer_name\")."},
     {"fn": t_describe_doctype, "name": "describe_doctype",
      "description": "Summarize a doctype's structure (required fields, links, "
                     "child tables, fetch_from, id field)."},
@@ -418,9 +423,15 @@ Conflict kinds and how to fix them:
 
 Record every correction with the `correct` tool (never edit files by hand). A
 correction must name the conflict it answers in its `conflict` field (the key is
-"<kind>:<source or field>[:<target>]"); for duplicate_row, merge_rows/skip_row
-close it, and for a conflict you have decided to accept, dismiss_conflict with a
-reason closes it.
+"<kind>:<source or field>[:<target>]"). A row reference is the key value as a
+string, or {"row": N} for a source line number (1 = header). Exact shapes:
+- duplicate_row: {"action":"merge_rows","keep":"<key value>","drop":[{"row":N}],
+  "conflict":"duplicate_row:<source>:<target>"} — or skip_row to drop the row
+  outright. For two rows with the SAME key value, use {"row":N} references.
+- missing_value: {"action":"set_value","at":{"row":N},"column":"<col>",
+  "value":"<v>","conflict":"missing_value:<source>:<target>"}.
+- a conflict you have decided to accept: {"action":"dismiss_conflict",
+  "conflict":"<key>","reason":"<why>"}.
 
 Flat party sheets (doctype='customers_full' or 'suppliers_full'; ONE file with
 a party + Contact + Address): every conflict is an out-of-contract column and is
@@ -455,7 +466,7 @@ Rules:
 # Live progress, streamed to stdout. A single round can take minutes and make
 # dozens of remote calls; without this the CLI user watches a blank screen and
 # has to guess whether it is working. `--quiet` silences it.
-_LIVE: dict = {"enabled": True, "indent": "  "}
+_LIVE: dict = {"enabled": True, "indent": "  ", "echo_content": True}
 
 
 def _live(message: str) -> None:
@@ -523,9 +534,10 @@ def _live_llm_response(response, started: float) -> None:
         bits.append("wants " + ", ".join(wanted))
     _live(f"{_LIVE['indent']}· llm #{_TRANSCRIPT_CTX.get('llm_calls', 0)} ← "
           + " · ".join(bits))
-    thought = _thinking(response)
-    if thought:
-        _live(f"{_LIVE['indent']}    “{thought}”")
+    if _LIVE.get("echo_content", True):
+        thought = _thinking(response)
+        if thought:
+            _live(f"{_LIVE['indent']}    “{thought}”")
 
 
 def _log_llm_event(event: str, **fields) -> None:
@@ -1104,6 +1116,215 @@ def _data_quality_blockers(analysis: dict) -> list:
             and c["kind"] in DATA_QUALITY_KINDS]
 
 
+_CORRECTION_SCHEMA = (
+    "Return ONE correction as strict JSON (nothing else), one of:\n"
+    '  {"action":"merge_rows","keep":<ref>,"drop":[<ref>,...],'
+    '"field_overrides":{"<col>":"<v>"},"conflict":"<key>"}\n'
+    '  {"action":"skip_row","at":<ref>,"reason":"...","conflict":"<key>"}\n'
+    '  {"action":"set_value","at":<ref>,"column":"<col>","value":"<v>",'
+    '"conflict":"<key>"}\n'
+    '  {"action":"dismiss_conflict","conflict":"<key>","reason":"..."}\n'
+    "A row ref (<ref>) is the key value as a string, or {\"row\": N} for a "
+    "source line number (1 = header). Do not invent a value unless one is "
+    "visible in the row context; otherwise drop the row or waive the conflict."
+)
+
+
+def _extract_json(text: str) -> Optional[dict]:
+    """The first JSON object in an LLM reply, tolerating fences and prose."""
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.M)
+    for start in range(len(text)):
+        if text[start] != "{":
+            continue
+        depth = 0
+        for end in range(start, len(text)):
+            ch = text[end]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:end + 1])
+                    except json.JSONDecodeError:
+                        break
+    return None
+
+
+def _rows_text(conflict: dict, src) -> str:
+    """The source rows a conflict names, one readable line each."""
+    rows: set = set()
+    for g in conflict.get("groups") or []:
+        rows.update(g.get("rows") or [])
+    rows.update(conflict.get("rows") or [])
+    out = []
+    for line in sorted(rows):
+        idx = line - 2  # line 1 = header
+        if 0 <= idx < src.n_rows:
+            cells = " | ".join(
+                f"{h}={src.rows[idx][j] if j < len(src.rows[idx]) else ''}"
+                for j, h in enumerate(src.headers))
+            out.append(f"  line {line}: {cells}")
+    return "\n".join(out)
+
+
+def _ref_label(ref, src=None, key_column: str = "") -> str:
+    """A row reference as an operator reads it: 'row 31 (Hollow Core Drilling)'."""
+    if isinstance(ref, dict) and isinstance(ref.get("row"), int):
+        line = ref["row"]
+        label = f"row {line}"
+        if src is not None and key_column in src.headers:
+            idx = line - 2
+            col = src.headers.index(key_column)
+            if 0 <= idx < src.n_rows and col < len(src.rows[idx]):
+                key = str(src.rows[idx][col]).strip()
+                if key:
+                    label += f" ({key})"
+        return label
+    return repr(ref)
+
+
+def _describe_proposal(corr: dict, src=None, key_column: str = "") -> str:
+    """A correction proposal as a plain sentence, not raw JSON."""
+    action = corr.get("action")
+    if action == "skip_row":
+        why = f" — {corr['reason']}" if corr.get("reason") else ""
+        return f"drop {_ref_label(corr.get('at'), src, key_column)}{why}"
+    if action == "set_value":
+        return (f"set {corr.get('column')} on "
+                f"{_ref_label(corr.get('at'), src, key_column)} "
+                f"to {corr.get('value')!r}")
+    if action == "merge_rows":
+        drops = ", ".join(_ref_label(d, src, key_column)
+                          for d in (corr.get("drop") or []))
+        return f"merge {drops} into {_ref_label(corr.get('keep'), src, key_column)}"
+    if action == "dismiss_conflict":
+        why = f" — {corr['reason']}" if corr.get("reason") else ""
+        return f"waive {corr.get('conflict')}{why}"
+    if action == "change_key":
+        return f"use {corr.get('column')} as the review key"
+    return json.dumps(corr, ensure_ascii=False)
+
+
+async def _propose_correction(llm, conflict: dict, src, key_column: str,
+                              conflict_key: str) -> Optional[dict]:
+    """One LLM proposal for one conflict; None when it produced nothing usable."""
+    from llama_index.core.base.llms.types import ChatMessage, MessageRole
+
+    prompt = (
+        f"You are fixing data-quality issues in a spreadsheet before import.\n"
+        f"Key column: {key_column or '(unknown)'}\n"
+        f"Use this EXACT conflict key in your answer: {conflict_key!r}\n\n"
+        f"Conflict:\n{json.dumps(conflict, indent=2, default=str)}\n\n"
+        f"Relevant source rows:\n{_rows_text(conflict, src) or '(none)'}\n\n"
+        f"{_CORRECTION_SCHEMA}"
+    )
+    # the raw model JSON is not shown live; the loop renders it as a sentence
+    _LIVE["echo_content"] = False
+    try:
+        response = await llm.achat([ChatMessage(role=MessageRole.USER, content=prompt)])
+    finally:
+        _LIVE["echo_content"] = True
+    msg = getattr(response, "message", None)
+    text = getattr(msg, "content", None) or str(response)
+    return _extract_json(text)
+
+
+def _correction_sink(args, doctype: str, source: str):
+    """Where a data-quality correction is journaled: the run context, or a journal."""
+    log_dir = getattr(args, "log_dir", "logs")
+    if getattr(args, "run", None):
+        from erpgen.context import MigrationContext  # noqa: PLC0415
+
+        return MigrationContext(args.run, log_dir, source=source or "agent",
+                                base_url=getattr(args, "base", ""),
+                                doctypes=[doctype], command="correct")
+    from erpgen.journal import MigrationJournal  # noqa: PLC0415
+
+    return MigrationJournal(log_dir, doctype=doctype, source=source or "agent",
+                            base_url=getattr(args, "base", ""))
+
+
+async def _llm_data_quality_loop(args, analysis: dict, doctype: str,
+                                 source: str, flat: bool) -> int:
+    """LLM proposes a correction per data-quality error; the user approves each.
+
+    Returns 0 when every blocker was corrected, EXIT_DATA_QUALITY when any
+    remain (the mapping/import flow must not run), or 2 on a transport failure.
+    """
+    from erpgen.corrections import (WORKSHEET_DIR, add_correction, conflict_key,
+                                   worksheet_path)
+
+    blockers = _data_quality_blockers(analysis)
+    if not blockers:
+        return 0
+
+    llm = get_llm(args.provider, args.model, args.api_base)
+    if not _preflight_llm(args):
+        return 2
+
+    try:
+        src = read_source(source) if source else None
+    except Exception:  # noqa: BLE001 — row data is a nicety, not a requirement
+        src = None
+    key_column = (analysis.get("source") or {}).get("key_column") or ""
+    ws_dir = getattr(args, "worksheet_dir", None) or WORKSHEET_DIR
+    ws_path = worksheet_path(doctype, source, ws_dir)
+
+    print(f"\n=== LLM data-quality correction — {len(blockers)} conflict(s) ===")
+    for i, conf in enumerate(blockers, 1):
+        print(f"\n[{i}/{len(blockers)}] {conf['kind']}: "
+              f"{conf.get('source') or conf.get('field')}")
+        proposal = None
+        try:
+            proposal = await _propose_correction(
+                llm, conf, src, key_column, conflict_key(conf))
+        except Exception as e:  # noqa: BLE001 — keep going to the next error
+            print(f"  (proposal failed: {type(e).__name__}: {e})")
+        if proposal is None:
+            print("  (no usable proposal — skipping; fix this one by hand)")
+            continue
+        print(f"  Proposal: {_describe_proposal(proposal, src, key_column)}")
+        ans = input("  Apply this correction? [y/N] ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("  Skipped.")
+            continue
+        try:
+            saved, created = add_correction(ws_path, proposal, created_by="agent")
+        except ValueError as e:
+            print(f"  Rejected: {e}")
+            continue
+        if created:
+            sink = _correction_sink(args, doctype, source)
+            sink.effect("correction_add",
+                        {"op": "correction_revoke", "path": str(ws_path),
+                         "correction_id": saved["id"]},
+                        doctype=doctype, source=source, correction_id=saved["id"])
+            sink.close()
+            print(f"  correction {saved['id']} recorded.")
+        else:
+            print(f"  correction {saved['id']} already recorded.")
+
+    # re-detect; a corrected conflict now reads corrected/waived, a skipped one
+    # stays open and must still block the mapping/import flow
+    cmd = ["map", source]
+    if doctype and not flat:
+        cmd += ["--doctype", doctype]
+    _erpgen(cmd)
+    fresh = latest_analysis(doctype, source) or analysis
+    remaining = _data_quality_blockers(fresh)
+    if remaining:
+        print(f"\n=== {len(remaining)} data-quality error(s) still remain — "
+              "not proceeding to the mapping/import flow ===")
+        for c in remaining:
+            print(f"    [{c['kind']}] {c.get('source') or c.get('field')}")
+        print("  Fix them by hand (erpgen.py correct ...) or re-run with "
+              "--llm-data-quality-correction and approve the remaining proposals.")
+        return EXIT_DATA_QUALITY
+    print("\nData quality clean — proceeding to the mapping/import flow.")
+    return 0
+
+
 def _stall_fingerprint(errs: list) -> frozenset:
     """Identity of the outstanding error conflicts, for stall detection.
 
@@ -1271,7 +1492,7 @@ async def _run_rounds(args, workflow, transcript: Transcript, analysis: dict,
             return outcome
 
         # programmatic verification: re-read the newest analysis artifact
-        fresh = latest_analysis(doctype)
+        fresh = latest_analysis(doctype, source)
         if fresh is not None:
             analysis = fresh
         after_errs = _error_conflicts(analysis)
@@ -1354,18 +1575,26 @@ async def run_agent(args) -> int:
     # on mapping decisions.
     dq = _data_quality_blockers(analysis)
     if dq:
-        print(f"\n=== {len(dq)} data-quality conflict(s) must be fixed before "
-              "the mapping agent can run ===")
-        for c in dq:
-            print(f"    [{c['kind']}] {c.get('source') or c.get('field')}")
-        print("  Fix them deterministically (no LLM needed) with worksheet "
-              "corrections, e.g.:")
-        print(f"    python3 erpgen.py correct {source} --doctype {doctype} "
-              "--json '{\"action\": \"set_value\", \"at\": {\"row\": N}, ...}'")
-        print("  duplicate_row -> skip_row / merge_rows; missing_value -> "
-              "set_value; or dismiss_conflict to waive one with a reason.")
-        print("  Re-run once they are corrected/waived/resolved.")
-        return EXIT_DATA_QUALITY
+        if getattr(args, "llm_data_quality_correction", False):
+            code = await _llm_data_quality_loop(args, analysis, doctype, source, flat)
+            if code:
+                return code
+            analysis = latest_analysis(doctype, source) or analysis
+        else:
+            print(f"\n=== {len(dq)} data-quality conflict(s) must be fixed before "
+                  "the mapping agent can run ===")
+            for c in dq:
+                print(f"    [{c['kind']}] {c.get('source') or c.get('field')}")
+            print("  Fix them deterministically (no LLM needed) with worksheet "
+                  "corrections, e.g.:")
+            print(f"    python3 erpgen.py correct {source} --doctype {doctype} "
+                  "--json '{\"action\": \"set_value\", \"at\": {\"row\": N}, ...}'")
+            print("  duplicate_row -> skip_row / merge_rows; missing_value -> "
+                  "set_value; or dismiss_conflict to waive one with a reason.")
+            print("  Or pass --llm-data-quality-correction to have the LLM propose "
+                  "fixes you approve one by one.")
+            print("  Re-run once they are corrected/waived/resolved.")
+            return EXIT_DATA_QUALITY
 
     # With no conflicts there is nothing for the model to decide, so run the
     # import deterministically and only wake the agent if rows actually failed.
@@ -1450,6 +1679,10 @@ def add_agent_flags(ap: argparse.ArgumentParser) -> None:
                          "unaffected)")
     ap.add_argument("--doctor", action="store_true",
                     help="show tools + analysis without calling an LLM")
+    ap.add_argument("--llm-data-quality-correction", action="store_true",
+                    help="let the LLM propose a correction for each data-quality "
+                         "error and apply it only after a y/N confirmation; if any "
+                         "remain, the mapping/import flow does not run")
 
 
 def build_parser() -> argparse.ArgumentParser:

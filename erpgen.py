@@ -1,49 +1,8 @@
 #!/usr/bin/env python3
-"""erpgen CLI — map & migrate spreadsheets into ERPNext.
+"""Map and migrate spreadsheets into ERPNext, flagging data-quality issues and
+mapping conflicts first. Imports are idempotent and fully revertible via the
+effect journal; an LLM agent can resolve conflicts with confirmation."""
 
-Idempotent imports: before inserting anything, the tool queries which natural
-keys already exist on the target site. Only NEW records are created; duplicates
-are skipped; every row (created / skipped / failed) is written to an audit log.
-
-Examples:
-  # inspect a source and get a mapping plan (metadata comes from the live site)
-  python3 erpgen.py map samples/customers.csv --doctype Customer
-
-  # dry-run: plan + payloads + predicted skips, touches nothing
-  python3 erpgen.py import samples/customers.csv --doctype Customer \
-      --defaults '{"customer_group":"Commercial","territory":"All Territories"}'
-
-  # import: creates new records, skips existing, logs everything
-  # (--defaults is optional; pass real JSON, not a placeholder)
-  python3 erpgen.py import samples/customers.csv --doctype Customer --apply
-  python3 erpgen.py import samples/customers.csv --doctype Customer \
-      --defaults '{"customer_group":"Commercial","territory":"All Territories"}' --apply
-
-  # bulk path via the Data Import machinery (also deduped), optional submit
-  python3 erpgen.py import samples/customers.csv --doctype Customer --apply --bulk --submit
-
-  # explicit key column (needed when it isn't auto-inferred)
-  python3 erpgen.py import samples/sales_orders.csv --doctype "Sales Order" \
-      --id-column "Sales Order ID" --apply
-
-  # create a new column on a doctype (e.g. for an unmapped source column)
-  python3 erpgen.py createfield Customer --label "Vendor Code" --fieldtype Data
-  python3 erpgen.py createfield Customer --list
-
-  # inspect records (agent verification / existence checks)
-  python3 erpgen.py get-record Customer "Acme Steel Works"
-  python3 erpgen.py list-records "Customer Group"
-  python3 erpgen.py list-records "Customer Group" --filter '[["name","like","%Whol%"]]'
-  python3 erpgen.py describe-doctype "Customer Group"   # what a record needs
-
-  # revert a migration (replays the run journal's inverses: records, custom
-  # fields and mapping overrides in one command)
-  python3 erpgen.py revert --latest Item
-  python3 erpgen.py revert --latest Item --apply
-
-  # clean up demo data
-  python3 erpgen.py delete --doctype Customer --names "Acme Steel Works,Bluedot Logistics"
-"""
 from __future__ import annotations
 
 import argparse

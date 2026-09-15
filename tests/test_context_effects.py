@@ -62,6 +62,20 @@ def test_custom_field_label_defaults_to_fieldname(mkctx):
     assert eff["fieldname"] == "notes"
 
 
+def test_context_has_a_summary_like_a_journal(mkctx):
+    """`_effect_sink` hands back a context under --run, so every caller that
+    prints `.summary()` needs one here too (MigrationJournal has had it for a
+    while; the context did not)."""
+    c = mkctx("run1")
+    c.record_created("UOM", "Dozen")
+    s = c.summary()
+    assert "Run context:" in s
+    assert "1 revertible effect(s)" in s
+
+    empty = mkctx("run2")
+    assert "nothing to undo" in empty.summary()
+
+
 # ------------------------------------------------------------- read views
 def test_load_run_accepts_run_id_or_path(mkctx):
     c = mkctx("run1")

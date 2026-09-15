@@ -135,6 +135,17 @@ class MigrationContext:
                   effects=self.effects, pending=len(self._pending))
         self._fh.close()
 
+    def summary(self) -> str:
+        """Operator-facing line, matching `MigrationJournal.summary` so the two
+        sinks are interchangeable at the call sites that print one."""
+        line = f"Run context: {self.path}  ({self.effects} revertible effect(s))"
+        if self.effects == 0:
+            line += " — nothing to undo"
+        pending = len(self._pending)
+        if pending:
+            line += f", {pending} requirement(s) still pending"
+        return line
+
     # ------------------------------------------------------------ coeffects
     def add_requirements(self, conflicts: list[dict]) -> int:
         """Record mapper conflicts as requirements. Returns how many were added."""

@@ -257,6 +257,22 @@ def test_set_value_on_a_skipped_row_is_inert():
     assert "dropped by an earlier correction" in prepared.verdicts["c2"]["why"]
 
 
+def test_sibling_skip_rows_on_one_row_are_all_applicable():
+    """Each blank cell on a row is its own missing_value conflict, so the agent
+    proposes a skip_row per conflict. The first drops the row; the rest are
+    satisfied no-ops, not 'stale' — the row is already gone, which is the goal."""
+    prepared = _after([
+        {"action": "skip_row", "at": {"row": 5}, "reason": "blank address line 1",
+         "conflict": "missing_value:Address Line 1:address_line1"},
+        {"action": "skip_row", "at": {"row": 5}, "reason": "blank city",
+         "conflict": "missing_value:City:city"},
+        {"action": "skip_row", "at": {"row": 5}, "reason": "blank country",
+         "conflict": "missing_value:Country:country"},
+    ])
+    assert prepared.applied() == ["c1", "c2", "c3"]
+    assert _names(prepared) == ["Nimbus Forge", "Granite Bay", "Harborline", "Bluedot"]
+
+
 def test_merge_rows_applies_overrides_and_drops_the_duplicate():
     rows = [row[:] for row in ROWS] + [["Bluedot Logistics", "", "5555"]]
     prepared = _after([{

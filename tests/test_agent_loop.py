@@ -248,3 +248,111 @@ def test_run_agent_proceeds_when_data_quality_is_clean(agent_mod, monkeypatch):
 
     assert rc != agent_mod.EXIT_DATA_QUALITY
     assert llm_called, "a clean data-quality pass must reach the LLM mapping flow"
+
+
+# ------------------------------------------------- llm data-quality correction
+def _dq_loop(agent_mod, monkeypatch, proposal, answer, fresh_conflicts):
+    import asyncio
+    from types import SimpleNamespace
+
+    blockers = [{"kind": "missing_value", "severity": "error", "status": "open",
+                 "source": "Customer Name", "target": "customer_name", "rows": [30]}]
+
+    class _Resp:
+        class _Msg:
+            content = proposal
+        message = _Msg()
+
+    class _LLM:
+        async def achat(self, messages):
+            return _Resp()
+
+    applied = []
+
+    def _add(path, corr, created_by="human"):
+        applied.append(corr)
+        return {"id": "c1"}, True
+
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: _LLM())
+    monkeypatch.setattr(agent_mod, "_preflight_llm", lambda args: True)
+    monkeypatch.setattr(agent_mod, "read_source",
+                        lambda p: SimpleNamespace(n_rows=3, headers=["Customer Name"],
+                                                 rows=[["A"], ["B"], [""]]))
+    # add_correction is imported inside _llm_data_quality_loop, so patch the
+    # module it comes from rather than the agent module
+    import erpgen.corrections as _corr
+
+    monkeypatch.setattr(_corr, "add_correction", _add)
+    monkeypatch.setattr(agent_mod, "_correction_sink",
+                        lambda *a, **k: SimpleNamespace(effect=lambda *a, **k: None,
+                                                        close=lambda: None))
+    monkeypatch.setattr(agent_mod, "_erpgen", lambda cmd, timeout=300: (0, ""))
+    monkeypatch.setattr(agent_mod, "latest_analysis",
+                        lambda dt, source="": {"conflicts": fresh_conflicts})
+    monkeypatch.setattr("builtins.input", lambda prompt="": answer)
+
+    analysis = {"conflicts": blockers, "source": {"key_column": "Customer Name"}}
+    code = asyncio.run(agent_mod._llm_data_quality_loop(
+        _args(), analysis, "Customer", "samples/x.csv", False))
+    return code, applied
+
+
+def test_extract_json_handles_fences_and_prose(agent_mod):
+    assert agent_mod._extract_json('{"action": "skip_row"}') == {"action": "skip_row"}
+    assert agent_mod._extract_json('Sure, here you go:\n```json\n{"action": "merge_rows"}\n```') \
+        == {"action": "merge_rows"}
+    assert agent_mod._extract_json("no json here") is None
+
+
+def test_llm_dq_loop_applies_an_approved_correction(agent_mod, monkeypatch):
+    code, applied = _dq_loop(
+        agent_mod, monkeypatch,
+        proposal='{"action":"skip_row","at":{"row":30},"reason":"blank","conflict":"missing_value:Customer Name:customer_name"}',
+        answer="y", fresh_conflicts=[])
+    assert code == 0
+    assert len(applied) == 1
+
+
+def test_llm_dq_loop_skips_a_declined_correction_and_stops(agent_mod, monkeypatch):
+    code, applied = _dq_loop(
+        agent_mod, monkeypatch,
+        proposal='{"action":"skip_row","at":{"row":30},"reason":"blank","conflict":"missing_value:Customer Name:customer_name"}',
+        answer="n",
+        fresh_conflicts=[{"kind": "missing_value", "severity": "error",
+                          "status": "open", "source": "Customer Name"}])
+    assert code == agent_mod.EXIT_DATA_QUALITY
+    assert applied == []
+
+
+def test_llm_dq_loop_is_a_noop_when_data_is_clean(agent_mod, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(agent_mod, "get_llm",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("LLM must not run")))
+    code = asyncio.run(agent_mod._llm_data_quality_loop(
+        _args(), {"conflicts": [], "source": {"key_column": "Customer Name"}},
+        "Customer", "samples/x.csv", False))
+    assert code == 0
+
+
+def test_describe_proposal_is_human_readable(agent_mod):
+    from types import SimpleNamespace
+
+    src = SimpleNamespace(
+        headers=["Customer Name", "City"],
+        rows=[["Acme", "Cleveland"], ["Hollow Core Drilling", ""]], n_rows=2)
+    kc = "Customer Name"
+
+    assert agent_mod._describe_proposal(
+        {"action": "skip_row", "at": {"row": 3}, "reason": "blank city"}, src, kc
+    ) == "drop row 3 (Hollow Core Drilling) — blank city"
+    assert agent_mod._describe_proposal(
+        {"action": "set_value", "at": {"row": 3}, "column": "City", "value": "Cleveland"}, src, kc
+    ) == "set City on row 3 (Hollow Core Drilling) to 'Cleveland'"
+    assert agent_mod._describe_proposal(
+        {"action": "merge_rows", "keep": {"row": 2}, "drop": [{"row": 3}]}, src, kc
+    ) == "merge row 3 (Hollow Core Drilling) into row 2 (Acme)"
+    assert agent_mod._describe_proposal(
+        {"action": "dismiss_conflict", "conflict": "possible_duplicate_row:Customer Name",
+         "reason": "two entities"}, src, kc
+    ) == "waive possible_duplicate_row:Customer Name — two entities"

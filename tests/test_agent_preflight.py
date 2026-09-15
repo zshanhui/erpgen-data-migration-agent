@@ -886,12 +886,40 @@ def _drive_loop(agent_mod, monkeypatch, args, analysis=None):
 
     monkeypatch.setattr(agent_mod, "_run_agent_round", _fake_round)
     monkeypatch.setattr(agent_mod, "latest_analysis",
-                        lambda doctype: dict(analysis or STUCK_ANALYSIS))
+                        lambda doctype, source="": dict(analysis or STUCK_ANALYSIS))
     recorder = _Recorder()
     outcome = asyncio.run(agent_mod._run_rounds(
         args, _Workflow(), recorder, dict(analysis or STUCK_ANALYSIS),
         "Contact", "samples/contacts.csv"))
     return outcome, recorder
+
+
+def test_round_verification_reads_the_source_scoped_analysis(agent_mod, monkeypatch):
+    """The post-round re-read must pass the source, or several worksheets for one
+    doctype make `latest_analysis` error into None and the loop keeps a stale
+    analysis — the false stall this run hit (Customer: e2e + dirty)."""
+    import asyncio
+
+    seen = {}
+
+    async def _fake_round(workflow, msg, max_iterations=0):
+        return "done"
+
+    def _fresh(doctype, source=""):
+        seen["args"] = (doctype, source)
+        # the round actually cleared the conflicts; a source-scoped re-read
+        # reflects that, so the loop converges instead of stalling
+        return {"base_url": "u", "conflicts": []}
+
+    monkeypatch.setattr(agent_mod, "_run_agent_round", _fake_round)
+    monkeypatch.setattr(agent_mod, "latest_analysis", _fresh)
+
+    outcome = asyncio.run(agent_mod._run_rounds(
+        _LoopArgs(), object(), _Recorder(), dict(STUCK_ANALYSIS),
+        "Customer", "samples/customers_e2e.csv"))
+
+    assert seen["args"] == ("Customer", "samples/customers_e2e.csv")
+    assert outcome.converged is True
 
 
 def test_escape_hatch_fires_when_conflicts_never_change(agent_mod, monkeypatch):
@@ -917,7 +945,7 @@ def test_escape_hatch_waits_for_the_configured_number_of_rounds(agent_mod, monke
     async def _fake_round(workflow, msg, max_iterations=0):
         return "tried"
 
-    def _fresh(doctype):
+    def _fresh(doctype, source=""):
         calls["n"] += 1
         return dict(STUCK_ANALYSIS)
 
@@ -1121,7 +1149,7 @@ def test_round_loop_publishes_the_run_id_for_tools(agent_mod, monkeypatch):
 
     monkeypatch.setattr(agent_mod, "_run_agent_round", _fake_round)
     monkeypatch.setattr(agent_mod, "latest_analysis",
-                        lambda dt: {"base_url": "u", "conflicts": []})
+                        lambda dt, source="": {"base_url": "u", "conflicts": []})
     asyncio.run(agent_mod._run_rounds(_run_args(run="myrun"), object(), _T(),
                                       {"base_url": "u", "conflicts": []},
                                       "Item", "s.csv"))

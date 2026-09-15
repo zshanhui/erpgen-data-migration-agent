@@ -381,7 +381,11 @@ def _apply(c: dict, rows: list[list], headers: list[str], key_column: str,
         if why:
             return why
         if idx in dropped:
-            return "the row was dropped by an earlier correction"
+            # the row is already gone (a sibling skip_row / merge_rows dropped
+            # it): the intent is satisfied, so this is an idempotent no-op —
+            # NOT a contradiction. Multiple missing_value conflicts on one row
+            # each propose a skip_row, and only the first may actually drop it.
+            return None
         dropped.add(idx)
         return None
 
