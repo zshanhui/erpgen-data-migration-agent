@@ -184,3 +184,67 @@ def test_preflight_is_skipped_for_openai(agent_mod, monkeypatch):
                         lambda *a, **k: called.append(a) or (True, ""))
     assert agent_mod._preflight_llm(_args(provider="openai")) is True
     assert called == []
+
+
+# ------------------------------------------------------------ data-quality gate
+def _conflict(kind, severity="error", status="open"):
+    return {"kind": kind, "severity": severity, "status": status,
+            "source": f"col-{kind}"}
+
+
+def test_data_quality_blockers_return_only_open_stale_errors(agent_mod):
+    a = {"conflicts": [
+        _conflict("duplicate_row"),
+        _conflict("missing_value"),
+        _conflict("possible_duplicate_row", severity="warning"),  # warning → never a gate
+        _conflict("link_value_conflict"),             # mapping, not data quality
+        _conflict("missing_value", status="corrected"),
+        _conflict("missing_value", status="waived"),
+        _conflict("missing_value", status="resolved"),
+    ]}
+    blockers = agent_mod._data_quality_blockers(a)
+    assert [(c["kind"], c["status"]) for c in blockers] == \
+        [("duplicate_row", "open"), ("missing_value", "open")]
+
+
+def test_data_quality_blockers_on_a_clean_analysis(agent_mod):
+    a = {"conflicts": [_conflict("link_value_conflict"),
+                       _conflict("missing_value", status="corrected")]}
+    assert agent_mod._data_quality_blockers(a) == []
+
+
+def test_run_agent_gates_on_data_quality_before_any_llm(agent_mod, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(agent_mod, "resolve_doctype", lambda args: ("Item", False))
+    monkeypatch.setattr(agent_mod, "_load_analysis",
+                        lambda *a, **k: {"doctype": "Item",
+                                         "source": "samples/items.csv",
+                                         "conflicts": [_conflict("duplicate_row")]})
+    llm_called = []
+    monkeypatch.setattr(agent_mod, "get_llm",
+                        lambda *a, **k: llm_called.append(1) or object())
+
+    rc = asyncio.run(agent_mod.run_agent(_args(source="samples/items.csv")))
+
+    assert rc == agent_mod.EXIT_DATA_QUALITY
+    assert llm_called == [], "the LLM must not be touched while data quality is broken"
+
+
+def test_run_agent_proceeds_when_data_quality_is_clean(agent_mod, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(agent_mod, "resolve_doctype", lambda args: ("Item", False))
+    monkeypatch.setattr(agent_mod, "_load_analysis",
+                        lambda *a, **k: {"doctype": "Item",
+                                         "source": "samples/items.csv",
+                                         "conflicts": [_conflict("link_value_conflict")]})
+    llm_called = []
+    monkeypatch.setattr(agent_mod, "get_llm",
+                        lambda *a, **k: llm_called.append(1) or object())
+    monkeypatch.setattr(agent_mod, "_preflight_llm", lambda args: False)
+
+    rc = asyncio.run(agent_mod.run_agent(_args(source="samples/items.csv")))
+
+    assert rc != agent_mod.EXIT_DATA_QUALITY
+    assert llm_called, "a clean data-quality pass must reach the LLM mapping flow"

@@ -650,6 +650,11 @@ def instrumented_llm(base_cls):
     return _Instrumented
 
 
+#: hard bound on one LLM request, so a hung endpoint surfaces as a timeout
+#: error instead of an open connection the operator has to Ctrl-C out of
+LLM_TIMEOUT = 120
+
+
 def _deepseek_llm(model: str, api_base: str):
     """OpenAI-compatible client for DeepSeek.
 
@@ -666,6 +671,10 @@ def _deepseek_llm(model: str, api_base: str):
         api_base=api_base or "https://api.deepseek.com",
         is_chat_model=True,
         is_function_calling_model=True,
+        # fail fast and loud: no silent SDK retries, and a hard read bound so a
+        # hung request surfaces as APITimeoutError instead of an open connection
+        timeout=LLM_TIMEOUT,
+        max_retries=0,
     )
 
 
@@ -679,6 +688,8 @@ def _deepinfra_llm(model: str, api_base: str):
         api_base=api_base or "https://api.deepinfra.com/v1/openai",
         is_chat_model=True,
         is_function_calling_model=True,
+        timeout=LLM_TIMEOUT,
+        max_retries=0,
     )
 
 
@@ -819,7 +830,8 @@ def _openai_llm(model: str):
     """OpenAI LLM, instrumented so its calls are logged like DeepSeek's."""
     from llama_index.llms.openai import OpenAI
 
-    return instrumented_llm(OpenAI)(model=model or "gpt-4o-mini")
+    return instrumented_llm(OpenAI)(model=model or "gpt-4o-mini",
+                                    timeout=LLM_TIMEOUT, max_retries=0)
 
 
 def get_llm(provider: str, model: str, api_base: str = ""):
@@ -910,6 +922,10 @@ def build_workflow(llm):
         llm=llm,
         verbose=True,
         timeout=900,
+        # non-streaming: the OpenAI-compatible hosts this targets answer a plain
+        # `achat` in a few seconds, but their SSE stream can sit open without
+        # ever sending a chunk, hanging the run until the client cancels it
+        streaming=False,
     )
     return AgentWorkflow(agents=[agent], root_agent="migration_agent", timeout=900)
 
@@ -1064,6 +1080,28 @@ def _error_conflicts(analysis: dict) -> list:
     return [c for c in analysis["conflicts"]
             if c["severity"] == "error"
             and c.get("status", "open") in ("open", "stale")]
+
+
+#: conflict kinds the deterministic cleaning stage owns. The mapping agent is
+#: gated until these are corrected/waived, so the LLM never spends a token on
+#: "which rows are duplicates" — the detectors already answered that for free.
+DATA_QUALITY_KINDS = ("duplicate_row", "missing_value")
+
+#: exit code when the mapping agent is refused until data quality is clean
+EXIT_DATA_QUALITY = 5
+
+
+def _data_quality_blockers(analysis: dict) -> list:
+    """Error-severity cleaning conflicts that still block the mapping agent.
+
+    `possible_duplicate_row` is warning-only and never blocks, so it is not a
+    gate. Data quality is resolved deterministically — worksheet corrections via
+    `erpgen.py correct` — not by the LLM.
+    """
+    return [c for c in analysis["conflicts"]
+            if c["severity"] == "error"
+            and c.get("status", "open") in ("open", "stale")
+            and c["kind"] in DATA_QUALITY_KINDS]
 
 
 def _stall_fingerprint(errs: list) -> frozenset:
@@ -1309,6 +1347,25 @@ async def run_agent(args) -> int:
     src = analysis.get("source")
     source = (src.get("path") if isinstance(src, dict) else src) \
         or args.source or "unknown"
+
+    # Data quality gates the mapping agent: duplicate keys and empty required
+    # cells are found by deterministic detectors, so they must be resolved with
+    # worksheet corrections (no LLM) before the model is allowed to spend a token
+    # on mapping decisions.
+    dq = _data_quality_blockers(analysis)
+    if dq:
+        print(f"\n=== {len(dq)} data-quality conflict(s) must be fixed before "
+              "the mapping agent can run ===")
+        for c in dq:
+            print(f"    [{c['kind']}] {c.get('source') or c.get('field')}")
+        print("  Fix them deterministically (no LLM needed) with worksheet "
+              "corrections, e.g.:")
+        print(f"    python3 erpgen.py correct {source} --doctype {doctype} "
+              "--json '{\"action\": \"set_value\", \"at\": {\"row\": N}, ...}'")
+        print("  duplicate_row -> skip_row / merge_rows; missing_value -> "
+              "set_value; or dismiss_conflict to waive one with a reason.")
+        print("  Re-run once they are corrected/waived/resolved.")
+        return EXIT_DATA_QUALITY
 
     # With no conflicts there is nothing for the model to decide, so run the
     # import deterministically and only wake the agent if rows actually failed.
