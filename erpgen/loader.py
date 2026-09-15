@@ -9,6 +9,7 @@ Two paths:
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -199,6 +200,10 @@ class RestLoader:
                 results.append(RowResult(name=key or payload.get("name"), ok=False, error=str(e)))
                 if logger:
                     logger.row(row, key, "failed", message=str(e))
+                # surface the reason on stderr: the agent sees only the import's
+                # stdout tail, and without this it knows "failed: N" but not why
+                print(f"WARNING: row {row}: {doctype} '{key}' failed: {e}",
+                      file=sys.stderr)
             if delay:
                 time.sleep(delay)
         return results

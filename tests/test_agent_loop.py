@@ -356,3 +356,45 @@ def test_describe_proposal_is_human_readable(agent_mod):
         {"action": "dismiss_conflict", "conflict": "possible_duplicate_row:Customer Name",
          "reason": "two entities"}, src, kc
     ) == "waive possible_duplicate_row:Customer Name — two entities"
+
+
+# --------------------------------------------------------- correct tool kwarg
+def test_correct_tool_merges_a_top_level_conflict_kwarg(agent_mod, monkeypatch):
+    """The model sometimes passes `conflict` top-level; fail-soft, not a TypeError."""
+    import json as _json
+
+    seen = {}
+
+    def _fake_erpgen(cmd, timeout=300):
+        seen["cmd"] = cmd
+        return 0, "correct exit 0:\ncorrection c1 added"
+
+    monkeypatch.setattr(agent_mod, "_erpgen", _fake_erpgen)
+    out = agent_mod.t_correct(
+        "samples/customers.csv", "Customer",
+        '{"action":"set_value","at":{"row":5},"column":"Country","value":"US"}',
+        conflict="link_value_conflict:Country:country",
+    )
+    sent = _json.loads(seen["cmd"][seen["cmd"].index("--json") + 1])
+    assert sent["conflict"] == "link_value_conflict:Country:country"
+    assert "correct exit 0" in out
+
+
+def test_correct_tool_does_not_override_an_existing_conflict(agent_mod, monkeypatch):
+    import json as _json
+
+    seen = {}
+
+    def _fake_erpgen(cmd, timeout=300):
+        seen["cmd"] = cmd
+        return 0, "correct exit 0:\ncorrection c1 added"
+
+    monkeypatch.setattr(agent_mod, "_erpgen", _fake_erpgen)
+    agent_mod.t_correct(
+        "samples/customers.csv", "Customer",
+        '{"action":"set_value","at":{"row":5},"column":"Country","value":"US",'
+        '"conflict":"missing_value:Country:country"}',
+        conflict="link_value_conflict:Country:country",
+    )
+    sent = _json.loads(seen["cmd"][seen["cmd"].index("--json") + 1])
+    assert sent["conflict"] == "missing_value:Country:country"

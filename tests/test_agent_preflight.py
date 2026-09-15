@@ -302,6 +302,17 @@ def test_pre_import_carries_the_run_id_before_the_subcommand(agent_mod, monkeypa
     assert seen["cmd"][2] == "import" and "--apply" in seen["cmd"]
 
 
+def test_deterministic_import_prints_the_revert_command(agent_mod, monkeypatch, capsys):
+    import asyncio
+
+    monkeypatch.setattr(agent_mod, "_load_analysis", lambda *a: dict(CLEAN))
+    monkeypatch.setattr(agent_mod, "_erpgen",
+                        lambda cmd, timeout=300: (0, "REST upsert: created 0, failed 0"))
+    monkeypatch.setattr(agent_mod, "get_llm", lambda *a, **k: None)
+    assert asyncio.run(agent_mod.run_agent(_run_args(run="r1"))) == 0
+    assert "revert this run: python3 erpgen.py revert r1 --apply" in capsys.readouterr().out
+
+
 def test_row_failures_engage_the_agent_with_the_context(agent_mod, monkeypatch):
     import asyncio
     captured = {}
@@ -1084,6 +1095,40 @@ def test_help_block_offers_the_offline_path(agent_mod):
 def test_model_defaults_when_not_supplied(agent_mod):
     out = agent_mod.describe_llm_error(RateLimitError("x", status_code=429), BASE)
     assert "(provider default)" in out
+
+
+def test_the_deepseek_default_is_the_canonical_v41_flash_id(agent_mod):
+    """`deepseek-v4.1-flash` is rejected by the API; the id is `deepseek-flash`."""
+    assert agent_mod.DEFAULT_DEEPSEEK_MODEL == "deepseek-flash"
+
+
+# ------------------------------------------------ --model flash|pro shorthands
+@pytest.mark.parametrize("given,expected", [
+    ("flash", "deepseek-flash"),
+    ("pro", "deepseek-v4-pro"),
+    ("FLASH", "deepseek-flash"),        # case-insensitive
+    ("  pro  ", "deepseek-v4-pro"),     # surrounding whitespace ignored
+    ("", "deepseek-flash"),             # omitted -> provider default
+    (None, "deepseek-flash"),
+    ("deepseek-v4-pro", "deepseek-v4-pro"),   # a full id is never second-guessed
+    ("gpt-4o-mini", "gpt-4o-mini"),
+])
+def test_deepseek_model_shorthands_resolve(agent_mod, given, expected):
+    assert agent_mod.resolve_deepseek_model(given) == expected
+
+
+def test_the_flash_alias_tracks_the_default(agent_mod):
+    """One source of truth: `flash` and the omitted-model default cannot drift."""
+    assert agent_mod.DEEPSEEK_MODEL_ALIASES["flash"] == \
+        agent_mod.DEFAULT_DEEPSEEK_MODEL
+
+
+def test_deepseek_llm_uses_the_resolved_model(agent_mod, monkeypatch):
+    pytest.importorskip("llama_index.llms.openai_like")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "dummy-key-no-network")
+    assert agent_mod._deepseek_llm("pro", "").model == "deepseek-v4-pro"
+    assert agent_mod._deepseek_llm("flash", "").model == "deepseek-flash"
+    assert agent_mod._deepseek_llm("", "").model == "deepseek-flash"
 
 
 # ------------------------------------------------------------ _is_llm_error

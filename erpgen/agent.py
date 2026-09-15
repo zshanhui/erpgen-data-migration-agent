@@ -26,7 +26,8 @@ Usage:
 
 LLM provider: --provider openai|deepseek|deepinfra (auto-detected from
 OPENAI_API_KEY / DEEPSEEK_API_KEY / DEEPINFRA_API_KEY). DeepSeek defaults to model
-deepseek-v4-flash on https://api.deepseek.com (--api-base to override).
+deepseek-flash (V4.1 Flash) on https://api.deepseek.com (--api-base to override),
+and accepts --model flash|pro as shorthands for deepseek-flash / deepseek-v4-pro.
 DeepInfra defaults to model zai-org/GLM-5.3.
 Run with the project venv: .venv/bin/python erpgen.py agent ...
 
@@ -63,6 +64,7 @@ from erpgen.customers_full import (  # noqa: E402
     parse_flat_target,
     party_for_flow,
 )
+from erpgen.prompts import SYSTEM_PROMPT, correction_proposal_prompt  # noqa: E402
 from erpgen.source import read_source  # noqa: E402
 from erpgen.tools import (  # noqa: E402
     create_field,
@@ -316,12 +318,21 @@ def t_set_mapping(doctype: str, column: str, target: str) -> str:
         return _j({"error": str(e)})
 
 
-def t_correct(source: str, doctype: str, correction_json: str) -> str:
-    """Record one worksheet correction; the CLI journals it so revert revokes it."""
+def t_correct(source: str, doctype: str, correction_json: str,
+              conflict: str = "") -> str:
+    """Record one worksheet correction; the CLI journals it so revert revokes it.
+
+    `conflict` is accepted for leniency: the tool description asks for it inside
+    `correction_json`, but the model sometimes passes it top-level too. When it
+    does (and the correction does not already name one), merge it in rather than
+    failing the call.
+    """
     try:
         corr = json.loads(correction_json)
     except json.JSONDecodeError as e:
         return _j({"error": f"correction_json is not valid JSON: {e}"})
+    if conflict and isinstance(corr, dict) and not corr.get("conflict"):
+        corr["conflict"] = conflict
     cmd: list = []
     run_id = _TRANSCRIPT_CTX.get("run")
     if run_id:
@@ -398,68 +409,6 @@ TOOLS = [
     {"fn": t_list_records, "name": "list_records",
      "description": "List records of a doctype (optional ERPNext filters JSON)."},
 ]
-
-SYSTEM_PROMPT = """You are the ERPNext migration-fix agent. You resolve mapping
-conflicts found by the erpgen mapper, then import the data.
-
-Conflict kinds and how to fix them:
-- unmapped_column: create_field for the column (label = column name), then re-run map.
-- ambiguous_mapping: decide the intended target and force it with set_mapping, then re-run map.
-- link_value_conflict: create the missing option records with create_record
-  (use describe_doctype to learn the required fields and the name field), then re-run map.
-- fetch_from: the target field is read-only (populated from another doc); you
-  cannot write it directly. Note it and move on.
-- required_missing: pass defaults to run_map/run_import.
-- duplicate_row: the same key appears on more than one row. Resolve the
-  conflicting cells in one row, drop the duplicate, or point --id-column at a
-  column that is unique per entity. You cannot invent a value.
-- missing_value: the cell is empty in the source sheet. Record the value as a
-  worksheet correction, or use defaults when a constant is legitimate. You cannot
-  invent the value.
-- possible_duplicate_row: WARNING only, never blocks. Two rows may be one entity
-  spelled two ways. Review the pairs: merge them, unify the spelling with a
-  value_map, or dismiss the conflict if they are genuinely separate. Do not try to
-  make this kind disappear before importing.
-
-Record every correction with the `correct` tool (never edit files by hand). A
-correction must name the conflict it answers in its `conflict` field (the key is
-"<kind>:<source or field>[:<target>]"). A row reference is the key value as a
-string, or {"row": N} for a source line number (1 = header). Exact shapes:
-- duplicate_row: {"action":"merge_rows","keep":"<key value>","drop":[{"row":N}],
-  "conflict":"duplicate_row:<source>:<target>"} — or skip_row to drop the row
-  outright. For two rows with the SAME key value, use {"row":N} references.
-- missing_value: {"action":"set_value","at":{"row":N},"column":"<col>",
-  "value":"<v>","conflict":"missing_value:<source>:<target>"}.
-- a conflict you have decided to accept: {"action":"dismiss_conflict",
-  "conflict":"<key>","reason":"<why>"}.
-
-Flat party sheets (doctype='customers_full' or 'suppliers_full'; ONE file with
-a party + Contact + Address): every conflict is an out-of-contract column and is
-error-severity (blocking). Resolve each via its suggested_action:
-- resolution=extend_contract -> set_mapping('<flow>', column,
-  '<doctype>.<target>'), e.g. set_mapping('customers_full', 'Tax ID', 'customer.tax_id').
-- resolution=create_custom_field -> first create_field(doctype, label, fieldtype)
-  (or run the suggested create_command), then set_mapping('<flow>', column,
-  '<doctype>.<fieldname>') using the suggested fieldname.
-The flow name and suggested commands are already filled in for you — use them
-verbatim. Then run_map again and confirm zero conflicts remain before importing.
-Contacts/Addresses shared between party types are linked automatically on import.
-
-Per-iteration workflow:
-1. Read the analysis from the user message or latest_analysis.
-2. Resolve every error-severity conflict: create fields/records, set mappings,
-   or record a worksheet correction with `correct` (set_value for a blank,
-   skip_row/merge_rows for a duplicate, dismiss_conflict to waive one with a
-   reason). A corrected conflict turns "corrected"/"waived" on the next map.
-3. run_map again and confirm the error-severity conflicts decreased. Repeat until zero.
-4. run_import with apply=True.
-5. Verify with get_record / list_records if useful, then give a final summary.
-
-Rules:
-- Never import while error-severity conflicts remain open or stale.
-- Imports are idempotent: re-running is safe and skips existing records.
-- Never modify source files; record decisions via set_mapping / create_field / correct.
-- Tools return JSON; reason over it before acting."""  # noqa: E501
 
 
 # ---------------------------------------------------------------- llm
@@ -666,6 +615,30 @@ def instrumented_llm(base_cls):
 #: error instead of an open connection the operator has to Ctrl-C out of
 LLM_TIMEOUT = 120
 
+#: DeepSeek's canonical id for V4.1 Flash. DeepSeek still accepts the older
+#: aliases (`deepseek-v4-flash`, `deepseek-chat`) and serves this same model for
+#: them, but `deepseek-v4.1-flash` is rejected outright — /v1/models lists only
+#: `deepseek-flash` and `deepseek-v4-pro`.
+DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
+
+#: Short `--model` names, so `--model pro` / `--model flash` work without the
+#: caller having to know that the flash id dropped its version number.
+DEEPSEEK_MODEL_ALIASES = {
+    "flash": "deepseek-flash",
+    "pro": "deepseek-v4-pro",
+}
+
+
+def resolve_deepseek_model(model: str) -> str:
+    """Map a short alias to DeepSeek's canonical id; pass anything else through.
+
+    Only `flash`/`pro` (case- and whitespace-insensitive) are rewritten, so
+    `--model` can still name any model the provider serves — a full id is never
+    second-guessed. An empty name means "provider default".
+    """
+    name = (model or "").strip()
+    return DEEPSEEK_MODEL_ALIASES.get(name.lower()) or name or DEFAULT_DEEPSEEK_MODEL
+
 
 def _deepseek_llm(model: str, api_base: str):
     """OpenAI-compatible client for DeepSeek.
@@ -674,11 +647,14 @@ def _deepseek_llm(model: str, api_base: str):
     property validates model names against OpenAI's registry and rejects
     DeepSeek model ids). is_function_calling_model=True is required for the
     FunctionAgent tool loop.
+
+    The default is `DEFAULT_DEEPSEEK_MODEL` (V4.1 Flash); see
+    `resolve_deepseek_model` for the `flash`/`pro` shorthands.
     """
     from llama_index.llms.openai_like import OpenAILike
 
     return instrumented_llm(OpenAILike)(
-        model=model or "deepseek-v4-flash",
+        model=resolve_deepseek_model(model),
         api_key=os.environ.get("DEEPSEEK_API_KEY"),
         api_base=api_base or "https://api.deepseek.com",
         is_chat_model=True,
@@ -1116,20 +1092,6 @@ def _data_quality_blockers(analysis: dict) -> list:
             and c["kind"] in DATA_QUALITY_KINDS]
 
 
-_CORRECTION_SCHEMA = (
-    "Return ONE correction as strict JSON (nothing else), one of:\n"
-    '  {"action":"merge_rows","keep":<ref>,"drop":[<ref>,...],'
-    '"field_overrides":{"<col>":"<v>"},"conflict":"<key>"}\n'
-    '  {"action":"skip_row","at":<ref>,"reason":"...","conflict":"<key>"}\n'
-    '  {"action":"set_value","at":<ref>,"column":"<col>","value":"<v>",'
-    '"conflict":"<key>"}\n'
-    '  {"action":"dismiss_conflict","conflict":"<key>","reason":"..."}\n'
-    "A row ref (<ref>) is the key value as a string, or {\"row\": N} for a "
-    "source line number (1 = header). Do not invent a value unless one is "
-    "visible in the row context; otherwise drop the row or waive the conflict."
-)
-
-
 def _extract_json(text: str) -> Optional[dict]:
     """The first JSON object in an LLM reply, tolerating fences and prose."""
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.M)
@@ -1211,14 +1173,10 @@ async def _propose_correction(llm, conflict: dict, src, key_column: str,
     """One LLM proposal for one conflict; None when it produced nothing usable."""
     from llama_index.core.base.llms.types import ChatMessage, MessageRole
 
-    prompt = (
-        f"You are fixing data-quality issues in a spreadsheet before import.\n"
-        f"Key column: {key_column or '(unknown)'}\n"
-        f"Use this EXACT conflict key in your answer: {conflict_key!r}\n\n"
-        f"Conflict:\n{json.dumps(conflict, indent=2, default=str)}\n\n"
-        f"Relevant source rows:\n{_rows_text(conflict, src) or '(none)'}\n\n"
-        f"{_CORRECTION_SCHEMA}"
-    )
+    prompt = correction_proposal_prompt(
+        key_column, conflict_key,
+        json.dumps(conflict, indent=2, default=str),
+        _rows_text(conflict, src))
     # the raw model JSON is not shown live; the loop renders it as a sentence
     _LIVE["echo_content"] = False
     try:
@@ -1534,6 +1492,11 @@ async def _run_rounds(args, workflow, transcript: Transcript, analysis: dict,
     return outcome
 
 
+def _revert_hint(run_id: str) -> None:
+    """The one-liner that reverses an entire run, printed at the end."""
+    print(f"  revert this run: python3 erpgen.py revert {run_id} --apply")
+
+
 def _report_run_end(journal, transcript: Transcript) -> None:
     if hasattr(journal, "pending_requirements"):  # unified run context
         pending = journal.pending_requirements()
@@ -1542,7 +1505,7 @@ def _report_run_end(journal, transcript: Transcript) -> None:
         for r in pending:
             print(f"    PENDING  {r.get('kind')}: {r.get('detail')}")
         journal.close(status="ok")
-        print(f"  revert the whole run: python3 erpgen.py revert {journal.run_id} --apply")
+        _revert_hint(journal.run_id)
     else:
         journal.close()
         print(f"\n{journal.summary()}")
@@ -1608,6 +1571,8 @@ async def run_agent(args) -> int:
               f"{failed} row(s) failed")
         if not failed:
             print(out.strip().splitlines()[-1] if out.strip() else "")
+            if getattr(args, "run", None):
+                _revert_hint(args.run)
             return 0
         pre_import = warning_digest(out) or out[-1500:]
         print(f"  {failed} row(s) failed — engaging the agent to investigate.")
@@ -1658,7 +1623,9 @@ def add_agent_flags(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--defaults", help='JSON defaults for map/import, e.g. \'{"customer_group":"Commercial"}\'')
     ap.add_argument("--provider", default="auto",
                     choices=["auto", "openai", "deepseek", "deepinfra"])
-    ap.add_argument("--model", help="LLM model (provider default if omitted)")
+    ap.add_argument("--model", help="LLM model (provider default if omitted). "
+                                    "For DeepSeek, 'flash' and 'pro' are accepted "
+                                    "and resolve to deepseek-flash / deepseek-v4-pro")
     ap.add_argument("--api-base", help="OpenAI-compatible base URL "
                                        "(DeepSeek default: https://api.deepseek.com)")
     ap.add_argument("--max-iterations", type=int, default=50,

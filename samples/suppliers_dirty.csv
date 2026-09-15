@@ -1,13 +1,13 @@
-Supplier Name,Supplier Type,Supplier Group,Country,Tax ID
-Apex Industrial Supply,Company,Distributor,United States,SUP-001
-Bright Steel Works,Company,Raw Material,United States,SUP-002
-Bright Steel Works,Company,Raw Material,United States,SUP-003
-Cascade Bearings,Company,Hardware,United States,SUP-004
-Delta Plastics,Company,Raw Material,United States,SUP-005
-Echo Tooling,Company,Hardware,United States,SUP-006
-,Company,Distributor,United States,SUP-007
-Granite Castings,Company,Distributor,United States,SUP-008
-Harborline Freight,Company,Services,United States,SUP-009
-Ironclad Fasteners,,Hardware,United States,SUP-010
-Northwind Timber,Company,Raw Material,United States,SUP-011
-Northwind Timbr,Company,Raw Material,United States,SUP-011
+Supplier Name,Supplier Type,Supplier Group,Country,Tax ID,Default Currency
+Apex Industrial Supply,Company,Distributor,United States,SUP-001,USD
+Bright Steel Works,Company,Raw Material,United States,SUP-002,USD
+Bright Steel Works,Company,Raw Material,United States,SUP-003,USD
+Cascade Bearings,Company,Hardware,United States,SUP-004,BTC
+Delta Plastics,Company,Machinery,United States,SUP-005,USD
+Echo Tooling,Company,Hardware,Wakanda,SUP-006,USD
+,Company,Distributor,United States,SUP-007,USD
+Granite Castings,Company,Distributor,United States,SUP-008,USD
+Harborline Freight,Company,Services,United States,SUP-009,USD
+Ironclad Fasteners,,Hardware,United States,SUP-010,USD
+Northwind Timber,Company,Raw Material,United States,SUP-011,USD
+Northwind Timbr,Company,Raw Material,United States,SUP-011,USD

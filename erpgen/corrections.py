@@ -19,9 +19,11 @@ shape-checked here; whether the conflict it names still exists is decided in
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -125,6 +127,27 @@ def _identity(corr: dict) -> tuple:
     return tuple(parts)
 
 
+@contextmanager
+def _locked(path: str | Path):
+    """Serialise one read-modify-write of a worksheet file.
+
+    `add_correction`/`revoke` are load -> modify -> save, and the agent fires
+    them as parallel tool calls (each its own process): without a lock, two
+    writers read the same file, pick the same next `c{n}` id, and the second
+    write silently drops the first. flock excludes across threads and processes;
+    the lock is a sibling file so it is stable even if a future writer swaps the
+    worksheet's inode.
+    """
+    lock = Path(str(path) + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with lock.open("a+") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def add_correction(path: str | Path, correction: dict,
                    created_by: str = "human") -> tuple[dict, bool]:
     """Append one correction to the worksheet at `path`, unless already recorded.
@@ -141,40 +164,42 @@ def add_correction(path: str | Path, correction: dict,
     p = Path(path)
     if not p.exists():
         raise ValueError(f"no worksheet at {p}; run `map` first")
-    data = read_worksheet(p)
-    headers = [prof.get("header", "") for prof in (data.get("column_profiles") or [])]
-    corr = dict(correction)
-    corr.setdefault("created_at", dt.datetime.now(dt.timezone.utc)
-                    .isoformat(timespec="seconds"))
-    corr.setdefault("created_by", created_by)
-    why = _validate(corr, headers)
-    if why:
-        raise ValueError(why)
-    for existing in data.get("corrections") or []:
-        if not existing.get("revoked_at") and _identity(existing) == _identity(corr):
-            return existing, False
-    ids = {c.get("id") for c in (data.get("corrections") or [])}
-    n = 0
-    while True:
-        n += 1
-        if f"c{n}" not in ids:
-            corr["id"] = f"c{n}"
-            break
-    data.setdefault("corrections", []).append(corr)
-    p.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-    return corr, True
+    with _locked(p):
+        data = read_worksheet(p)
+        headers = [prof.get("header", "") for prof in (data.get("column_profiles") or [])]
+        corr = dict(correction)
+        corr.setdefault("created_at", dt.datetime.now(dt.timezone.utc)
+                        .isoformat(timespec="seconds"))
+        corr.setdefault("created_by", created_by)
+        why = _validate(corr, headers)
+        if why:
+            raise ValueError(why)
+        for existing in data.get("corrections") or []:
+            if not existing.get("revoked_at") and _identity(existing) == _identity(corr):
+                return existing, False
+        ids = {c.get("id") for c in (data.get("corrections") or [])}
+        n = 0
+        while True:
+            n += 1
+            if f"c{n}" not in ids:
+                corr["id"] = f"c{n}"
+                break
+        data.setdefault("corrections", []).append(corr)
+        p.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        return corr, True
 
 
 def revoke(path: str | Path, correction_id: str, reason: str = "reverted") -> bool:
     """Revoke a correction in place; immutable and auditable, like the rest."""
     p = Path(path)
-    data = read_worksheet(p)
-    for c in data.get("corrections") or []:
-        if c.get("id") == correction_id and not c.get("revoked_at"):
-            c["revoked_at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-            c["revoked_reason"] = reason
-            p.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-            return True
+    with _locked(p):
+        data = read_worksheet(p)
+        for c in data.get("corrections") or []:
+            if c.get("id") == correction_id and not c.get("revoked_at"):
+                c["revoked_at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+                c["revoked_reason"] = reason
+                p.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+                return True
     return False
 
 

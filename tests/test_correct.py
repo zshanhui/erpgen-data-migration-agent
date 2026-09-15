@@ -166,3 +166,38 @@ def test_correct_cli_rejects_a_correction_without_a_worksheet(cli, tmp_path):
          "--json", json.dumps(_skip())])
     args.worksheet_dir = str(tmp_path / "worksheets")
     assert cli.cmd_correct(args) == 2
+
+
+# ------------------------------------------------- parallel authoring (race)
+def _parallel_add(path: str, idx: int) -> None:
+    """One distinct correction from a child process; id assignment must not race."""
+    from erpgen import corrections as C
+
+    corr = {"action": "set_value", "at": {"row": idx + 2},
+            "column": "Customer Name", "value": f"v{idx}",
+            "conflict": "missing_value:Customer Name:customer_name"}
+    C.add_correction(path, corr)
+
+
+def test_parallel_adds_do_not_lose_writes(tmp_path):
+    """The agent fires `correct` as parallel subprocesses; each must survive.
+
+    `add_correction` is a load -> pick id -> save; un-locked, two processes read
+    the same file, pick the same `c{n}`, and the later write drops the earlier.
+    """
+    import multiprocessing as mp
+
+    wp = tmp_path / "ws.json"
+    _worksheet(wp)
+    n = 8
+    ctx = mp.get_context("fork")
+    procs = [ctx.Process(target=_parallel_add, args=(str(wp), i)) for i in range(n)]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(30)
+        assert p.exitcode == 0
+
+    ids = [c["id"] for c in json.loads(wp.read_text())["corrections"]]
+    assert len(ids) == n, f"lost writes: {len(ids)} of {n}"
+    assert len(set(ids)) == n, f"duplicate ids: {ids}"

@@ -13,6 +13,7 @@ from __future__ import annotations
 import http.cookiejar
 import json
 import mimetypes
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -24,6 +25,26 @@ from uuid import uuid4
 
 class ERPNextError(Exception):
     """Raised for HTTP/API failures, with the server's message included."""
+
+
+def _server_message(detail: str) -> str:
+    """The concise human message from a Frappe error body, when there is one.
+
+    Frappe answers validation failures with JSON whose `exception` field is the
+    short, actionable sentence (e.g. "Supplier Type cannot be ..."), while `exc`
+    is a multi-line traceback the agent does not need. The body is read truncated
+    (see `_request`), so this regex-extracts the field rather than calling
+    `json.loads`, which would fail on the cut-off JSON. Falls back to the raw
+    detail when the shape is unexpected.
+    """
+    for key in ("exception", "message"):
+        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', detail)
+        if m:
+            try:
+                return json.loads(f'"{m.group(1)}"')
+            except json.JSONDecodeError:
+                return m.group(1)
+    return detail
 
 
 def _quote(s: str) -> str:
@@ -107,7 +128,9 @@ class ERPNextClient:
                 detail = e.read().decode(errors="replace")[:800]
             except Exception:
                 pass
-            raise ERPNextError(f"HTTP {e.code} {method} {path}: {detail}") from e
+            raise ERPNextError(
+                f"HTTP {e.code} {method} {path}: {_server_message(detail)}"
+            ) from e
 
     def login(self, username: str, password: str) -> None:
         resp = self._request(
