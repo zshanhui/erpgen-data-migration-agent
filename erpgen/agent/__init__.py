@@ -658,7 +658,8 @@ def _report_round_error(exc: BaseException, args, round_no: int,
               f"{max((args.max_iterations or 20) * 2, 40)}\n"
               "    or run this sheet alone and inspect the transcript:\n"
               f"      {transcript.path}\n"
-              "    or use the offline path: DOCTOR=1 scripts/run-all-agentic.sh",
+              "    or use the offline path: "
+              "python3 erpgen.py agent --doctor --source <sheet>",
               file=sys.stderr)
         transcript.log(event="iteration_exhausted", round=round_no,
                        max_iterations=args.max_iterations,

@@ -1104,7 +1104,7 @@ def test_help_block_always_names_endpoint_and_model(agent_mod):
 
 def test_help_block_offers_the_offline_path(agent_mod):
     out = _describe(agent_mod, AuthenticationError("x", status_code=401))
-    assert "DOCTOR=1 scripts/run-all-agentic.sh" in out
+    assert "agent --doctor --source <sheet>" in out
 
 
 def test_model_defaults_when_not_supplied(agent_mod):

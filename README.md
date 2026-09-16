@@ -17,32 +17,29 @@ things being worked on:
 
 ## Demo run
 
-full demo test run
+ERPNext stack running in Docker (see `docker/README.md`), then:
 
-make sure you have erpnext stack running in Docker before runningg erpgen
-
-```
+```bash
 export DEEPSEEK_API_KEY=...
 cd data-migration
 
-./scripts/run-all-agentic.sh                # LLM resolves conflicts, then imports
-DOCTOR=1 ./scripts/run-all-agentic.sh       # no LLM: build each map + show conflicts
-RUN_ID=myrun ./scripts/run-all-agentic.sh   # name the run so it reverts as one unit
+# one named run, so a single revert undoes all three sheets
+RUN=myrun
+.venv/bin/python erpgen.py --run $RUN agent --source samples/customers-smb.csv --provider deepseek
+.venv/bin/python erpgen.py --run $RUN agent --source samples/items.csv         --provider deepseek
+.venv/bin/python erpgen.py --run $RUN agent --source samples/employees.csv     --provider deepseek
+
+# no LLM: build each analysis and show what the agent would have to resolve
+.venv/bin/python erpgen.py agent --doctor --source samples/customers-smb.csv
+
+# undo the whole run
+.venv/bin/python erpgen.py revert $RUN            # dry run: list the inverses
+.venv/bin/python erpgen.py revert $RUN --apply
 ```
 
-```
-# customers: 29 rows (20 will be new, nothing pre-exists)
-python3 erpgen.py import samples/customers.csv --doctype Customer \
-    --defaults '{"customer_group":"Commercial","territory":"All Territories"}' --apply
-
-# items: 12 rows, UoM→uoms.uom trap + Machinery-group conflict back
-python3 erpgen.py map samples/items.csv --doctype Item       # see conflicts first
-
-# or the full agent loop on the conflict-rich e2e file
-export DEEPSEEK_API_KEY=<your-key>
-.venv/bin/python erpgen.py agent --doctype Item \
-    --source samples/items_e2e.csv --provider deepseek
-```
+One flat party sheet, one relational sheet, one naming-series sheet. Each agent
+run resolves what the mapping cannot decide on its own, then imports — idempotent,
+so re-running a sheet is a no-op.
 
 Running deterministic mappings:
 

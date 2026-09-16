@@ -323,8 +323,8 @@ def describe_llm_error(exc: BaseException, api_base: str, model: str = "",
         out.append(f"  provider : {provider}")
     out += ["", f"  {cause}", "", "  Next steps:"]
     out += [f"    {s}" for s in steps]
-    out += ["", "  No LLM needed (builds every analysis offline):",
-            "    DOCTOR=1 scripts/run-all-agentic.sh"]
+    out += ["", "  No LLM needed (builds the analysis offline):",
+            "    python3 erpgen.py agent --doctor --source <sheet>"]
     return "\n".join(out)
 
 

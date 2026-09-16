@@ -24,14 +24,21 @@ being analysed against the wrong doctype.
 
 ### Every master worksheet
 
-`scripts/run-all-agentic.sh` drives the LLM loop over all supported sheets in
-dependency order (parties → the Contact/Address sheets that link to them → items).
+Run the agent over the sheets in dependency order (parties → the Contact/Address
+sheets that link to them → items), all in one named run so a single `revert`
+undoes them together.
 
 ```bash
 export DEEPSEEK_API_KEY=...
-./scripts/run-all-agentic.sh               # LLM resolves conflicts, then imports
-DOCTOR=1 ./scripts/run-all-agentic.sh      # no LLM: build each map, show conflicts
-RUN_ID=myrun ./scripts/run-all-agentic.sh  # name the run so it reverts as one unit
+RUN=myrun
+for sheet in customers-smb.csv contacts.csv addresses.csv items.csv; do
+    .venv/bin/python erpgen.py --run "$RUN" agent --source "samples/$sheet" --provider deepseek
+done
+
+# no LLM: build each analysis and show what the agent would have to resolve
+.venv/bin/python erpgen.py agent --doctor --source samples/items.csv
+
+.venv/bin/python erpgen.py revert "$RUN" --apply
 ```
 
 | # | Worksheet | Flow / doctype |
@@ -45,6 +52,7 @@ RUN_ID=myrun ./scripts/run-all-agentic.sh  # name the run so it reverts as one u
 | 7 | `addresses.csv` | Address (links to the customers above) |
 | 8 | `items.csv` | Item |
 | 9 | `items_e2e.csv` | Item (conflict-rich) |
+| 10 | `employees.csv` | Employee (naming-series key) |
 
 ### Deterministic first, LLM only when needed
 
@@ -342,7 +350,7 @@ curl -sS -m 5 -o /dev/null -w '%{http_code}\n' https://api.deepseek.com/
 `401` means the network is fine and the key is the problem. Other statuses map to
 their own guidance (404 → model id or `--api-base`, 429 → rate limit, 400 →
 context length). No LLM needed at all:
-`DOCTOR=1 ./scripts/run-all-agentic.sh`.
+`python3 erpgen.py agent --doctor --source samples/items.csv`.
 
 ## Tests
 
