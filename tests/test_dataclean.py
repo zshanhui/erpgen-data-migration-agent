@@ -328,6 +328,28 @@ def test_build_analysis_instructions_cover_the_new_kinds():
     assert "Never invent a value" in text   # the agent's real constraint
 
 
+def test_an_unmapped_relational_column_suggests_the_field_to_create():
+    """The relational half of the out-of-contract advice: the analysis has to name
+    the field the playbook's create_field step quotes (`_snake` of the label)."""
+    from erpgen.analysis import build_analysis
+
+    engine = _customer_engine()
+    sheet = make_sheet(["Customer Name", "Customer Type", "Vendor Rating"],
+                       [["Acme", "Company", "A"], ["Beta", "Company", "B"]])
+    analysis = build_analysis(FakeClient(), sheet, engine.suggest(sheet), engine,
+                              id_column="Customer Name")
+
+    [suggestion] = analysis["suggested_custom_fields"]
+    assert suggestion["fieldname"] == "vendor_rating"
+    assert suggestion["doctype"] == "Customer"
+    assert suggestion["fieldtype"] == "Data"
+    assert "--label 'Vendor Rating'" in suggestion["create_command"]
+
+    [conflict] = [c for c in analysis["conflicts"] if c["kind"] == "unmapped_column"]
+    assert conflict["source"] == "Vendor Rating"
+    assert conflict["severity"] == "info", "a relational column is not blocking"
+
+
 def test_build_analysis_without_a_key_column_skips_duplicate_detection():
     """Inference can fail; the required-cell checks must still run."""
     from erpgen.analysis import build_analysis

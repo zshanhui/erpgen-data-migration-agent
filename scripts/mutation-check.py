@@ -48,12 +48,39 @@ TREE = "erpgen/tree.py"
 INF = "erpgen/infer.py"
 EMP = "erpgen/employees.py"
 DED = "erpgen/dedup.py"
+MAP = "erpgen/mapper.py"
+#: the agent is a package now; AGT above still points at the old module
+AGTT = "erpgen/agent/tools.py"
 
 MUTATIONS = [
     ("bug: update_record journals no inverse", [
         (TLS, '    if ACTIVE_JOURNAL is not None:\n        ACTIVE_JOURNAL.record_updated(doctype, name, before)',
               '    pass  # MUTANT'),
     ], "tests/test_update_record.py::test_the_effect_records_the_previous_values"),
+
+    # ---- the existence queries: a filter that cannot match duplicates rows ----
+    ("bug: create_record looks the record up by `name`, not its natural key", [
+        (TLS, 'filters=[[id_field, "=", str(name_value)]],',
+              'filters=[["name", "=", str(name_value)]],'),
+    ], "tests/test_site_queries.py::test_create_record_finds_an_existing_record_through_its_natural_key"),
+
+    ("bug: existing_names asks the site for keys that cannot be there", [
+        (DED, 'filters=[[id_field, "in", chunk]]',
+              'filters=[[id_field, "in", ["NEVER-MATCHES"]]]'),
+    ], "tests/test_site_queries.py::test_existing_names_finds_what_the_site_has_by_the_key_field"),
+
+    ("bug: the flat match threshold sends a known field to create_custom_field", [
+        (CF, 'MATCH_THRESHOLD = 0.7', 'MATCH_THRESHOLD = 0.99'),
+    ], "tests/test_party_sheets.py::test_an_extra_column_that_matches_a_known_field_extends_the_contract"),
+
+    ("bug: the agent's journal is never published to the tools", [
+        (AGT, '    erpgen_tools.ACTIVE_JOURNAL = journal\n', '    pass  # MUTANT\n'),
+    ], "tests/test_agent_wiring.py::test_a_run_without_a_run_id_opens_its_own_journal"),
+
+    ("bug: the run context drops the update inverse", [
+        (CTX, '        self.effect("record_update",\n                    {"op": "restore_record", "doctype": doctype, "name": name,\n                     "fields": dict(before)},\n                    doctype=doctype, name=name, fields=sorted(before))',
+              '        pass  # MUTANT'),
+    ], "tests/test_update_record.py::test_the_run_context_journals_the_same_inverse"),
 
     ("bug: effect seq restarts per command", [
         (CTX, '                    self.effects += 1\n                    effects.append(e)',
@@ -703,7 +730,7 @@ MUTATIONS = [
     ("bug: Employee dedup queries `name` again (duplicates every re-run)", [
         (DED, '    "Employee": {"source": "employee_number", "target": "employee_number"},',
               '    # MUTANT: no Employee key'),
-    ], "tests/test_employees.py::test_the_dedup_spec_queries_employee_number_not_name"),
+    ], "tests/test_site_queries.py::test_dedup_payloads_asks_about_the_documented_key_of_a_naming_series_doctype"),
 
     # ---- the full name, and the columns with no built-in home ----
     ("bug: the full name maps to the recomputed employee_name again", [
@@ -739,6 +766,44 @@ MUTATIONS = [
         (ANL, '    return [str(vmap.get(v, v)) for v in values]',
               '    return values  # MUTANT'),
     ], "tests/test_employees.py::test_link_checks_validate_the_mapped_value"),
+
+    # ---- the leaving date: mandatory once status is Left ----
+    ("bug: Last Working Day no longer maps to relieving_date", [
+        (MAP, '    "lastworkingday": ["relieving_date"],',
+              '    # MUTANT: no synonym'),
+    ], "tests/test_employees.py::test_last_working_day_maps_to_relieving_date"),
+
+    # ---- the reporting tree: a second pass, because docnames are server-made ----
+    ("bug: the manager name is not joined to the sheet's employee ID", [
+        (EMP, '        manager_number = by_name.get(manager) or (manager if manager in numbers\n'
+              '                                                  else "")',
+              '        manager_number = ""  # MUTANT'),
+    ], "tests/test_employees.py::test_link_managers_sets_reports_to_from_the_sheet_names"),
+
+    ("bug: a self-report is linked (ERPNext throws on save)", [
+        (EMP, '        if manager_number == own:', '        if False:  # MUTANT'),
+    ], "tests/test_employees.py::test_link_managers_skips_a_self_report"),
+
+    ("bug: rows that already hold the right manager are rewritten", [
+        (EMP, '        if own_doc["reports_to"] == manager_doc["name"]:',
+              '        if False:  # MUTANT'),
+    ], "tests/test_employees.py::test_link_managers_leaves_rows_that_already_hold_the_right_manager"),
+
+    ("bug: the link_managers tool drops --run (tree survives a revert)", [
+        (AGTT, '    cmd += ["--run", str(run_id)]\n    cmd += ["link-managers", source]',
+               '    cmd += ["link-managers", source]  # MUTANT'),
+    ], "tests/test_employees.py::test_the_tool_forwards_the_run_id"),
+
+    # ---- the flag that makes the migration one command ----
+    ("bug: --link-managers no longer runs the second pass", [
+        (CLI, '    if args.link_managers and plan.doctype == "Employee":',
+              '    if False:  # MUTANT'),
+    ], "tests/test_employees.py::test_the_link_managers_flag_runs_the_second_pass_after_the_rows"),
+
+    ("bug: --link-managers fires for a non-Employee doctype", [
+        (CLI, '    if args.link_managers and plan.doctype == "Employee":',
+              '    if args.link_managers:  # MUTANT'),
+    ], "tests/test_employees.py::test_the_link_managers_flag_is_ignored_for_other_doctypes"),
 ]
 
 

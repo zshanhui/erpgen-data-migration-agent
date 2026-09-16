@@ -53,6 +53,21 @@ def test_typed_effect_helpers_record_their_inverse(mkctx):
                        "previous": "customer_group", "path": "ov.json"}
 
 
+def test_a_link_added_to_an_existing_record_journals_its_removal(mkctx):
+    """Link-merge writes onto a record the run did not create, so the inverse is
+    the only way back — and it has to name both ends of the link."""
+    c = mkctx("run1")
+
+    c.link_added("Contact", "CONTACT-1", "Customer", "Acme Steel Works")
+    c.close()
+
+    [effect] = load_run("run1", c.path.parent)["effects"]
+    assert effect["kind"] == "record_link_add"
+    assert effect["inverse"] == {"op": "remove_record_link", "doctype": "Contact",
+                                 "name": "CONTACT-1", "link_doctype": "Customer",
+                                 "link_name": "Acme Steel Works"}
+
+
 def test_custom_field_label_defaults_to_fieldname(mkctx):
     c = mkctx("run1")
     c.custom_field_created("Item", "notes", "Item-notes")

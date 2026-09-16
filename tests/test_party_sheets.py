@@ -35,6 +35,7 @@ from erpgen.customers_full import (
     load_flat_mappings,
     parse_flat_target,
     party_for_flow,
+    run_flat_parties_import,
     spec_for,
     type_maps,
 )
@@ -707,6 +708,105 @@ def test_a_fully_valid_sheet_has_no_conflicts():
     a = _analysis(_site(), SUPPLIER_HEADERS, [SHENZHEN_ROW])
     assert _kinds(a, "link_value_conflict") == []
     assert a["conflicts"] == []
+
+
+# ------------------------------------------------- out-of-contract columns
+# `_classify_extra_column` decides what the playbook's extend_contract /
+# create_custom_field advice is based on. Nothing exercised it: the fixtures
+# never carried a column outside the contract, so a wrong target or an
+# unactionable suggested_action would have reached the agent unnoticed.
+def _with_extras(*extra):
+    return SUPPLIER_HEADERS + list(extra), [SHENZHEN_ROW + ["x"] * len(extra)]
+
+
+def test_an_extra_column_that_matches_a_known_field_extends_the_contract():
+    headers, rows = _with_extras("Zip")
+    a = _analysis(_site(), headers, rows)
+
+    [entry] = a["extra_columns"]
+    assert entry["resolution"] == "extend_contract"
+    assert entry["best_match"] == {"doctype": "Address", "target": "pincode",
+                                   "label": "Pincode", "score": 0.78,
+                                   "method": "synonym"}
+
+    [conflict] = _kinds(a, "unmapped_column")
+    assert conflict["severity"] == "error", "an unmapped column is blocking"
+    assert conflict["target"] == "pincode" and conflict["doctype"] == "Address"
+    assert "set_mapping('suppliers_full', 'Zip', 'address.pincode')" \
+        in conflict["suggested_action"]
+    assert a["suggested_custom_fields"] == [], \
+        "the field exists — create_custom_field would be the wrong advice"
+
+
+def test_an_extra_column_with_no_match_asks_for_a_custom_field_first():
+    headers, rows = _with_extras("Vendor Rating")
+    a = _analysis(_site(), headers, rows)
+
+    [entry] = a["extra_columns"]
+    assert entry["resolution"] == "create_custom_field"
+    assert entry["best_match"] is None
+    assert entry["suggested_doctype"] == "Supplier"
+
+    [conflict] = _kinds(a, "unmapped_column")
+    assert conflict["suggested_action"].startswith(
+        "create_field('Supplier', 'Vendor Rating', 'Data')")
+
+    [suggested] = a["suggested_custom_fields"]
+    assert suggested["fieldname"] == "vendor_rating"
+    assert suggested["label"] == "Vendor Rating"
+    assert "createfield Supplier --label 'Vendor Rating'" in suggested["create_command"]
+
+
+def test_the_profile_of_an_extra_column_is_reported_for_review():
+    headers, rows = _with_extras("Vendor Rating")
+    a = _analysis(_site(), headers, rows)
+
+    [entry] = a["extra_columns"]
+    assert entry["non_empty"] == 1.0
+    assert entry["sample"] == ["x"]
+    assert entry["inferred_type"] == "text"
+
+
+def test_both_classifications_reach_the_analysis_in_column_order():
+    headers, rows = _with_extras("Zip", "Vendor Rating")
+    a = _analysis(_site(), headers, rows)
+
+    assert [(e["header"], e["resolution"]) for e in a["extra_columns"]] == [
+        ("Zip", "extend_contract"),
+        ("Vendor Rating", "create_custom_field"),
+    ]
+    assert [c["source"] for c in _kinds(a, "unmapped_column")] == \
+        ["Zip", "Vendor Rating"]
+    assert [s["fieldname"] for s in a["suggested_custom_fields"]] == ["vendor_rating"]
+
+
+# ------------------------------------------------- the flat import orchestrator
+def test_the_flat_import_reports_what_it_wrote(capsys):
+    """The printed summary is the operator's (and the shell scripts') only view of
+    a flat import: one line per doctype the row fed, with the counts it returns."""
+    counts = run_flat_parties_import(
+        FakeSite(), make_sheet(SUPPLIER_HEADERS, [SHENZHEN_ROW]),
+        party="Supplier", apply=True)
+
+    assert counts == {
+        "supplier": {"created": 1, "skipped": 0, "failed": 0},
+        "contact": {"created": 1, "skipped": 0, "linked": 0, "failed": 0},
+        "address": {"created": 1, "skipped": 0, "linked": 0, "failed": 0},
+    }
+    out = capsys.readouterr().out
+    assert "suppliers_full import (APPLY):" in out
+    assert "supplier   created 1 | skipped 0" in out
+    assert "contact    created 1 | skipped 0" in out
+    assert "address    created 1 | skipped 0" in out
+
+
+def test_the_flat_import_says_dry_run_when_it_is_not_applying(capsys):
+    counts = run_flat_parties_import(
+        FakeSite(), make_sheet(SUPPLIER_HEADERS, [SHENZHEN_ROW]),
+        party="Supplier", apply=False)
+
+    assert counts["supplier"]["created"] == 1, "a dry run still predicts the rows"
+    assert "suppliers_full import (dry run):" in capsys.readouterr().out
 
 
 def test_link_conflict_for_a_mapped_but_missing_link_value():

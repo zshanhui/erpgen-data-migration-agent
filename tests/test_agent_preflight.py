@@ -772,10 +772,22 @@ def test_llm_calls_are_numbered_and_counted(agent_mod, monkeypatch):
 
 
 def test_logging_never_breaks_a_run_with_no_transcript(agent_mod):
-    """Outside a run there is no transcript; logging must be a no-op."""
+    """Outside a run there is no transcript; logging must be a no-op.
+
+    Asserted, not merely exercised: the wrapper has to come back with the model's
+    response *and* leave nothing hooked for logging — as written before, this test
+    would have passed just as happily if the logger had started writing to a file
+    of its own.
+    """
     import asyncio
     agent_mod._TRANSCRIPT_CTX.clear()
-    asyncio.run(agent_mod.instrumented_llm(_FakeLLM)().achat(messages=["a"]))
+
+    response = asyncio.run(
+        agent_mod.instrumented_llm(_FakeLLM)().achat(messages=["a"]))
+
+    assert response is not None, "the wrapper still returns the model's response"
+    assert agent_mod._TRANSCRIPT_CTX.get("log_event") is None, \
+        "no transcript is open, so nothing may be hooked into it"
 
 
 def test_prompt_content_is_not_logged(agent_mod, monkeypatch):

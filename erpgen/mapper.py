@@ -67,6 +67,9 @@ SYNONYMS: dict[str, list[str]] = {
     "disabled": ["disabled"],
     "active": ["disabled"],
     "isactive": ["disabled"],
+    # shared no token with `relieving_date`, so the scorer was silent and the
+    # column was dropped — mandatory once `status` is Left (validate_status)
+    "lastworkingday": ["relieving_date"],
 }
 
 

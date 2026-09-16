@@ -2,9 +2,11 @@
 # Reset-and-import test for the items sample.
 #
 # Runs the full migration workflow against the live ERPNext demo:
-#   1. reset  — delete the demo items (idempotent cleanup, missing = ok)
-#   2. import — map + idempotent import with --apply
-#   3. verify — assert every expected item exists on the site
+#   1. reset      — delete the demo items (idempotent cleanup, missing = ok)
+#   2. prereqs    — the Item Groups the sheet needs (via create_record)
+#   3. import     — map + idempotent import with --apply
+#   4. verify     — assert every expected item exists on the site
+#   5. idempotency— re-import: must create 0 and skip every row
 #
 # Pass/fail via exit code: 0 = pass, 1 = fail.
 #
@@ -35,15 +37,25 @@ echo
 echo "== 2. resolve prerequisites (what the agent would do) =="
 # a) the UoM column scores against the child table 'uoms.uom' — force the parent field
 "$PY" erpgen.py set-mapping "$DOCTYPE" --column "UoM" --target stock_uom 2>&1 | grep -E "Override saved|Journal" || true
-# b) 'Machinery' item group is a lookup record the sample references
+# b) every Item Group the sheet references is a lookup record it must exist first;
+#    creating them through `create_record` is also the first exercise of its
+#    "does this already exist?" query (the thing the second pass below gates on)
 "$PY" - <<'PYEOF'
-import os, sys; sys.path.insert(0, ".")
+import csv, os, sys; sys.path.insert(0, ".")
 from erpgen.client import ERPNextClient
 from erpgen.tools import create_record
-c = ERPNextClient(os.environ.get("BASE", "http://localhost:8082"))
-r = create_record(c, "Item Group", {"item_group_name": "Machinery",
-                                    "parent_item_group": "All Item Groups"})
-print(f"  item group Machinery: {r}")
+
+client = ERPNextClient(os.environ.get("BASE", "http://localhost:8082"))
+needed = sorted({r["Group"].strip() for r in csv.DictReader(open("samples/items.csv"))
+                 if r.get("Group", "").strip()})
+have = {r["name"] for r in client.list("Item Group", fields=["name"], limit=0)}
+missing = [g for g in needed if g not in have]
+for group in missing:
+    result = create_record(client, "Item Group",
+                           {"item_group_name": group,
+                            "parent_item_group": "All Item Groups"})
+    print(f"  item group {group}: {result}")
+print(f"  item groups: {len(needed)} needed, {len(missing)} created")
 PYEOF
 
 echo
@@ -78,4 +90,26 @@ if [ "$MISSING" -ne 0 ]; then
 fi
 
 echo
-echo "PASS — items import workflow OK"
+echo "== 5. idempotency: re-importing the same sheet must create nothing =="
+# This is the only check of the real boundary's key lookup: every record now
+# exists, so a filter that cannot match (wrong field, wrong value) shows up here
+# as duplicates instead of a no-op. The unit suite fakes the client, so nothing
+# else catches it.
+OUT2="$("$PY" erpgen.py import "$SOURCE" --doctype "$DOCTYPE" --apply 2>&1)"
+echo "$OUT2" | sed -n '/Dedup:/,$p'
+
+if echo "$OUT2" | grep -qE "failed: [1-9]|failed [1-9]|error-severity conflict"; then
+    echo "FAIL: the re-import reported failures or was blocked by conflicts" >&2
+    exit 1
+fi
+CREATED2="$(echo "$OUT2" | sed -n 's/.*created \([0-9]*\).*/\1/p' | head -1)"
+SKIPPED2="$(echo "$OUT2" | sed -n 's/.*to create, \([0-9]*\) skipped.*/\1/p' | head -1)"
+if [ "${CREATED2:-x}" != "0" ] || [ "${SKIPPED2:-x}" != "${#ITEM_CODES[@]}" ]; then
+    echo "FAIL: re-import created ${CREATED2:-?}, skipped ${SKIPPED2:-?} — expected 0 created, ${#ITEM_CODES[@]} skipped." >&2
+    echo "      The existence query is not matching what is on the site." >&2
+    exit 1
+fi
+echo "  (re-import created 0, skipped $SKIPPED2)"
+
+echo
+echo "PASS — items import workflow OK (including idempotent re-import)"

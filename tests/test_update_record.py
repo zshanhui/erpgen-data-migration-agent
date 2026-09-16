@@ -103,6 +103,29 @@ def test_no_journal_set_means_no_effect_but_the_write_still_happens():
     assert client.docs[("Customer Group", "Wholesale")]["is_group"] == 1
 
 
+def test_the_run_context_journals_the_same_inverse(tmp_path):
+    """With `--run`, effects land in the shared context instead of a per-command
+    journal. The context has to record the update too, or `revert <run-id>`
+    silently leaves the field change behind."""
+    from erpgen.context import MigrationContext, load_run
+
+    client = _site()
+    ctx = MigrationContext("run-upd", tmp_path, source="samples/customers.csv",
+                           doctypes=["Customer Group"])
+    erpgen_tools.ACTIVE_JOURNAL = ctx
+    try:
+        update_record(client, "Customer Group", "Wholesale", {"is_group": 1})
+    finally:
+        erpgen_tools.ACTIVE_JOURNAL = None
+        ctx.close()
+
+    [effect] = load_run("run-upd", tmp_path)["effects"]
+    assert effect["kind"] == "record_update"
+    assert effect["inverse"] == {"op": "restore_record",
+                                 "doctype": "Customer Group", "name": "Wholesale",
+                                 "fields": {"is_group": 0}}
+
+
 # ----------------------------------------------------------- inverse mechanics
 def test_restore_record_dry_run_does_not_touch_the_client(fake_client):
     inv = {"op": "restore_record", "doctype": "Customer Group", "name": "Wholesale",

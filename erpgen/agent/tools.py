@@ -254,6 +254,22 @@ def t_correct(source: str, doctype: str, correction_json: str,
     return f"correct exit {code}:\n{out[-1500:]}"
 
 
+def t_link_managers(source: str, doctype: str = "Employee") -> str:
+    """Second pass: set Employee.reports_to from the sheet's manager column."""
+    cmd: list = []
+    run_id = _TRANSCRIPT_CTX.get("run")
+    if run_id:
+        # --run is GLOBAL, and without it the tree updates journal to their own
+        # file — `revert <run-id>` would then undo the employees and leave the
+        # hierarchy behind.
+        cmd += ["--run", str(run_id)]
+    cmd += ["link-managers", source]
+    if doctype:
+        cmd += ["--doctype", doctype]
+    code, out = _erpgen(cmd, timeout=900)
+    return f"link-managers exit {code}:\n{out[-2000:]}"
+
+
 def t_describe_doctype(doctype: str) -> str:
     try:
         return _j(describe_doctype(CLIENT, doctype))
@@ -316,6 +332,16 @@ TOOLS = [
                     "- change_key: {\"action\":\"change_key\",\"column\":\"<col>\",\"reason\":\"...\"}\n"
                     "The conflict key is \"<kind>:<source or field>[:<target>]\" "
                     "(e.g. \"duplicate_row:Customer Name:customer_name\")."},
+    {"fn": t_link_managers, "name": "link_managers",
+     "description": "SECOND PASS for an Employee sheet: set reports_to from the "
+                    "sheet's manager column. Run it only AFTER run_import applied "
+                    "and the employees exist — the manager column holds people's "
+                    "names, and reports_to needs the Employee docname the site "
+                    "assigned (HR-EMP-…), so it cannot be set in the import. Links "
+                    "the rows it can, reports the ones it cannot (a name matching "
+                    "no employee, a self-report, an employee not on the site) and "
+                    "changes nothing that already holds the right manager, so it "
+                    "is safe to re-run."},
     {"fn": t_describe_doctype, "name": "describe_doctype",
      "description": "Summarize a doctype's structure (required fields, links, "
                     "child tables, fetch_from, id field)."},

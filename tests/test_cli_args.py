@@ -25,6 +25,7 @@ MINIMAL_ARGV = {
     "revert": [],
     "create-record": ["UOM", "--fields", '{"uom_name": "Dozen"}'],
     "update-record": ["Item Group", "Tooling", "--fields", '{"is_group": 1}'],
+    "link-managers": ["samples/employees.csv"],
     "status": [],
     "delete": ["--doctype", "Item", "--names", "A"],
     "clean": ["samples/items.csv"],

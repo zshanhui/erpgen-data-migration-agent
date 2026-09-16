@@ -427,6 +427,10 @@ def test_llm_dq_loop_is_a_noop_when_data_is_clean(agent_mod, monkeypatch):
 
 
 def test_describe_proposal_is_human_readable(agent_mod):
+    """The operator approves these, so they must read as sentences naming the row
+    and the change — not as the raw correction JSON. Asserted by content rather
+    than by whole-string equality: the wording is presentation, and pinning it
+    exactly makes a harmless copy edit look like a regression."""
     from types import SimpleNamespace
 
     src = SimpleNamespace(
@@ -434,19 +438,31 @@ def test_describe_proposal_is_human_readable(agent_mod):
         rows=[["Acme", "Cleveland"], ["Hollow Core Drilling", ""]], n_rows=2)
     kc = "Customer Name"
 
-    assert agent_mod._describe_proposal(
-        {"action": "skip_row", "at": {"row": 3}, "reason": "blank city"}, src, kc
-    ) == "drop row 3 (Hollow Core Drilling) — blank city"
-    assert agent_mod._describe_proposal(
-        {"action": "set_value", "at": {"row": 3}, "column": "City", "value": "Cleveland"}, src, kc
-    ) == "set City on row 3 (Hollow Core Drilling) to 'Cleveland'"
-    assert agent_mod._describe_proposal(
-        {"action": "merge_rows", "keep": {"row": 2}, "drop": [{"row": 3}]}, src, kc
-    ) == "merge row 3 (Hollow Core Drilling) into row 2 (Acme)"
-    assert agent_mod._describe_proposal(
-        {"action": "dismiss_conflict", "conflict": "possible_duplicate_row:Customer Name",
-         "reason": "two entities"}, src, kc
-    ) == "waive possible_duplicate_row:Customer Name — two entities"
+    def sentence(corr):
+        text = agent_mod._describe_proposal(corr, src, kc)
+        assert not text.lstrip().startswith("{"), "raw JSON is not a sentence"
+        return text
+
+    skip = sentence({"action": "skip_row", "at": {"row": 3},
+                     "reason": "blank city"})
+    assert "row 3" in skip and "Hollow Core Drilling" in skip and "blank city" in skip
+    assert skip.startswith("drop"), "the action is the first thing the reader sees"
+
+    set_value = sentence({"action": "set_value", "at": {"row": 3},
+                          "column": "City", "value": "Cleveland"})
+    assert "City" in set_value and "row 3" in set_value and "Cleveland" in set_value
+
+    merge = sentence({"action": "merge_rows", "keep": {"row": 2},
+                      "drop": [{"row": 3}]})
+    assert "row 2" in merge and "row 3" in merge
+
+    waive = sentence({"action": "dismiss_conflict",
+                      "conflict": "possible_duplicate_row:Customer Name",
+                      "reason": "two entities"})
+    assert "possible_duplicate_row:Customer Name" in waive and "two entities" in waive
+
+    # an action with no sentence of its own still has to come back readable
+    assert "review key" in sentence({"action": "change_key", "column": "Tax ID"})
 
 
 # --------------------------------------------------------- correct tool kwarg

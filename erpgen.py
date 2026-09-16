@@ -612,6 +612,9 @@ def cmd_import(args) -> int:
 
     if not args.apply:
         _print_dry_run_preview(args, engine, plan, payloads)
+        if args.link_managers:
+            print("NOTE: --link-managers needs --apply — there is nothing to link to "
+                  "until the employees exist")
         return 0
 
     errs = _blocking_conflicts(analysis)
@@ -629,6 +632,19 @@ def cmd_import(args) -> int:
     print(f"\nDedup: {len(to_create)} to create, {len(skipped)} skipped")
     _load_payloads(args, client, engine, plan, to_create, skipped, existing,
                    key_label, logger, journal)
+
+    # ---- second pass: the reporting tree, in the same run ----
+    # After the rows land, because reports_to links to a docname the site only
+    # assigns at insert. Same journal, so one `revert` undoes both passes.
+    if args.link_managers and plan.doctype == "Employee":
+        link_source = prepared.source if prepared else source
+        lines, problems = employees.link_managers(client, link_source,
+                                                  journal=journal,
+                                                  doctype=plan.doctype)
+        for line in lines:
+            print(f"NOTE: {line}")
+        for problem in problems:
+            print(f"WARNING: {problem}")
 
     # ---- post-run verification ----
     logger.run_end(verified_created=_verified_created(client, plan, spec, to_create,
@@ -1075,6 +1091,36 @@ def cmd_update_record(args) -> int:
     return 0
 
 
+def cmd_link_managers(args) -> int:
+    """Second pass: set Employee.reports_to from the sheet's manager column.
+
+    It has to be a separate pass: `reports_to` links to an Employee docname, and
+    docnames come from naming_series, so a manager named in the sheet has no
+    docname until they have been imported.
+    """
+    source = read_source(args.source)
+    client = _client(args)
+    sink = _effect_sink(args, args.doctype, source=args.source,
+                        command="link-managers")
+    try:
+        lines, problems = employees.link_managers(client, source, journal=sink,
+                                                  doctype=args.doctype)
+    finally:
+        sink.close()
+
+    for line in lines:
+        print(line)
+    for problem in problems:
+        print(f"WARNING: {problem}")
+    if not lines and not problems:
+        print(f"nothing to link — no resolvable manager column in {args.source}")
+    label = "Run context" if getattr(args, "run", None) else "Journal"
+    print(f"\n{label}: {sink.path}  ({sink.effects} effect(s))")
+    if getattr(args, "run", None):
+        print(f"  revert it: python3 erpgen.py revert {args.run} --apply")
+    return 0
+
+
 def cmd_status(args) -> int:
     """Show a migration context: requirements (pending/satisfied) + effects."""
     target = args.run_log
@@ -1212,6 +1258,10 @@ def _add_source_parsers(sub) -> None:
     p_imp.add_argument("--analysis-dir", default="analysis",
                        help="where to write the agent-consumable analysis JSON "
                             "(default: analysis/)")
+    p_imp.add_argument("--link-managers", action="store_true",
+                       help="Employee only: after the import lands, run the second "
+                            "pass that sets reports_to from the sheet's manager "
+                            "column (needs --apply)")
     p_imp.set_defaults(fn=cmd_import)
 
 
@@ -1315,6 +1365,16 @@ def _add_lifecycle_parsers(sub) -> None:
     p_ur.add_argument("--fields", required=True,
                       help='JSON object, e.g. \'{"is_group": 1}\'')
     p_ur.set_defaults(fn=cmd_update_record)
+
+    p_lm = sub.add_parser(
+        "link-managers",
+        help="second pass: set Employee.reports_to from the sheet's manager "
+             "column — run it AFTER `import --apply` created the employees",
+    )
+    p_lm.add_argument("source", help="the source sheet carrying the manager column")
+    p_lm.add_argument("--doctype", default="Employee",
+                      help="Employee (the only doctype this understands)")
+    p_lm.set_defaults(fn=cmd_link_managers)
 
     p_st = sub.add_parser(
         "status",

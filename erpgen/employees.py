@@ -18,10 +18,12 @@ import re
 from typing import Optional
 
 from .conflicts import distinct_values
+from .dedup import BATCH
 from .mapper import ColumnMapping, MappingEngine, MappingPlan, norm
 from .metadata import DoctypeMeta
 from .source import SourceTable
-from .tools import create_field, create_record
+from . import tools
+from .tools import create_field, create_record, update_record
 
 ID_FIELD = "employee_number"
 
@@ -304,6 +306,123 @@ def create_missing_departments(source: SourceTable, client,
                 journal.record_created("Department", docname)
             lines.append(f"created Department '{docname}' for '{name}'")
     return lines
+
+
+# ------------------------------------------------------------ reporting tree
+#: normalised headers for the manager column
+MANAGER_ALIASES = frozenset({"reportingmanager", "manager", "reportsto",
+                             "reportingto", "supervisor", "linemanager"})
+
+
+def _cell(source: SourceTable, row: list, header: str) -> str:
+    idx = source.column_index(header)
+    if idx is None or idx >= len(row):
+        return ""
+    return str(row[idx]).strip()
+
+
+def _employees_by_number(client, numbers: set[str]) -> dict[str, dict]:
+    """`{employee_number: {name, reports_to}}` for the given numbers."""
+    found: dict[str, dict] = {}
+    ordered = sorted(numbers)
+    for i in range(0, len(ordered), BATCH):
+        chunk = ordered[i:i + BATCH]
+        rows = client.list("Employee",
+                           filters=[["employee_number", "in", chunk]],
+                           fields=["name", "employee_number", "reports_to"],
+                           limit=0)
+        for r in rows:
+            number = r.get("employee_number")
+            if number:
+                found[str(number)] = {"name": str(r.get("name") or ""),
+                                      "reports_to": r.get("reports_to") or ""}
+    return found
+
+
+def link_managers(client, source: SourceTable, journal=None,
+                  doctype: str = "Employee") -> tuple[list[str], list[str]]:
+    """Second pass: set `reports_to` from the sheet's own manager column.
+
+    Returns `(lines, problems)`. A single pass cannot do this: `reports_to` is a
+    Link to an Employee *docname*, and docnames come from `naming_series`
+    (`HR-EMP-00001`), so a manager's name has no docname until they are inserted.
+    This pass joins the sheet's own `Full Name` -> `Emp ID`, resolves both sides
+    in one batched query, and patches only what actually changes — so it is
+    re-runnable and journals nothing on a no-op.
+    """
+    if doctype != "Employee":
+        return [], []
+    manager_column = _alias_column(source, MANAGER_ALIASES)
+    number_column = id_column(source)
+    name_column = _alias_column(source, NAME_ALIASES)
+    if not manager_column or not number_column:
+        return [], []
+
+    rows: list[tuple[int, str, str]] = []      # (row number, own no., manager)
+    by_name: dict[str, str] = {}
+    numbers: set[str] = set()
+    for i, row in enumerate(source.rows):
+        own = _cell(source, row, number_column)
+        name = _cell(source, row, name_column) if name_column else ""
+        manager = _cell(source, row, manager_column)
+        if own:
+            numbers.add(own)
+        if name and own:
+            by_name.setdefault(name, own)
+        if own and manager:
+            rows.append((source.row_number(i), own, manager))
+    if not rows:
+        return [], []
+
+    lines: list[str] = []
+    problems: list[str] = []
+    wanted: dict[int, tuple[str, str]] = {}     # row -> (own no., manager no.)
+    for row_no, own, manager in rows:
+        manager_number = by_name.get(manager) or (manager if manager in numbers
+                                                  else "")
+        if not manager_number:
+            problems.append(f"row {row_no}: no employee matches manager "
+                            f"'{manager}' — left unlinked")
+            continue
+        if manager_number == own:
+            problems.append(f"row {row_no}: '{manager}' is the employee's own "
+                            f"report — left unlinked")
+            continue
+        wanted[row_no] = (own, manager_number)
+        numbers.update((own, manager_number))
+
+    if not wanted:
+        return lines, problems
+
+    docs = _employees_by_number(client, numbers)
+    linked = already = 0
+    updates: list[tuple[str, str]] = []
+    for row_no, (own, manager_number) in wanted.items():
+        own_doc, manager_doc = docs.get(own), docs.get(manager_number)
+        if not own_doc or not manager_doc:
+            missing = own if not own_doc else manager_number
+            problems.append(f"row {row_no}: employee_number '{missing}' is not on "
+                            f"the site — left unlinked")
+            continue
+        if own_doc["reports_to"] == manager_doc["name"]:
+            already += 1
+            continue
+        updates.append((own_doc["name"], manager_doc["name"]))
+
+    previous = getattr(tools, "ACTIVE_JOURNAL", None)
+    tools.ACTIVE_JOURNAL = journal
+    try:
+        for employee, manager in updates:
+            update_record(client, "Employee", employee, {"reports_to": manager})
+            linked += 1
+    finally:
+        tools.ACTIVE_JOURNAL = previous
+
+    if linked:
+        lines.append(f"linked {linked} employee(s) to their reporting manager")
+    if already:
+        lines.append(f"{already} already had the right manager (unchanged)")
+    return lines, problems
 
 
 def ensure_ids(payloads: list[dict]) -> list[str]:

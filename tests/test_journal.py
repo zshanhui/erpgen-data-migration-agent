@@ -229,6 +229,22 @@ def test_migration_journal_accepts_an_explicit_run_id(tmp_path):
     assert parse_journal(j.path)["run_start"]["run_id"] == "explicit"
 
 
+def test_an_override_effect_records_the_mapping_it_replaced(tmp_path):
+    """`set-mapping` is a decision, and its inverse is the decision it overrode —
+    `previous=None` meaning "this column had no override before"."""
+    j = MigrationJournal(tmp_path, doctype="Customer", source="s.csv")
+
+    j.override_set("Customer", "Group", "customer_group", None, "ov.json")
+    j.override_set("Customer", "Tier", "customer_group", "tier", "ov.json")
+    j.close()
+
+    invs = [e["inverse"] for e in parse_journal(j.path)["effects"]]
+    assert invs[0] == {"op": "restore_override", "doctype": "Customer",
+                       "column": "Group", "previous": None, "path": "ov.json"}
+    assert invs[1]["previous"] == "tier", "restoring puts the old target back"
+    assert "restore override Customer.Tier" in describe_inverse(invs[1])
+
+
 def test_a_journal_with_no_effects_leaves_no_file(tmp_path):
     """A run that changed nothing has nothing to undo, and an empty journal only
     makes `--latest` point at a file with nothing in it."""

@@ -122,15 +122,50 @@ def logs_dir(tmp_path: Path) -> Path:
 
 
 # -------------------------------------------------------------- fake client
+def _filtered(rows: list[dict], f) -> list[dict]:
+    """One ERPNext filter clause over in-memory rows.
+
+    An operator this double does not model is an error, never a silent pass: the
+    whole point of honouring `filters` here is that a query which can never match
+    must not look like a hit.
+    """
+    field, op, value = f
+    if op == "=":
+        return [r for r in rows if str(r.get(field)) == str(value)]
+    if op == "!=":
+        return [r for r in rows if str(r.get(field)) != str(value)]
+    if op == "in":
+        want = {str(v) for v in value}
+        return [r for r in rows if str(r.get(field)) in want]
+    if op == "like":
+        pat = str(value).strip("%").lower()
+        return [r for r in rows if pat in str(r.get(field, "")).lower()]
+    raise AssertionError(
+        f"FakeClient.list does not model the {op!r} operator — teach it, rather "
+        f"than letting a real query silently match everything"
+    )
+
+
 class FakeClient:
     """Duck-typed ERPNextClient for the pure revert/apply paths.
 
-    Only the methods those paths actually call are implemented; every call is
-    recorded so tests can assert order and idempotency.
+    Every call is recorded so tests can assert order and idempotency. What it
+    models, and what it deliberately does not — a double that quietly differs from
+    the site is worse than no double at all:
+
+    * `list` honours `filters` (`=`, `!=`, `in`, `like`), `fields` and `limit`.
+      It used to ignore all three, so a filter that could never match on a real
+      site (wrong field, wrong value) still looked like a hit here: poisoning both
+      of the importer's key lookups left the entire suite green.
+    * `insert` stores the doc and names it `doc["name"]` or "<doctype>-1". Frappe's
+      naming rules (autoname, `field:`, naming_series) are NOT modelled — pass a
+      `name` in the doc when the test cares which name comes back.
+    * No validation, no link integrity, no permissions, no child-table expansion.
     """
 
     def __init__(self, existing: tuple = (), fail_with: dict | None = None,
-                 records: dict | None = None, docs: dict | None = None):
+                 records: dict | None = None, docs: dict | None = None,
+                 metas: dict | None = None):
         #: {(doctype, name)} that still exist on the "site"
         self.existing = set(existing)
         self.calls: list[tuple] = []
@@ -139,8 +174,22 @@ class FakeClient:
         self.records = records or {}
         #: {(doctype, name): {field: value}} returned by get(); update writes here
         self.docs = {(dt, n): dict(v) for (dt, n), v in (docs or {}).items()}
+        #: {doctype: raw DocType JSON} served by doctype_meta() (create_record's
+        #: `id_field` comes from here, so a lookup can be tested against the real
+        #: natural-key field instead of `name`)
+        self.metas = metas or {}
         for dt, name in self.existing:
             self.docs.setdefault((dt, name), {"name": name})
+
+    def doctype_meta(self, doctype):
+        self.calls.append(("doctype_meta", doctype))
+        raw = self.metas.get(doctype)
+        if raw is None:
+            raise ERPNextError(
+                f'HTTP 404 GET /api/resource/DocType/{doctype}: '
+                '{"exc_type":"DoesNotExistError"}'
+            )
+        return dict(raw)
 
     def get(self, doctype, name):
         self.calls.append(("get", doctype, name))
@@ -163,9 +212,26 @@ class FakeClient:
         self.docs.setdefault((doctype, name), {"name": name}).update(doc)
         return dict(self.docs[(doctype, name)])
 
+    def insert(self, doctype, doc):
+        self.calls.append(("insert", doctype))
+        if doctype in self.fail_with:
+            raise ERPNextError(self.fail_with[doctype])
+        saved = {**doc, "name": doc.get("name") or f"{doctype}-1"}
+        self.records.setdefault(doctype, []).append(dict(saved))
+        self.existing.add((doctype, saved["name"]))
+        self.docs[(doctype, saved["name"])] = dict(saved)
+        return dict(saved)
+
     def list(self, doctype, filters=None, fields=None, limit=0, **kw):
         self.calls.append(("list", doctype))
-        return list(self.records.get(doctype, []))
+        rows = [dict(r) for r in self.records.get(doctype, [])]
+        for f in filters or []:
+            rows = _filtered(rows, f)
+        if fields and fields != ["*"]:
+            rows = [{k: v for k, v in r.items() if k in fields} for r in rows]
+        if limit:
+            rows = rows[:limit]
+        return rows
 
     def delete(self, doctype: str, name: str) -> None:
         self.calls.append(("delete", doctype, name))
